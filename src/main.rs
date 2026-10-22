@@ -1751,14 +1751,19 @@ impl App {
         }
     }
 
+    fn page_vertical_offset(&self, page_height: u32) -> i32 {
+        let (_, viewport_h) = self.viewport();
+        ((viewport_h as i32 - page_height as i32) / 2).max(0)
+    }
+
     fn page_origin(&self) -> Option<(i32, i32)> {
-        self.bitmap.as_ref()?;
+        let bitmap = self.bitmap.as_ref()?;
         let visible = self.visible_width();
         Some((
             self.page_left_offset(visible)
                 - self.spread_offset.round() as i32
                 - self.scroll_x.round() as i32,
-            MARGIN as i32 - self.scroll_y.round() as i32,
+            self.page_vertical_offset(bitmap.height) - self.scroll_y.round() as i32,
         ))
     }
 
@@ -1968,6 +1973,9 @@ impl App {
         let scroll_y = self.scroll_y;
         let spread_offset = self.spread_offset;
         let visible_width = self.visible_width() as i32;
+        let page_vertical_offset = bitmap
+            .map(|page| self.page_vertical_offset(page.height))
+            .unwrap_or(0);
         let menu_position = self.command_menu_position(viewport);
         let Some(surface) = self.surface.as_mut() else {
             return;
@@ -2001,7 +2009,7 @@ impl App {
             let window_left = page_left_offset(viewport, content_left, visible_width.max(1) as u32)
                 - scroll_x.round() as i32;
             let origin_x = window_left - spread_offset.round() as i32;
-            let y0 = MARGIN as i32 - scroll_y.round() as i32;
+            let y0 = page_vertical_offset - scroll_y.round() as i32;
 
             let src_left = (spread_offset.round() as i32).max(0);
             let src_right = (spread_offset.round() as i32 + visible_width).min(bw);
