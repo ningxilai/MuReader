@@ -12,5 +12,9 @@ reflowable documents:
 - `mupdf/source/html/html-layout.c`: when an image line does not fit in the
   remaining page space, shrink its images greedily to the available height
   instead of moving the line to the next page.
+- `mupdf/source/html/html-parse.c`: default images to `display:inline` so
+  normal paragraph images participate in the text flow instead of forcing a
+  block-level page break. This fills the previous page with text and avoids
+  the large bottom gap before a next-page image.
 
 The rest of the crate is unmodified.
