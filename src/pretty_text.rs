@@ -27,7 +27,9 @@ const CONTENT_HEIGHT: f32 = PAGE_HEIGHT - 2.0 * MARGIN;
 /// and MuPDF's real layout, so an exactly-full line never wraps again.
 const BREAK_WIDTH: f32 = CONTENT_WIDTH - 6.0;
 const FONT_SIZE: f32 = 12.0;
+#[cfg(test)]
 const LINE_HEIGHT: f32 = 18.0;
+#[cfg(test)]
 const LINES_PER_PAGE: usize = (CONTENT_HEIGHT / LINE_HEIGHT) as usize;
 
 // Small total-fit demerit parameters, in the spirit of the Knuth-Plass
@@ -78,6 +80,15 @@ pub fn is_plain_text(path: &Path) -> bool {
 
 /// Build a paginated HTML document for a plain-text file.
 pub fn html_for_path(path: &Path, fonts: &FontCatalog) -> Result<String, String> {
+    html_for_path_at(path, fonts, FONT_SIZE)
+}
+
+/// Build a plain-text document at a specific base font size.
+pub fn html_for_path_at(
+    path: &Path,
+    fonts: &FontCatalog,
+    font_size: f32,
+) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let text = String::from_utf8(bytes).map_err(|_| {
         format!(
@@ -86,28 +97,38 @@ pub fn html_for_path(path: &Path, fonts: &FontCatalog) -> Result<String, String>
         )
     })?;
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-    Ok(html_for_text(text, fonts))
+    Ok(html_for_text_at(text, fonts, font_size))
 }
 
 /// Build a paginated HTML document from text.
+#[cfg(test)]
 pub fn html_for_text(text: &str, fonts: &FontCatalog) -> String {
+    html_for_text_at(text, fonts, FONT_SIZE)
+}
+
+/// Build a paginated HTML document from text at a specific base font size.
+pub fn html_for_text_at(text: &str, fonts: &FontCatalog, font_size: f32) -> String {
     let paragraphs = split_paragraphs(text);
+    let line_height = font_size * 1.5;
+    let lines_per_page = ((CONTENT_HEIGHT / line_height) as usize).max(1);
     let mut pages: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
 
     for paragraph in paragraphs {
-        let lines = layout_paragraph(&paragraph, |piece| fonts.measure_text(piece, FONT_SIZE));
-        let remaining = LINES_PER_PAGE.saturating_sub(current.len());
+        let lines = layout_paragraph_at(&paragraph, font_size, |piece| {
+            fonts.measure_text(piece, font_size)
+        });
+        let remaining = lines_per_page.saturating_sub(current.len());
         if remaining < 2 && lines.len() > remaining {
             pages.push(std::mem::take(&mut current));
         }
         for line in lines {
-            if current.len() >= LINES_PER_PAGE {
+            if current.len() >= lines_per_page {
                 pages.push(std::mem::take(&mut current));
             }
             current.push(line);
         }
-        if current.len() < LINES_PER_PAGE {
+        if current.len() < lines_per_page {
             current.push(String::new());
         }
     }
@@ -123,7 +144,7 @@ pub fn html_for_text(text: &str, fonts: &FontCatalog) -> String {
         pages.push(Vec::new());
     }
 
-    render_html(&pages)
+    render_html(&pages, font_size, line_height)
 }
 
 fn split_paragraphs(text: &str) -> Vec<String> {
@@ -156,8 +177,15 @@ fn split_paragraphs(text: &str) -> Vec<String> {
     paragraphs
 }
 
+#[cfg(test)]
 fn layout_paragraph(text: &str, measure: impl Fn(&str) -> f32) -> Vec<String> {
+    layout_paragraph_at(text, FONT_SIZE, measure)
+}
+
+fn layout_paragraph_at(text: &str, font_size: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
     let hyphen_width = measure("-");
+    let ragged_stretch = RAGGED_STRETCH / FONT_SIZE * font_size;
+    let emergency_stretch = EMERGENCY_STRETCH / FONT_SIZE * font_size;
     let units = units(text, measure);
     if units.is_empty() {
         return Vec::new();
@@ -173,19 +201,17 @@ fn layout_paragraph(text: &str, measure: impl Fn(&str) -> f32) -> Vec<String> {
         prefix[j] = prefix[j - 1] + units[j - 2].space + units[j - 1].width;
     }
 
-    let breaks = dp_breaks(&units, &prefix, RAGGED_STRETCH, hyphen_width)
+    let breaks = dp_breaks(&units, &prefix, ragged_stretch, hyphen_width)
         .or_else(|| {
             dp_breaks(
                 &units,
                 &prefix,
-                RAGGED_STRETCH + EMERGENCY_STRETCH,
+                ragged_stretch + emergency_stretch,
                 hyphen_width,
             )
         })
         // A guaranteed fallback: any line short of the measure is allowed.
-        .or_else(|| dp_breaks(&units, &prefix, RAGGED_STRETCH + BREAK_WIDTH, hyphen_width))
-        // A guaranteed fallback: any line short of the measure is allowed.
-        .or_else(|| dp_breaks(&units, &prefix, RAGGED_STRETCH + BREAK_WIDTH, hyphen_width))
+        .or_else(|| dp_breaks(&units, &prefix, ragged_stretch + BREAK_WIDTH, hyphen_width))
         .unwrap_or_else(|| vec![units.len()]);
 
     let mut starts = vec![0usize];
@@ -432,16 +458,19 @@ fn hyphenate_english(text: &str) -> Option<Vec<String>> {
     let syllables: Vec<String> = hyphenate(text, Lang::English).map(str::to_string).collect();
     (syllables.len() > 1).then_some(syllables)
 }
-fn render_html(pages: &[Vec<String>]) -> String {
+fn render_html(pages: &[Vec<String>], font_size: f32, line_height: f32) -> String {
     let mut html = String::new();
     html.push_str(
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>\n\
          @page { size: 612pt 792pt; margin: 0; }\n\
          html, body { margin: 0; padding: 0; }\n\
-         .page { width: 504pt; height: 684pt; margin: 54pt; }\n\
-         .line { margin: 0; font-family: serif; font-size: 12pt; \
-                 line-height: 18pt; white-space: pre; }\n\
-         </style></head><body>\n",
+         .page { width: 504pt; height: 684pt; margin: 54pt; }\n",
+    );
+    let _ = write!(
+        html,
+        ".line {{ margin: 0; font-family: serif; font-size: {font_size}pt; \
+                 line-height: {line_height}pt; white-space: pre; }}\n\
+         </style></head><body>\n"
     );
     for (index, page) in pages.iter().enumerate() {
         if index + 1 == pages.len() {
@@ -571,6 +600,19 @@ mod tests {
         let lines = layout_paragraph(text, width);
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| width(line) <= BREAK_WIDTH));
+    }
+
+    #[test]
+    fn larger_font_size_uses_more_pages() {
+        let text = (0..120)
+            .map(|index| format!("paragraph {index}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let fonts = FontCatalog::new(None).unwrap();
+        let normal = html_for_text_at(&text, &fonts, 12.0);
+        let large = html_for_text_at(&text, &fonts, 18.0);
+        assert!(large.matches("class=\"page").count() > normal.matches("class=\"page").count());
+        assert!(large.contains("font-size: 18pt"));
     }
 
     #[test]

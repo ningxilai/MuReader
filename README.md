@@ -68,6 +68,8 @@ search_page = "C-s"
 search_book = "M-s"
 zoom_in = "+"
 zoom_out = "-"
+font_increase = "C-="
+font_decrease = "C--"
 reset_view = "0"
 rotate_right = "r"
 rotate_left = "l"
@@ -88,7 +90,8 @@ and log files.
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
 Press `:` for the command menu. While it is open, the page is frozen and normal
-shortcuts are disabled.
+shortcuts are disabled. For reflowable documents, `C-=` and `C--` change the base
+text size; the document is reflowed and the current reading position is kept.
 
 ## Changelog
 
@@ -102,6 +105,8 @@ shortcuts are disabled.
   `C-n`/`C-p`.
 - Added the Vim-style `:` command menu, CSS-driven UI/document fonts, and a
   configurable page-turn duration.
+- Added reflowable text-size controls (`C-=`/`C--`) that reflow the document and
+  preserve the current reading position.
 - Fixed spread/keyboard interaction regressions and smoothed two-page turns.
 
 ## License

@@ -34,6 +34,7 @@ pub enum Command {
     GotoPage(usize),
     ZoomIn,
     ZoomOut,
+    FontScale(f32),
     SetScale(f32),
     RotateRight,
     RotateLeft,
@@ -184,6 +185,26 @@ fn run(rx: std::sync::mpsc::Receiver<Command>, proxy: EventLoopProxy<UserEvent>)
                 if let Some(engine) = engine.as_mut() {
                     engine.zoom_by(ZOOM_OUT_FACTOR);
                     render_and_send(engine, &proxy);
+                }
+            }
+            Command::FontScale(factor) => {
+                if let Some(engine) = engine.as_mut() {
+                    match engine.adjust_font(factor) {
+                        Ok(true) => {
+                            let _ = proxy.send_event(UserEvent::Worker(Event::Outline(
+                                engine.outline().to_vec(),
+                            )));
+                            render_and_send(engine, &proxy);
+                        }
+                        Ok(false) => {
+                            let _ = proxy.send_event(UserEvent::Worker(Event::Status(
+                                "text size at its limit".to_string(),
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = proxy.send_event(UserEvent::Worker(Event::Error(e)));
+                        }
+                    }
                 }
             }
             Command::SetScale(scale) => {

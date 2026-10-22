@@ -32,7 +32,8 @@ use clipboard::{ClipboardHandle, ClipboardNotice};
 use config::Config;
 use document::{
     Fit, HighlightRect, OutlineEntry, PageBitmap, RenderedLink, RenderedPage, SearchScope,
-    TextLayer, TextSelection, MARGIN, MAX_SCALE, MIN_SCALE, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
+    TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE, MIN_SCALE, ZOOM_IN_FACTOR,
+    ZOOM_OUT_FACTOR,
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
@@ -86,6 +87,8 @@ enum MenuAction {
     SearchBook,
     ZoomIn,
     ZoomOut,
+    FontIncrease,
+    FontDecrease,
     ResetView,
     RotateRight,
     RotateLeft,
@@ -149,6 +152,16 @@ const COMMANDS: &[CommandEntry] = &[
         label: "Zoom out",
         keywords: "zoom out smaller",
         action: MenuAction::ZoomOut,
+    },
+    CommandEntry {
+        label: "Increase text size",
+        keywords: "font text size larger increase bigger",
+        action: MenuAction::FontIncrease,
+    },
+    CommandEntry {
+        label: "Decrease text size",
+        keywords: "font text size smaller decrease reduce",
+        action: MenuAction::FontDecrease,
     },
     CommandEntry {
         label: "Reset view",
@@ -273,6 +286,8 @@ struct App {
     page_count: Option<usize>,
     scale: f32,
     page_fit: Fit,
+    font_scale: f32,
+    reflowable: bool,
     rotation: u16,
     scroll_x: f32,
     scroll_y: f32,
@@ -350,6 +365,8 @@ impl App {
             page_count: None,
             scale: 1.0,
             page_fit: Fit::Page,
+            font_scale: 1.0,
+            reflowable: false,
             rotation: 0,
             scroll_x: 0.0,
             scroll_y: 0.0,
@@ -855,6 +872,26 @@ impl App {
         self.zoom(ZOOM_OUT_FACTOR, Command::ZoomOut);
     }
 
+    fn font_increase(&mut self) {
+        self.change_font_size(FONT_SIZE_STEP);
+    }
+
+    fn font_decrease(&mut self) {
+        self.change_font_size(1.0 / FONT_SIZE_STEP);
+    }
+
+    fn change_font_size(&mut self, factor: f32) {
+        if !self.reflowable {
+            self.status = Some("text size is only available for reflowable documents".to_string());
+            self.update_title();
+            return;
+        }
+        self.finish_animation();
+        self.pending_turn = None;
+        self.status = None;
+        self.send(Command::FontScale(factor));
+    }
+
     fn reset_view(&mut self) {
         self.finish_animation();
         let Some(baseline) = self.zoom_baseline.take() else {
@@ -1034,13 +1071,18 @@ impl App {
         } else {
             format!(" — {}°", self.rotation)
         };
+        let text = if self.reflowable && (self.font_scale - 1.0).abs() > 1.0e-4 {
+            format!(" — text {:.0}%", self.font_scale * 100.0)
+        } else {
+            String::new()
+        };
         let status = self
             .status
             .as_ref()
             .map(|s| format!(" — {s}"))
             .unwrap_or_default();
         window.set_title(&format!(
-            "{name} — {page} — {:.0}%{rotation}{status}",
+            "{name} — {page} — {:.0}%{text}{rotation}{status}",
             self.scale * 100.0
         ));
     }
@@ -1140,6 +1182,8 @@ impl App {
             MenuAction::SearchBook => self.start_search_prompt(SearchScope::Book),
             MenuAction::ZoomIn => self.zoom_in(),
             MenuAction::ZoomOut => self.zoom_out(),
+            MenuAction::FontIncrease => self.font_increase(),
+            MenuAction::FontDecrease => self.font_decrease(),
             MenuAction::ResetView => self.reset_view(),
             MenuAction::RotateRight => self.rotate(true),
             MenuAction::RotateLeft => self.rotate(false),
@@ -1553,6 +1597,8 @@ impl App {
             Action::SearchBook => self.start_search_prompt(SearchScope::Book),
             Action::ZoomIn => self.zoom_in(),
             Action::ZoomOut => self.zoom_out(),
+            Action::FontIncrease => self.font_increase(),
+            Action::FontDecrease => self.font_decrease(),
             Action::ResetView => self.reset_view(),
             Action::RotateRight => self.rotate(true),
             Action::RotateLeft => self.rotate(false),
@@ -1561,8 +1607,10 @@ impl App {
     }
 
     fn install_page(&mut self, page: RenderedPage) {
-        let page_changed =
-            self.page != page.page || self.pages != page.pages || self.rotation != page.rotation;
+        let page_changed = self.page != page.page
+            || self.pages != page.pages
+            || self.rotation != page.rotation
+            || (self.font_scale - page.font_scale).abs() > 1.0e-4;
         let new_scale = page.scale;
         let restore = if page_changed {
             self.pending_zooms.clear();
@@ -1593,6 +1641,8 @@ impl App {
         self.page_count = page.page_count;
         self.scale = new_scale;
         self.page_fit = page.fit;
+        self.font_scale = page.font_scale;
+        self.reflowable = page.reflowable;
         self.rotation = page.rotation;
         self.highlights = page.highlights;
         self.links = page.links;
@@ -2528,7 +2578,10 @@ mod tests {
             vec!["Show outline"]
         );
         assert!(filtered_commands("nonsense").is_empty());
-        assert_eq!(filtered_commands("right")[0], 11);
+        assert_eq!(
+            COMMANDS[filtered_commands("right")[0]].label,
+            "Rotate right"
+        );
     }
 
     #[test]
