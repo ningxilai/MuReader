@@ -283,7 +283,7 @@ impl RenderEngine {
         let mut pretty_text = pretty && crate::pretty_text::is_plain_text(path);
         let mut doc = if pretty_text {
             match crate::pretty_text::html_for_path(path, &fonts) {
-                Ok(html) => match Document::from_bytes(html.as_bytes(), "text/html") {
+                Ok(html) => match Document::from_copied_bytes(html.as_bytes(), "text/html") {
                     Ok(document) => document,
                     Err(error) => {
                         eprintln!("MuReader: pretty text render failed: {error}; using MuPDF");
@@ -361,7 +361,7 @@ impl RenderEngine {
         if self.pretty_text {
             let html =
                 crate::pretty_text::html_for_path_at(&self.source_path, &self.fonts, target)?;
-            let mut doc = Document::from_bytes(html.as_bytes(), "text/html")
+            let mut doc = Document::from_copied_bytes(html.as_bytes(), "text/html")
                 .map_err(|e| format!("pretty text render: {e}"))?;
             doc.layout(LAYOUT_WIDTH, LAYOUT_HEIGHT, target)
                 .map_err(|e| format!("layout: {e}"))?;

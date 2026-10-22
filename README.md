@@ -13,11 +13,13 @@ cargo build --release
 Or install MuReader:
 
 ```bash
-cargo install --git https://github.com/ningxilai/emthin.git
+cargo install --git https://github.com/ningxilai/MuReader.git
 ```
 
-The repository vendors `mupdf-sys` 0.8.0 under `vendor/mupdf-sys` with a small
-reflow patch that keeps oversized images inside one reflowed page.
+MuPDF is built from `ningxilai/mupdf-rs` (branch `main`), which carries the
+reflow layout fixes used by MuReader. This keeps the MuPDF C changes in the
+fork instead of vendoring the whole C source tree in this repository. Cargo
+fetches the fork and its MuPDF submodules during the first build.
 
 ## Test
 
@@ -107,6 +109,8 @@ text size; the document is reflowed and the current reading position is kept.
   configurable page-turn duration.
 - Added reflowable text-size controls (`C-=`/`C--`) that reflow the document and
   preserve the current reading position.
+- Moved MuPDF C patches to the `ningxilai/mupdf-rs` fork and removed the
+  vendored `mupdf-sys` tree from this repository.
 - Fixed spread/keyboard interaction regressions and smoothed two-page turns.
 
 ## License

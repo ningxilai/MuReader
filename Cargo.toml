@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Lee <loyalpartner@163.com>"]
 license = "AGPL-3.0"
-repository = "https://github.com/ningxilai/emthin"
+repository = "https://github.com/ningxilai/MuReader"
 description = "MuReader: standalone MuPDF document reader"
 
 
@@ -14,7 +14,7 @@ fontdb = "0.24"
 harfbuzz_rs = "2"
 hypher = "0.1"
 libc = "0.2"
-mupdf = { version = "0.8", default-features = false, features = [
+mupdf = { git = "https://github.com/ningxilai/mupdf-rs", branch = "main", default-features = false, features = [
     "epub",
     "cbz",
     "xps",
@@ -22,7 +22,6 @@ mupdf = { version = "0.8", default-features = false, features = [
     "img",
     "html",
     "system-fonts",
-    "bundled-fonts",
     "base14-fonts",
     "brotli",
 ] }
@@ -43,6 +42,3 @@ winit = "0.30"
 
 [profile.release]
 lto = true
-
-[patch.crates-io]
-mupdf-sys = { path = "vendor/mupdf-sys" }
