@@ -9,8 +9,8 @@ reflowable documents:
   one page instead of splitting them across pages.
 - `mupdf/source/reflow/reflow-doc.c`: pass the document page height into the
   HTML layout call used for reflowed pages.
-- `mupdf/source/html/html-layout.c`: when a lone image does not fit in the
-  remaining page space, shrink it greedily to the available height instead of
-  moving it to the next page.
+- `mupdf/source/html/html-layout.c`: when an image line does not fit in the
+  remaining page space, shrink its images greedily to the available height
+  instead of moving the line to the next page.
 
 The rest of the crate is unmodified.

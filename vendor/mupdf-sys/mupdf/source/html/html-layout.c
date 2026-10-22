@@ -563,12 +563,11 @@ typedef struct
 #define TRBLCPY(DST,SRC) \
 do { DST[T] = SRC[T] ; DST[R] = SRC[R]; DST[B] = SRC[B]; DST[L] = SRC[L]; } while (0)
 
-static int fit_single_image_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)
+static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)
 {
 	fz_html_flow *node;
+	fz_html_flow *tallest = NULL;
 	int images = 0;
-	int others = 0;
-	fz_html_flow *image = NULL;
 
 	if (max_h <= 0)
 		return 0;
@@ -577,23 +576,25 @@ static int fit_single_image_to_height(fz_html_flow *a, fz_html_flow *b, float ma
 		if (node->type == FLOW_IMAGE)
 		{
 			images++;
-			image = node;
-		}
-		else if (node->type != FLOW_BREAK && node->type != FLOW_SBREAK &&
-			node->type != FLOW_ANCHOR)
-		{
-			others++;
+			if (!tallest || node->h > tallest->h)
+				tallest = node;
 		}
 	}
-	if (images != 1 || others != 0 || !image || image->h <= max_h)
+	if (images == 0 || !tallest || tallest->h <= max_h)
 		return 0;
 
 	/* Greedy placement: use the remaining space at the bottom of this page
-	 * rather than pushing the image to the next page. */
-	float scale = max_h / image->h;
-	image->h *= scale;
-	image->w *= scale;
-	*width = image->w;
+	 * rather than pushing the image line to the next page. */
+	float scale = max_h / tallest->h;
+	for (node = a; node && node != b; node = node->next)
+	{
+		if (node->type == FLOW_IMAGE)
+		{
+			node->h *= scale;
+			node->w *= scale;
+		}
+	}
+	*width = tallest->w;
 	return 1;
 }
 
@@ -612,7 +613,7 @@ static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float 
 		if (line_h > avail)
 		{
 			float fitted_w;
-			if (fit_single_image_to_height(a, b, avail, &fitted_w))
+			if (fit_line_images_to_height(a, b, avail, &fitted_w))
 			{
 				line_w = fitted_w;
 				line_h = measure_line(a, b, &baseline);
