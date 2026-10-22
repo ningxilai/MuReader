@@ -1090,16 +1090,34 @@ impl App {
     fn start_goto_prompt(&mut self) {
         self.prompt = Prompt::Goto(String::new());
         self.update_title();
+        self.request_redraw();
     }
 
     fn start_outline_prompt(&mut self) {
         self.prompt = Prompt::Outline(String::new());
         self.update_title();
+        self.request_redraw();
     }
 
     fn start_search_prompt(&mut self, scope: SearchScope) {
         self.prompt = Prompt::Search(String::new(), scope);
         self.update_title();
+        self.request_redraw();
+    }
+
+    /// The visible, single-line prompt shown above the page.
+    fn prompt_line(&self) -> Option<(String, String)> {
+        match &self.prompt {
+            Prompt::Goto(input) => Some(("Go to page: ".to_string(), input.clone())),
+            Prompt::Outline(input) => Some(("Outline page: ".to_string(), input.clone())),
+            Prompt::Search(query, SearchScope::Page) => {
+                Some(("Search page: ".to_string(), query.clone()))
+            }
+            Prompt::Search(query, SearchScope::Book) => {
+                Some(("Search book: ".to_string(), query.clone()))
+            }
+            Prompt::None => None,
+        }
     }
 
     fn open_command_menu(&mut self) {
@@ -1463,6 +1481,7 @@ impl App {
     fn cancel_prompt(&mut self) {
         self.prompt = Prompt::None;
         self.update_title();
+        self.request_redraw();
     }
 
     fn commit_prompt(&mut self) {
@@ -1489,6 +1508,7 @@ impl App {
             Prompt::None => {}
         }
         self.update_title();
+        self.request_redraw();
     }
 
     fn handle_prompt_key(&mut self, event: &winit::event::KeyEvent) {
@@ -1506,12 +1526,14 @@ impl App {
                 if let Prompt::Search(input, _) = &mut self.prompt {
                     input.push(' ');
                     self.update_title();
+                    self.request_redraw();
                 }
             }
             Key::Named(NamedKey::Backspace) => match &mut self.prompt {
                 Prompt::Goto(input) | Prompt::Outline(input) | Prompt::Search(input, _) => {
                     input.pop();
                     self.update_title();
+                    self.request_redraw();
                 }
                 Prompt::None => {}
             },
@@ -1523,6 +1545,7 @@ impl App {
                         }
                     }
                     self.update_title();
+                    self.request_redraw();
                 }
                 Prompt::Search(input, _) => {
                     for c in ch.chars() {
@@ -1531,6 +1554,7 @@ impl App {
                         }
                     }
                     self.update_title();
+                    self.request_redraw();
                 }
                 Prompt::None => {}
             },
@@ -2027,6 +2051,7 @@ impl App {
             .map(|page| self.page_vertical_offset(page.height))
             .unwrap_or(0);
         let menu_position = self.command_menu_position(viewport);
+        let prompt = self.prompt_line();
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
@@ -2197,6 +2222,59 @@ impl App {
                     buffer[dst_start..dst_start + copy_w as usize]
                         .copy_from_slice(&panel.pixels[src_start..src_start + copy_w as usize]);
                 }
+            }
+        }
+
+        if let Some((label, value)) = prompt {
+            let panel_w = size
+                .width
+                .saturating_sub(80)
+                .clamp(260, 560)
+                .min(size.width.max(1));
+            let panel_h = 44;
+            let panel_x = ((vw - panel_w as i32) / 2).max(0);
+            let panel_y = (vh - panel_h as i32 - 40).max(0);
+            let mut line = format!("{label}{value}");
+            if value.is_empty() {
+                line.push('_');
+            } else {
+                line.push('▏');
+            }
+            // Keep long search queries inside the panel.
+            let max_chars = (panel_w / 8).max(16) as usize;
+            if line.chars().count() > max_chars {
+                line = line
+                    .chars()
+                    .skip(line.chars().count() - max_chars)
+                    .collect();
+            }
+            for row in panel_y..(panel_y + panel_h as i32).min(vh) {
+                let start = row as usize * size.width as usize + panel_x as usize;
+                let end = start + (panel_w.min((vw - panel_x).max(0) as u32)) as usize;
+                buffer[start..end].fill(0x00202020);
+            }
+            let border = 0x00484848;
+            for x in panel_x..(panel_x + panel_w as i32).min(vw) {
+                buffer[panel_y as usize * size.width as usize + x as usize] = border;
+                buffer[(panel_y + panel_h as i32 - 1).min(vh - 1) as usize * size.width as usize
+                    + x as usize] = border;
+            }
+            if self.menu_text.is_none() {
+                self.menu_text = TextEngine::new(self.fonts.clone()).ok();
+            }
+            if let Some(text) = self.menu_text.as_mut() {
+                let mut target =
+                    TextTarget::new(&mut buffer, size.width, size.height, panel_y, panel_h);
+                text.draw_line(
+                    &line,
+                    15.0,
+                    Weight::NORMAL,
+                    &mut target,
+                    panel_x + 16,
+                    panel_y,
+                    panel_h,
+                    (235, 235, 235),
+                );
             }
         }
 
