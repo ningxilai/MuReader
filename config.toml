@@ -1,0 +1,66 @@
+# MuReader configuration.
+#
+# Default location:
+#   $XDG_CONFIG_HOME/mureader/config.toml
+#   (~/.config/mureader/config.toml)
+#
+# Set MUREADER_CONFIG to use a different file.
+
+[animation]
+# Page-turn slide duration in milliseconds.
+page_turn_ms = 320
+# Delay before re-rendering after window resize; the old page is scaled
+# immediately while dragging.
+window_fit_ms = 120
+
+[reflowable]
+# Custom CSS for reflowable documents (EPUB, HTML, TXT, FB2, MOBI, DOCX, ...).
+# Use !important where the document's own CSS should be overridden.
+#
+# The first font-family declared here is also used by the outline, prompts,
+# and other UI text. Missing glyphs (CJK, emoji, symbols) share the same
+# fallback chain, so there is no separate [fonts] section.
+#
+# css = """
+# body {
+#     font-family: "Noto Serif", "Droid Sans Fallback Full", sans-serif;
+# }
+# """
+css = ""
+# Optional CSS file, applied after the inline CSS. Relative paths are resolved
+# against this config file's directory.
+css_file = ""
+
+# Read styleless source files as plain text and reflow them with Unicode
+# line breaking and a KP-style total-fit pass. Supported extensions: txt,
+# text, md, markdown, mdown, mkd, rst, org, adoc, asciidoc, tex, log.
+# Markup is kept verbatim. EPUB/HTML/FB2 keep MuPDF's own layout.
+pretty = true
+
+[keys]
+# Each binding is a key sequence; put spaces between sequence steps.
+# Multiple bindings for one action use an array.
+# Modifiers: C- (Control), M- (Alt), S- (Shift).
+quit = ["q", "Q", "Escape"]
+next_page = "n"
+prev_page = "p"
+first_page = ["g", "Home", "M-<"]
+last_page = ["G", "End", "M->"]
+scroll_down = ["Down", "PageDown", "Space", "C-n"]
+scroll_up = ["Up", "PageUp", "S-Space", "Delete", "C-p"]
+scroll_down_screen = "C-v"
+scroll_up_screen = "M-v"
+scroll_left = ["Left", "C-b"]
+scroll_right = ["Right", "C-f"]
+scroll_left_most = "C-a"
+scroll_right_most = "C-e"
+goto_page = "M-g g"
+outline = "o"
+search_page = "C-s"
+search_book = "M-s"
+zoom_in = "+"
+zoom_out = "-"
+reset_view = "0"
+rotate_right = "r"
+rotate_left = "l"
+copy = ["M-w", "C-w"]
