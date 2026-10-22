@@ -10,8 +10,10 @@ reflowable documents:
 - `mupdf/source/reflow/reflow-doc.c`: pass the document page height into the
   HTML layout call used for reflowed pages.
 - `mupdf/source/html/html-layout.c`: when an image line does not fit in the
-  remaining page space, shrink its images greedily to the available height
-  instead of moving the line to the next page.
+  remaining page space, compare the scaled image area with the whitespace area
+  using the golden ratio. The image is only shrunk when its area is at least
+  `1/phi` of the available page area; otherwise the line moves to the next
+  page.
 - `mupdf/source/html/html-parse.c`: default images to `display:inline` so
   normal paragraph images participate in the text flow instead of forcing a
   block-level page break. This fills the previous page with text and avoids

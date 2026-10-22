@@ -563,19 +563,21 @@ typedef struct
 #define TRBLCPY(DST,SRC) \
 do { DST[T] = SRC[T] ; DST[R] = SRC[R]; DST[B] = SRC[B]; DST[L] = SRC[L]; } while (0)
 
-static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float *width)
+static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max_h, float page_w, float *width)
 {
 	fz_html_flow *node;
 	fz_html_flow *tallest = NULL;
+	float image_area = 0;
 	int images = 0;
 
-	if (max_h <= 0)
+	if (max_h <= 0 || page_w <= 0)
 		return 0;
 	for (node = a; node && node != b; node = node->next)
 	{
 		if (node->type == FLOW_IMAGE)
 		{
 			images++;
+			image_area += node->w * node->h;
 			if (!tallest || node->h > tallest->h)
 				tallest = node;
 		}
@@ -583,9 +585,20 @@ static int fit_line_images_to_height(fz_html_flow *a, fz_html_flow *b, float max
 	if (images == 0 || !tallest || tallest->h <= max_h)
 		return 0;
 
-	/* Greedy placement: use the remaining space at the bottom of this page
-	 * rather than pushing the image line to the next page. */
+	/* Decide between shrinking the image into the remaining page area and
+	 * moving it to the next page. The image and the whitespace left beside
+	 * it should form a golden-ratio division of that area:
+	 *
+	 *     image_area / (available_area - image_area) >= phi
+	 *
+	 * Equivalently, the image must occupy at least 1/phi of the available
+	 * area. If it would be smaller, leaving the gap is the better choice. */
 	float scale = max_h / tallest->h;
+	float available_area = page_w * max_h;
+	float scaled_area = image_area * scale * scale;
+	if (scaled_area * 1.6180339887498948482f < available_area)
+		return 0;
+
 	for (node = a; node && node != b; node = node->next)
 	{
 		if (node->type == FLOW_IMAGE)
@@ -608,12 +621,13 @@ static int flush_line(fz_context *ctx, fz_html_box *box, layout_data *ld, float 
 	if (page_h > 0)
 	{
 		avail = page_h - fmodf(box->s.layout.b - page_top, page_h);
-		/* If a lone image is too tall for the remaining space, shrink it
-		 * greedily to fill the page instead of moving it to the next one. */
+		/* Try to place an image line in the remaining page area. The
+		 * golden-ratio area test inside decides whether shrinking is
+		 * preferable to moving the line to the next page. */
 		if (line_h > avail)
 		{
 			float fitted_w;
-			if (fit_line_images_to_height(a, b, avail, &fitted_w))
+			if (fit_line_images_to_height(a, b, avail, page_w, &fitted_w))
 			{
 				line_w = fitted_w;
 				line_h = measure_line(a, b, &baseline);
