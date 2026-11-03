@@ -46,6 +46,10 @@ const LAYOUT_EM: f32 = 12.0;
 const FONT_SIZE_MIN: f32 = 8.0;
 const FONT_SIZE_MAX: f32 = 24.0;
 pub const FONT_SIZE_STEP: f32 = 1.1;
+/// Keep the four pages of a spread; each turn replaces the page that leaves.
+const PAGE_CACHE_CAPACITY: usize = 4;
+/// Outside a spread only the current page and one neighbor are useful.
+const PAGE_CACHE_SINGLE_CAPACITY: usize = 2;
 
 /// A spread gap is visual, not structural. It scales with the rendered page
 /// width and collapses when the viewport only fits the two page widths.
@@ -283,6 +287,13 @@ pub struct RenderEngine {
     pretty_text: bool,
     /// Base text size in points for reflowable documents.
     font_size: f32,
+    /// Recently rendered pages for the spread strip. Consecutive page turns
+    /// overlap three of the four pages, so reusing them avoids rasterizing
+    /// the whole strip on every turn. Each entry records the scale it was
+    /// rendered at because mixed page sizes can change the spread fit scale.
+    page_cache: Vec<(usize, f32, PageRender)>,
+    #[cfg(test)]
+    page_renders: usize,
 }
 
 impl RenderEngine {
@@ -350,6 +361,9 @@ impl RenderEngine {
             source_path: path.to_path_buf(),
             pretty_text,
             font_size: LAYOUT_EM,
+            page_cache: Vec::new(),
+            #[cfg(test)]
+            page_renders: 0,
         };
         engine.skip_blank_forward();
         Ok(engine)
@@ -370,6 +384,7 @@ impl RenderEngine {
         if (target - self.font_size).abs() < 0.01 {
             return Ok(false);
         }
+        self.page_cache.clear();
         let old_page = self.page;
         let old_count = self.page_count.unwrap_or(1).max(1);
         let anchor = self.page_anchor();
@@ -476,7 +491,11 @@ impl RenderEngine {
     }
 
     pub fn set_viewport(&mut self, width: u32, height: u32) {
-        self.viewport = (width.max(1), height.max(1));
+        let next = (width.max(1), height.max(1));
+        if next != self.viewport {
+            self.viewport = next;
+            self.page_cache.clear();
+        }
     }
 
     pub fn fit(&self) -> Fit {
@@ -671,6 +690,7 @@ impl RenderEngine {
         if factor.is_finite() && factor > 0.0 {
             self.fit = Fit::None;
             self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+            self.page_cache.clear();
         }
     }
 
@@ -679,6 +699,7 @@ impl RenderEngine {
         if scale.is_finite() && scale > 0.0 {
             self.fit = Fit::None;
             self.scale = scale.clamp(MIN_SCALE, MAX_SCALE);
+            self.page_cache.clear();
         }
     }
 
@@ -686,10 +707,12 @@ impl RenderEngine {
     pub fn fit_page(&mut self) {
         self.fit = Fit::Page;
         self.search_query = None;
+        self.page_cache.clear();
     }
 
     pub fn rotate(&mut self, delta: i32) {
         self.rotation = ((self.rotation as i32 + delta).rem_euclid(360)) as u16;
+        self.page_cache.clear();
     }
 
     /// Render the current page at the current viewport size.
@@ -789,12 +812,6 @@ impl RenderEngine {
         page.search(needle, 64)
             .map(|quads| quads.to_vec())
             .map_err(|e| format!("search page {}: {e}", page_no + 1))
-    }
-
-    fn layout_ctm(&mut self, bounds: &Rect) -> Result<Matrix, String> {
-        let scale = self.scale_for(bounds)?;
-        self.scale = scale;
-        Ok(self.ctm_for(bounds, scale))
     }
 
     fn scale_for(&self, bounds: &Rect) -> Result<f32, String> {
@@ -912,6 +929,7 @@ impl RenderEngine {
         } else {
             vec![self.page]
         };
+        let cacheable = quads.is_empty() && self.search_query.is_none();
         if self.reflowable {
             let mut filtered = Vec::with_capacity(page_numbers.len());
             for &page_no in &page_numbers {
@@ -920,46 +938,97 @@ impl RenderEngine {
                 }
             }
             if !filtered.is_empty() {
-                return self.render_pages(&filtered, quads);
+                return self.render_pages(&filtered, quads, cacheable);
             }
         }
-        self.render_pages(&page_numbers, quads)
+        self.render_pages(&page_numbers, quads, cacheable)
     }
 
     fn render_pages(
         &mut self,
         page_numbers: &[usize],
         quads: &[Quad],
+        cacheable: bool,
     ) -> Result<RenderedPage, String> {
         let first_no = *page_numbers
             .first()
             .ok_or_else(|| "no page to render".to_string())?;
-        let first_bounds = self
-            .doc
-            .load_page(first_no as i32)
-            .and_then(|page| page.bounds())
-            .map_err(|e| format!("page bounds: {e}"))?;
-        let first_ctm = self.layout_ctm(&first_bounds)?;
-        let scale = self.scale;
 
-        let mut rendered = vec![self.render_one(first_no, &first_ctm, quads)?];
+        // Collapse duplicate or out-of-range page numbers before rendering.
+        let mut numbers = vec![first_no];
         let mut pages = vec![first_no + 1];
         for &page_no in page_numbers.iter().skip(1) {
             if self.page_count.is_some_and(|count| page_no >= count) {
                 break;
             }
-            if pages.contains(&(page_no + 1)) {
+            if numbers.contains(&page_no) {
                 continue;
             }
-            let bounds = self
-                .doc
-                .load_page(page_no as i32)
-                .and_then(|page| page.bounds())
-                .map_err(|e| format!("page bounds: {e}"))?;
-            let ctm = self.ctm_for(&bounds, scale);
-            rendered.push(self.render_one(page_no, &ctm, &[])?);
+            numbers.push(page_no);
             pages.push(page_no + 1);
         }
+
+        let first_bounds = self
+            .doc
+            .load_page(first_no as i32)
+            .and_then(|page| page.bounds())
+            .map_err(|e| format!("page bounds: {e}"))?;
+        let scale = self.scale_for(&first_bounds)?;
+        self.scale = scale;
+        let first_ctm = self.ctm_for(&first_bounds, scale);
+
+        // Search highlights only apply to the first page, so searches take
+        // the direct path. Normal reading reuses the overlapping spread pages.
+        let mut direct = Vec::new();
+        for (index, &page_no) in numbers.iter().enumerate() {
+            if cacheable
+                && self.page_cache.iter().any(|(cached, cached_scale, _)| {
+                    *cached == page_no && (*cached_scale - scale).abs() < 1.0e-4
+                })
+            {
+                continue;
+            }
+            let ctm = if index == 0 {
+                first_ctm.clone()
+            } else {
+                let bounds = self
+                    .doc
+                    .load_page(page_no as i32)
+                    .and_then(|page| page.bounds())
+                    .map_err(|e| format!("page bounds: {e}"))?;
+                self.ctm_for(&bounds, scale)
+            };
+            let page_quads = if index == 0 { quads } else { &[] };
+            #[cfg(test)]
+            {
+                self.page_renders += 1;
+            }
+            let rendered = self.render_one(page_no, &ctm, page_quads)?;
+            if cacheable {
+                self.page_cache.retain(|(cached, _, _)| *cached != page_no);
+                self.make_room_for_page(&numbers);
+                self.page_cache.push((page_no, scale, rendered));
+            } else {
+                direct.push(rendered);
+            }
+        }
+
+        let rendered: Vec<&PageRender> = if cacheable {
+            let mut refs = Vec::with_capacity(numbers.len());
+            for page_no in &numbers {
+                let Some((_, _, page)) =
+                    self.page_cache.iter().find(|(cached, cached_scale, _)| {
+                        cached == page_no && (*cached_scale - scale).abs() < 1.0e-4
+                    })
+                else {
+                    return Err("page cache missing a rendered page".to_string());
+                };
+                refs.push(page);
+            }
+            refs
+        } else {
+            direct.iter().collect()
+        };
 
         let page_widths: Vec<u32> = rendered.iter().map(|page| page.bitmap.width).collect();
         // Blank reflow pages may have been filtered out, so the current page
@@ -975,7 +1044,7 @@ impl RenderEngine {
         } else {
             0
         };
-        let bitmap = compose_pages(rendered, gap);
+        let bitmap = compose_pages(&rendered, gap);
 
         Ok(RenderedPage {
             bitmap: bitmap.bitmap,
@@ -994,9 +1063,47 @@ impl RenderEngine {
             reflowable: self.reflowable,
         })
     }
+
+    fn cache_capacity(&self) -> usize {
+        if self.spread && self.fit != Fit::None {
+            PAGE_CACHE_CAPACITY
+        } else {
+            PAGE_CACHE_SINGLE_CAPACITY
+        }
+    }
+
+    /// Make room for a page without evicting any page the current strip needs.
+    fn make_room_for_page(&mut self, keep: &[usize]) {
+        let capacity = self.cache_capacity();
+        if self.page_cache.len() < capacity {
+            return;
+        }
+        let center = self.page;
+        let mut victim = None;
+        let mut farthest = 0;
+        for (index, (page_no, _, _)) in self.page_cache.iter().enumerate() {
+            let distance = page_no.abs_diff(center);
+            if !keep.contains(page_no) && (victim.is_none() || distance >= farthest) {
+                victim = Some(index);
+                farthest = distance;
+            }
+        }
+        if victim.is_none() {
+            for (index, (page_no, _, _)) in self.page_cache.iter().enumerate() {
+                let distance = page_no.abs_diff(center);
+                if victim.is_none() || distance >= farthest {
+                    victim = Some(index);
+                    farthest = distance;
+                }
+            }
+        }
+        if let Some(index) = victim {
+            self.page_cache.remove(index);
+        }
+    }
 }
 
-fn compose_pages(mut pages: Vec<PageRender>, gap: u32) -> PageRender {
+fn compose_pages(pages: &[&PageRender], gap: u32) -> PageRender {
     let width = pages
         .iter()
         .map(|page| page.bitmap.width)
@@ -1009,32 +1116,61 @@ fn compose_pages(mut pages: Vec<PageRender>, gap: u32) -> PageRender {
         .unwrap_or(0);
     let mut pixels = vec![0x00181818u32; width as usize * height as usize];
 
-    let mut left = PageRender {
+    let mut highlights = Vec::new();
+    let mut links = Vec::new();
+    let mut text = TextLayer::default();
+    let mut x = 0;
+    for page in pages {
+        blit_bitmap(&mut pixels, width, &page.bitmap, x, 0);
+        for rect in &page.highlights {
+            highlights.push(HighlightRect {
+                x0: rect.x0 + x,
+                x1: rect.x1 + x,
+                ..*rect
+            });
+        }
+        for link in &page.links {
+            let mut link = link.clone();
+            link.bounds.x0 += x;
+            link.bounds.x1 += x;
+            links.push(link);
+        }
+        let char_offset = text.chars.len();
+        let line_offset = text.lines.len();
+        for ch in &page.text.chars {
+            text.chars.push(TextChar {
+                rect: HighlightRect {
+                    x0: ch.rect.x0 + x,
+                    x1: ch.rect.x1 + x,
+                    ..ch.rect
+                },
+                line: ch.line + line_offset,
+                ..*ch
+            });
+        }
+        for line in &page.text.lines {
+            text.lines.push(TextLine {
+                start: line.start + char_offset,
+                end: line.end + char_offset,
+                rect: HighlightRect {
+                    x0: line.rect.x0 + x,
+                    x1: line.rect.x1 + x,
+                    ..line.rect
+                },
+            });
+        }
+        x += page.bitmap.width + gap;
+    }
+    PageRender {
         bitmap: PageBitmap {
             width,
             height,
-            pixels: Vec::new(),
+            pixels,
         },
-        highlights: Vec::new(),
-        links: Vec::new(),
-        text: TextLayer::default(),
-    };
-    let mut x = 0;
-    for mut page in pages.drain(..) {
-        blit_bitmap(&mut pixels, width, &page.bitmap, x, 0);
-        shift_highlights(&mut page.highlights, x);
-        shift_links(&mut page.links, x);
-        let char_offset = left.text.chars.len();
-        let line_offset = left.text.lines.len();
-        shift_text_layer(&mut page.text, x, line_offset, char_offset);
-        left.text.chars.extend(page.text.chars);
-        left.text.lines.extend(page.text.lines);
-        left.highlights.extend(page.highlights);
-        left.links.extend(page.links);
-        x += page.bitmap.width + gap;
+        highlights,
+        links,
+        text,
     }
-    left.bitmap.pixels = pixels;
-    left
 }
 fn blit_bitmap(dst: &mut [u32], dst_width: u32, src: &PageBitmap, x: u32, y: u32) {
     if src.width == 0 || src.height == 0 {
@@ -1049,34 +1185,6 @@ fn blit_bitmap(dst: &mut [u32], dst_width: u32, src: &PageBitmap, x: u32, y: u32
         let dst_start = (dy + row) * dst_width + dx;
         dst[dst_start..dst_start + src_width]
             .copy_from_slice(&src.pixels[src_start..src_start + src_width]);
-    }
-}
-
-fn shift_highlights(rects: &mut [HighlightRect], dx: u32) {
-    for rect in rects {
-        rect.x0 += dx;
-        rect.x1 += dx;
-    }
-}
-
-fn shift_links(links: &mut [RenderedLink], dx: u32) {
-    for link in links {
-        link.bounds.x0 += dx;
-        link.bounds.x1 += dx;
-    }
-}
-
-fn shift_text_layer(layer: &mut TextLayer, dx: u32, line_offset: usize, char_offset: usize) {
-    for ch in &mut layer.chars {
-        ch.rect.x0 += dx;
-        ch.rect.x1 += dx;
-        ch.line += line_offset;
-    }
-    for line in &mut layer.lines {
-        line.start += char_offset;
-        line.end += char_offset;
-        line.rect.x0 += dx;
-        line.rect.x1 += dx;
     }
 }
 
@@ -1591,6 +1699,67 @@ mod tests {
         let fitted = engine.render().unwrap();
         assert_eq!(fitted.fit, Fit::Page);
         assert_eq!(fitted.pages, vec![1, 2, 3, 4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spread_reuses_overlapping_pages() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("spread-cache");
+        let path = dir.join("sample.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(2400, 900);
+        engine.set_spread(true);
+
+        let first = engine.render().unwrap();
+        assert_eq!(first.pages, vec![1, 2, 3, 4]);
+        assert_eq!(engine.page_renders, 4);
+
+        assert!(engine.goto_page(3));
+        let second = engine.render().unwrap();
+        assert_eq!(second.pages, vec![2, 3, 4, 5]);
+        assert_eq!(
+            engine.page_renders, 5,
+            "a one-page shift should only rasterize the entering page"
+        );
+
+        assert!(engine.goto_page(4));
+        let third = engine.render().unwrap();
+        assert_eq!(third.pages, vec![3, 4, 5, 6]);
+        assert_eq!(engine.page_renders, 6);
+
+        assert!(engine.goto_page(3));
+        let back = engine.render().unwrap();
+        assert_eq!(back.pages, vec![2, 3, 4, 5]);
+        assert_eq!(
+            engine.page_renders, 7,
+            "going back should reuse the pages still in the strip"
+        );
+
+        assert!(engine.goto_page(2));
+        let back_again = engine.render().unwrap();
+        assert_eq!(back_again.pages, vec![1, 2, 3, 4]);
+        assert_eq!(engine.page_renders, 8);
+
+        engine.set_viewport(2400, 901);
+        let resized = engine.render().unwrap();
+        assert_eq!(resized.pages, vec![1, 2, 3, 4]);
+        assert_eq!(
+            engine.page_renders, 12,
+            "a viewport change invalidates every cached page"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
