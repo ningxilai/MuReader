@@ -2396,8 +2396,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
             }
         }
+        // `WaitUntil` persists after its deadline: leaving it set makes the
+        // event loop wake immediately on every iteration and burn CPU. Go
+        // back to sleeping until the next event once the debounce has run.
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn window_event(
