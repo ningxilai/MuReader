@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! User configuration.
 //!
 //! The file lives at `$XDG_CONFIG_HOME/mureader/config.toml` (usually
@@ -171,18 +172,47 @@ pub fn load() -> Config {
     }
 }
 
-fn strip_font_face_blocks(css: &str) -> String {
+fn strip_css_comments(css: &str) -> String {
     let mut result = String::with_capacity(css.len());
     let mut rest = css;
-    while let Some(index) = rest.find("@font-face") {
-        result.push_str(&rest[..index]);
-        let after = &rest[index..];
-        let Some(open) = after.find('{') else {
-            return result;
+    while let Some(start) = rest.find("/*") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("*/") {
+            Some(end) => rest = &after[end + 2..],
+            None => return result,
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+fn is_css_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') || !ch.is_ascii()
+}
+
+fn strip_font_face_blocks(css: &str) -> String {
+    let lower = css.to_ascii_lowercase();
+    let mut result = String::with_capacity(css.len());
+    let mut copied = 0usize;
+    let mut search = 0usize;
+    while let Some(relative) = lower[search..].find("@font-face") {
+        let start = search + relative;
+        if css[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_css_ident_char)
+        {
+            search = start + 1;
+            continue;
+        }
+        let Some(open_relative) = css[start..].find('{') else {
+            break;
         };
+        let open = start + open_relative;
         let mut depth = 0usize;
         let mut end = None;
-        for (offset, ch) in after[open..].char_indices() {
+        for (offset, ch) in css[open..].char_indices() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -196,36 +226,57 @@ fn strip_font_face_blocks(css: &str) -> String {
             }
         }
         match end {
-            Some(end) => rest = &after[end..],
-            None => return result,
+            Some(end) => {
+                result.push_str(&css[copied..start]);
+                copied = end;
+                search = end;
+            }
+            None => break,
         }
     }
-    result.push_str(rest);
+    result.push_str(&css[copied..]);
     result
 }
 
 fn first_css_font_family(css: &str) -> Option<String> {
     // `@font-face` names the source font, not necessarily the body face. The
     // UI should follow the family the document actually asks for.
-    let css = strip_font_face_blocks(css);
-    let mut rest = css.as_str();
-    while let Some(index) = rest.find("font-family") {
-        let after = &rest[index + "font-family".len()..];
+    let css = strip_font_face_blocks(&strip_css_comments(css));
+    let lower = css.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(relative) = lower[search..].find("font-family") {
+        let index = search + relative;
+        if css[..index]
+            .chars()
+            .next_back()
+            .is_some_and(is_css_ident_char)
+        {
+            search = index + 1;
+            continue;
+        }
+        let after = &lower[index + "font-family".len()..];
         let Some(colon) = after.find(':') else {
             break;
         };
-        let value = &after[colon + 1..];
-        let end = value.find([';', '}']).unwrap_or(value.len());
-        let value = value[..end].trim();
-        let first = value.split(',').next().unwrap_or(value).trim();
-        let first = first
-            .trim_matches(|ch| matches!(ch, '\'' | '"'))
-            .trim_end_matches("!important")
+        // A colon after a declaration boundary belongs to a later property.
+        if after[..colon].contains([';', '{', '}']) {
+            search = index + 1;
+            continue;
+        }
+        let value_start = index + "font-family".len() + colon + 1;
+        let value_lower = &lower[value_start..];
+        let end = value_lower.find([';', '}']).unwrap_or(value_lower.len());
+        let important = value_lower[..end].find("!important").unwrap_or(end);
+        let value = css[value_start..value_start + end]
+            .get(..important)
+            .unwrap_or("")
             .trim();
-        if !first.is_empty() && !first.starts_with("var(") {
+        let first = value.split(',').next().unwrap_or(value).trim();
+        let first = first.trim_matches(|ch| matches!(ch, '\'' | '"')).trim();
+        if !first.is_empty() && !first.to_ascii_lowercase().starts_with("var(") {
             return Some(first.to_string());
         }
-        rest = &after[colon + 1 + end..];
+        search = value_start + end;
     }
     None
 }
@@ -248,6 +299,18 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_dir(name: &str) -> PathBuf {
+        let serial = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("mureader-{name}-{}-{serial}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn parses_key_specs() {
@@ -304,9 +367,7 @@ pretty = false
 
     #[test]
     fn combines_inline_and_file_css() {
-        let dir = std::env::temp_dir().join("mureader-css-config-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("css-config");
         std::fs::write(dir.join("style.css"), "body { color: red; }").unwrap();
 
         let mut config = Config::default();
@@ -334,5 +395,24 @@ body { color: red; font-family: "FangSongCode", serif !important; }
             Some("Noto Serif")
         );
         assert_eq!(first_css_font_family("body { color: red; }"), None);
+    }
+
+    #[test]
+    fn css_font_family_ignores_comments_face_blocks_and_case() {
+        let family = first_css_font_family(
+            r#"
+/* font-family: "Commented Out"; */
+@FONT-FACE { font-family: "Embedded Face"; src: url(x); }
+body {
+    --font-family: "Custom Property";
+    FONT-FAMILY: 'Real Face', serif !IMPORTANT;
+}
+"#,
+        );
+        assert_eq!(family.as_deref(), Some("Real Face"));
+        assert_eq!(
+            first_css_font_family("body { --font-family: 'No'; font-family: 'Yes'; }").as_deref(),
+            Some("Yes")
+        );
     }
 }

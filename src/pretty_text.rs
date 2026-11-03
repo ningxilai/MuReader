@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! A deliberately small plain-text reflow pass.
 //!
 //! MuPDF's HTML/EPUB layout owns its own greedy line breaker and exposes no

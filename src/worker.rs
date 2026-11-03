@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Render worker.
 //!
 //! The worker thread is the only place that opens, uses, or drops a MuPDF
@@ -5,9 +6,10 @@
 //! keeps `Document`'s `!Send` nature out of the application state entirely.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use winit::event_loop::EventLoopProxy;
 
@@ -35,7 +37,7 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     FontScale(f32),
-    SetScale(f32),
+    FitPage,
     RotateRight,
     RotateLeft,
     Search {
@@ -62,23 +64,25 @@ pub enum Event {
 
 pub struct WorkerHandle {
     tx: Sender<Command>,
-    join: Option<JoinHandle<()>>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl WorkerHandle {
-    pub fn spawn(proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn spawn(proxy: EventLoopProxy<UserEvent>) -> Result<Self, String> {
         let (tx, rx) = channel();
-        let join = thread::Builder::new()
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        thread::Builder::new()
             .name("mureader-render".to_string())
-            .spawn(move || run(rx, proxy))
-            .expect("spawn render worker");
-        Self {
-            tx,
-            join: Some(join),
-        }
+            .spawn(move || run(rx, proxy, worker_cancel))
+            .map_err(|e| format!("spawn render worker: {e}"))?;
+        Ok(Self { tx, cancel })
     }
 
     pub fn send(&self, command: Command) {
+        // Every command cancels an in-flight book search. Starting a new
+        // search clears the flag again on the worker thread.
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.tx.send(command);
     }
 }
@@ -86,13 +90,14 @@ impl WorkerHandle {
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
         let _ = self.tx.send(Command::Quit);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
     }
 }
 
-fn run(rx: std::sync::mpsc::Receiver<Command>, proxy: EventLoopProxy<UserEvent>) {
+fn run(
+    rx: std::sync::mpsc::Receiver<Command>,
+    proxy: EventLoopProxy<UserEvent>,
+    cancel: Arc<AtomicBool>,
+) {
     let mut engine: Option<RenderEngine> = None;
     let mut viewport = (1100, 900);
 
@@ -207,9 +212,9 @@ fn run(rx: std::sync::mpsc::Receiver<Command>, proxy: EventLoopProxy<UserEvent>)
                     }
                 }
             }
-            Command::SetScale(scale) => {
+            Command::FitPage => {
                 if let Some(engine) = engine.as_mut() {
-                    engine.set_scale(scale);
+                    engine.fit_page();
                     render_and_send(engine, &proxy);
                 }
             }
@@ -227,11 +232,17 @@ fn run(rx: std::sync::mpsc::Receiver<Command>, proxy: EventLoopProxy<UserEvent>)
             }
             Command::Search { query, scope } => {
                 if let Some(engine) = engine.as_mut() {
-                    match engine.search(&query, scope) {
+                    cancel.store(false, Ordering::Relaxed);
+                    match engine.search(&query, scope, &cancel) {
                         Ok(Some(page)) => {
                             let _ = proxy.send_event(UserEvent::Worker(Event::Page(page)));
                         }
                         Ok(None) => {
+                            // A newer command interrupted this search; do not
+                            // report the old query as having no matches.
+                            if cancel.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             engine.clear_search();
                             render_and_send(engine, &proxy);
                             let target = match scope {

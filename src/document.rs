@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Worker-side document engine.
 //!
 //! `RenderEngine` owns the MuPDF `Document`. It is created, used, and dropped
@@ -11,6 +12,7 @@
 //! highlight, and link coordinates shifted into the composite space.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use fontdb::Weight;
@@ -125,7 +127,11 @@ impl TextLayer {
             .lines
             .iter()
             .filter(|line| line.rect.x1 > line.rect.x0 && line.rect.y1 > line.rect.y0)
-            .min_by(|a, b| line_distance(a.rect, y).total_cmp(&line_distance(b.rect, y)))?;
+            .min_by(|a, b| {
+                let da = rect_distance(a.rect, x, y);
+                let db = rect_distance(b.rect, x, y);
+                da.0.total_cmp(&db.0).then(da.1.total_cmp(&db.1))
+            })?;
         let mut best = line.start;
         let mut best_dx = f32::INFINITY;
         for index in line.start..line.end.min(self.chars.len()) {
@@ -172,14 +178,25 @@ impl TextLayer {
     }
 }
 
-fn line_distance(rect: HighlightRect, y: f32) -> f32 {
-    if y < rect.y0 as f32 {
+/// Vertical distance first, then horizontal. This keeps a click on a line's
+/// baseline from jumping to a different column on a nearby line, while still
+/// distinguishing two columns that share the same y coordinate.
+fn rect_distance(rect: HighlightRect, x: f32, y: f32) -> (f32, f32) {
+    let dx = if x < rect.x0 as f32 {
+        rect.x0 as f32 - x
+    } else if x > rect.x1 as f32 {
+        x - rect.x1 as f32
+    } else {
+        0.0
+    };
+    let dy = if y < rect.y0 as f32 {
         rect.y0 as f32 - y
     } else if y > rect.y1 as f32 {
         y - rect.y1 as f32
     } else {
         0.0
-    }
+    };
+    (dy, dx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,13 +487,8 @@ impl RenderEngine {
         self.spread = spread;
     }
 
-    fn page_step(&self) -> usize {
-        1
-    }
-
     pub fn next_page(&mut self) -> bool {
-        let step = self.page_step();
-        let next = self.page + step;
+        let next = self.page + 1;
         if let Some(count) = self.page_count {
             if next >= count {
                 return false;
@@ -493,7 +505,7 @@ impl RenderEngine {
         if self.page == 0 {
             return false;
         }
-        self.page = self.page.saturating_sub(self.page_step());
+        self.page = self.page.saturating_sub(1);
         self.skip_blank_backward();
         true
     }
@@ -662,11 +674,18 @@ impl RenderEngine {
         }
     }
 
+    #[cfg(test)]
     pub fn set_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 {
             self.fit = Fit::None;
             self.scale = scale.clamp(MIN_SCALE, MAX_SCALE);
         }
+    }
+
+    /// Restore the initial fit-to-page layout after an explicit zoom.
+    pub fn fit_page(&mut self) {
+        self.fit = Fit::Page;
+        self.search_query = None;
     }
 
     pub fn rotate(&mut self, delta: i32) {
@@ -695,6 +714,7 @@ impl RenderEngine {
         &mut self,
         needle: &str,
         scope: SearchScope,
+        cancel: &AtomicBool,
     ) -> Result<Option<RenderedPage>, String> {
         if needle.is_empty() {
             return Ok(None);
@@ -713,6 +733,9 @@ impl RenderEngine {
             SearchScope::Book => {
                 if let Some(count) = self.page_count {
                     for offset in 0..count {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Ok(None);
+                        }
                         let page_no = (start + offset) % count;
                         let quads = self.search_page(page_no, needle)?;
                         if !quads.is_empty() {
@@ -728,6 +751,9 @@ impl RenderEngine {
                 // walks forward and wraps for handlers that cannot report it.
                 let mut page_no = start;
                 loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
                     match self.search_page(page_no, needle) {
                         Ok(quads) if !quads.is_empty() => {
                             self.page = page_no;
@@ -740,6 +766,9 @@ impl RenderEngine {
                     }
                 }
                 for page_no in 0..start {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
                     let quads = self.search_page(page_no, needle)?;
                     if !quads.is_empty() {
                         self.page = page_no;
@@ -874,7 +903,10 @@ impl RenderEngine {
     }
 
     fn render_with_quads(&mut self, quads: &[Quad]) -> Result<RenderedPage, String> {
-        let page_numbers = if self.spread {
+        // A spread is a fit-to-page layout. Once the user zooms explicitly,
+        // rendering four pages at that scale can cost hundreds of megabytes;
+        // fall back to a single page even if the UI request has not arrived.
+        let page_numbers = if self.spread && self.fit != Fit::None {
             let start = self.page.saturating_sub(1);
             vec![start, start + 1, start + 2, start + 3]
         } else {
@@ -916,7 +948,7 @@ impl RenderEngine {
             if self.page_count.is_some_and(|count| page_no >= count) {
                 break;
             }
-            if page_no == first_no || pages.last().is_some_and(|&last| page_no + 1 == last) {
+            if pages.contains(&(page_no + 1)) {
                 continue;
             }
             let bounds = self
@@ -930,7 +962,12 @@ impl RenderEngine {
         }
 
         let page_widths: Vec<u32> = rendered.iter().map(|page| page.bitmap.width).collect();
-        let focus_index = self.page.saturating_sub(first_no);
+        // Blank reflow pages may have been filtered out, so the current page
+        // is not necessarily at `self.page - first_no`. Find its actual slot.
+        let focus_index = pages
+            .iter()
+            .position(|&page| page == self.page + 1)
+            .unwrap_or(0);
         let gap = if page_widths.len() > 1 {
             let visible = page_widths[focus_index]
                 .saturating_add(page_widths.get(focus_index + 1).copied().unwrap_or(0));
@@ -1253,13 +1290,38 @@ fn truncate_outline_title(title: &str, width: u32, indent: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     static DOC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    fn doc_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        DOC_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    struct DocTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for DocTestGuard {
+        fn drop(&mut self) {
+            // MuPDF keeps the user CSS in process-global state. Clear it even
+            // if a test panics so the next test starts from a clean slate.
+            let _ = Context::get().set_user_css("");
+        }
+    }
+
+    fn doc_test_guard() -> DocTestGuard {
+        DocTestGuard {
+            _lock: DOC_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let serial = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("mureader-{name}-{}-{serial}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn selection_layer() -> TextLayer {
@@ -1332,11 +1394,62 @@ mod tests {
     }
 
     #[test]
+    fn hit_testing_distinguishes_columns_at_the_same_height() {
+        let layer = TextLayer {
+            chars: vec![
+                TextChar {
+                    ch: 'L',
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10,
+                        x1: 20,
+                        y1: 30,
+                    },
+                    line: 0,
+                },
+                TextChar {
+                    ch: 'R',
+                    rect: HighlightRect {
+                        x0: 110,
+                        y0: 10,
+                        x1: 120,
+                        y1: 30,
+                    },
+                    line: 1,
+                },
+            ],
+            lines: vec![
+                TextLine {
+                    start: 0,
+                    end: 1,
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10,
+                        x1: 20,
+                        y1: 30,
+                    },
+                },
+                TextLine {
+                    start: 1,
+                    end: 2,
+                    rect: HighlightRect {
+                        x0: 110,
+                        y0: 10,
+                        x1: 120,
+                        y1: 30,
+                    },
+                },
+            ],
+        };
+        assert_eq!(layer.position_at(115.0, 20.0), Some(1));
+        assert_eq!(layer.position_at(15.0, 20.0), Some(0));
+        assert_eq!(layer.position_at(60.0, 20.0), Some(0));
+    }
+
+    #[test]
     fn reflowable_internal_links_resolve_pages() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-link-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("link");
         let path = dir.join("sample.html");
         std::fs::write(
             &path,
@@ -1373,9 +1486,7 @@ mod tests {
     #[test]
     fn pretty_text_paginates_plain_text() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-pretty-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("pretty");
         let path = dir.join("sample.txt");
         let mut text = String::from(
             "A deliberately long paragraph exercises the Unicode line breaker: the quick brown fox jumps over the lazy dog, again and again and again, while 中文句子也应该在合适的位置换行，而不是被硬切。\n\n",
@@ -1398,7 +1509,9 @@ mod tests {
         assert_eq!(first.pages, vec![1]);
         assert!(first.text.chars.iter().any(|ch| ch.ch == '你'));
 
-        let search = engine.search("quick", SearchScope::Page).unwrap();
+        let search = engine
+            .search("quick", SearchScope::Page, &AtomicBool::new(false))
+            .unwrap();
         assert!(search.is_some());
 
         assert!(engine.goto_page(2));
@@ -1415,9 +1528,7 @@ mod tests {
     #[test]
     fn spread_renders_two_pages_side_by_side() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-spread-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("spread");
         let path = dir.join("sample.html");
         let mut html = String::from("<!doctype html><html><body>");
         for i in 0..160 {
@@ -1468,15 +1579,25 @@ mod tests {
         let prev = engine.render().unwrap();
         assert_eq!(prev.page, 1);
         assert_eq!(prev.pages, vec![1, 2, 3, 4]);
+
+        engine.set_scale(2.0);
+        let zoomed = engine.render().unwrap();
+        assert_eq!(
+            zoomed.pages,
+            vec![1],
+            "an explicit zoom must not render a four-page strip"
+        );
+        engine.fit_page();
+        let fitted = engine.render().unwrap();
+        assert_eq!(fitted.fit, Fit::Page);
+        assert_eq!(fitted.pages, vec![1, 2, 3, 4]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reflowable_css_applies_background_and_foreground() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-css-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("css");
         let path = dir.join("sample.html");
         std::fs::write(
             &path,
@@ -1512,9 +1633,7 @@ mod tests {
     #[test]
     fn reflowable_font_size_reflows_and_keeps_a_page() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-font-size-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("font-size");
         let path = dir.join("sample.html");
         let body = (0..120)
             .map(|i| format!("<p>Paragraph {i} has enough words to wrap across the page.</p>"))
@@ -1539,9 +1658,7 @@ mod tests {
     #[test]
     fn pretty_text_font_size_reflows() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-pretty-font-size-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("pretty-font-size");
         let path = dir.join("sample.txt");
         let text = (0..160)
             .map(|i| format!("Paragraph {i} has enough words to wrap across the page."))
@@ -1560,9 +1677,7 @@ mod tests {
     #[test]
     fn reflowable_txt_html_and_fb2_smoke() {
         let _guard = doc_test_guard();
-        let dir = std::env::temp_dir().join("mureader-reflowable-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("reflowable");
 
         std::fs::write(
             dir.join("sample.txt"),

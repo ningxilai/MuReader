@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Wayland clipboard support for MuReader.
 //!
 //! This is deliberately a copy-only data-control client. It owns one Wayland
@@ -10,7 +11,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use wayland_client::backend::ObjectData;
 use wayland_client::protocol::{wl_registry, wl_seat};
@@ -44,7 +45,6 @@ enum Command {
 pub struct ClipboardHandle {
     tx: Sender<Command>,
     wake: UnixStream,
-    join: Option<JoinHandle<()>>,
 }
 
 impl ClipboardHandle {
@@ -55,34 +55,37 @@ impl ClipboardHandle {
         wake_read
             .set_nonblocking(true)
             .map_err(|e| format!("clipboard wake pipe: {e}"))?;
-        let join = thread::Builder::new()
+        wake.set_nonblocking(true)
+            .map_err(|e| format!("clipboard wake pipe: {e}"))?;
+        thread::Builder::new()
             .name("mureader-clipboard".to_string())
             .spawn(move || run(rx, wake_read, proxy))
             .map_err(|e| format!("spawn clipboard worker: {e}"))?;
-        Ok(Self {
-            tx,
-            wake,
-            join: Some(join),
-        })
+        Ok(Self { tx, wake })
     }
 
     pub fn copy(&self, text: String) -> bool {
         if self.tx.send(Command::Copy(text)).is_err() {
             return false;
         }
+        self.notify()
+    }
+
+    fn notify(&self) -> bool {
         let mut wake = &self.wake;
-        wake.write_all(&[1]).is_ok()
+        match wake.write(&[1]) {
+            Ok(_) => true,
+            // A full pipe is already readable, so the worker will wake up.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
     }
 }
 
 impl Drop for ClipboardHandle {
     fn drop(&mut self) {
         let _ = self.tx.send(Command::Quit);
-        let mut wake = &self.wake;
-        let _ = wake.write_all(&[1]);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        let _ = self.notify();
     }
 }
 

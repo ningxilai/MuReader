@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Wayland startup activation for MuReader window.
 //!
 //! A compositor may launch MuReader with `XDG_ACTIVATION_TOKEN` set. That

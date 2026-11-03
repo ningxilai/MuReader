@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! A deliberately small document viewer.
 //!
 //! This is not a compositor and does not host an editor. It opens one winit
@@ -42,7 +43,7 @@ use outline_text::{TextEngine, TextTarget};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 #[cfg(target_os = "linux")]
@@ -225,17 +226,6 @@ struct PendingZoom {
     expected_scale: f32,
 }
 
-#[derive(Clone, Copy)]
-struct ViewState {
-    scale: f32,
-    scroll: (f32, f32),
-}
-
-struct PendingRestore {
-    scale: f32,
-    scroll: (f32, f32),
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnDirection {
     Next,
@@ -300,8 +290,6 @@ struct App {
     keymap: Keymap,
     pending_zooms: VecDeque<PendingZoom>,
     last_requested_scale: f32,
-    zoom_baseline: Option<ViewState>,
-    pending_restore: Option<PendingRestore>,
     css: Option<String>,
     pretty_text: bool,
     page_turn_duration: Duration,
@@ -379,8 +367,6 @@ impl App {
             keymap,
             pending_zooms: VecDeque::new(),
             last_requested_scale: 1.0,
-            zoom_baseline: None,
-            pending_restore: None,
             css,
             pretty_text,
             page_turn_duration,
@@ -527,13 +513,18 @@ impl App {
 
     fn update_spread_layout(&mut self) {
         if self.spread_active {
+            // An explicit zoom must not keep rendering a four-page strip at
+            // an unbounded scale. Drop back to one page and let the fit-page
+            // path enable the spread again later.
+            if self.page_fit != Fit::Page {
+                self.spread_active = false;
+                self.send(Command::SetSpread(false));
+                return;
+            }
             if self.pages.len() < 2 {
                 return;
             }
             if self.bitmap.is_none() {
-                return;
-            }
-            if self.page_fit != Fit::Page {
                 return;
             }
             // The visual gap is not part of the fit decision. Using the same
@@ -565,11 +556,14 @@ impl App {
             width
         };
         let target = (width, height);
-        if self.last_viewport_sent == Some(target) {
-            self.resize_preview = false;
-        }
+        let unchanged = self.last_viewport_sent == Some(target);
         self.last_viewport_sent = Some(target);
         self.send(Command::Viewport(width, height));
+        // At an explicit zoom the worker keeps the current bitmap, so no
+        // further Page event will clear the preview. Finish it here.
+        if resize_preview_done(self.page_fit, unchanged) {
+            self.resize_preview = false;
+        }
     }
 
     fn schedule_viewport(&mut self) {
@@ -718,8 +712,6 @@ impl App {
         self.outline_open = false;
         self.spread_blocked = false;
         self.pending_zooms.clear();
-        self.pending_restore = None;
-        self.zoom_baseline = None;
         self.last_requested_scale = self.scale;
         self.send_viewport();
         self.update_title();
@@ -894,27 +886,17 @@ impl App {
 
     fn reset_view(&mut self) {
         self.finish_animation();
-        let Some(baseline) = self.zoom_baseline.take() else {
-            return;
-        };
         self.pending_zooms.clear();
-        self.pending_restore = Some(PendingRestore {
-            scale: baseline.scale,
-            scroll: baseline.scroll,
-        });
-        self.last_requested_scale = baseline.scale;
-        self.send(Command::SetScale(baseline.scale));
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        // A reset means "fit the page again", so the spread may be eligible
+        // after the worker reports the new fit-page scale.
+        self.spread_blocked = false;
+        self.send(Command::FitPage);
     }
 
     fn zoom(&mut self, factor: f32, command: Command) {
         self.finish_animation();
-        self.pending_restore = None;
-        if self.zoom_baseline.is_none() {
-            self.zoom_baseline = Some(ViewState {
-                scale: self.scale,
-                scroll: (self.scroll_x, self.scroll_y),
-            });
-        }
         let expected_scale = (self.last_requested_scale * factor).clamp(MIN_SCALE, MAX_SCALE);
         self.last_requested_scale = expected_scale;
         let screen = self.zoom_screen_point();
@@ -949,14 +931,18 @@ impl App {
     /// The normalized page-space point currently under `screen`.
     fn page_point_at_screen(&self, screen: (f32, f32)) -> Option<(f32, f32)> {
         let page = self.bitmap.as_ref()?;
-        let (x0, y0) = self.page_origin()?;
         let width = self.visible_width();
         if width == 0 || page.height == 0 {
             return None;
         }
+        // The screen coordinate must be relative to the visible window, not
+        // the whole rendered strip. `page_origin()` points at the strip start
+        // and therefore still includes `spread_offset`.
+        let window_left = self.page_left_offset(width) as f32 - self.scroll_x;
+        let window_top = self.page_vertical_offset(page.height) as f32 - self.scroll_y;
         Some((
-            (screen.0 - x0 as f32) / width as f32,
-            (screen.1 - y0 as f32) / page.height as f32,
+            (screen.0 - window_left) / width as f32,
+            (screen.1 - window_top) / page.height as f32,
         ))
     }
 
@@ -984,8 +970,6 @@ impl App {
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.pending_zooms.clear();
-        self.pending_restore = None;
-        self.zoom_baseline = None;
         self.last_requested_scale = self.scale;
         self.send(if right {
             Command::RotateRight
@@ -1238,6 +1222,7 @@ impl App {
                 }
                 _ => {}
             }
+            return;
         }
 
         match event.logical_key.as_ref() {
@@ -1459,8 +1444,6 @@ impl App {
             .unwrap_or_else(|| self.outline.len().saturating_sub(1));
         self.outline_open = true;
         self.pending_zooms.clear();
-        self.pending_restore = None;
-        self.zoom_baseline = None;
         self.last_requested_scale = self.scale;
         // Opening the panel narrows the content area. Drop the spread in the
         // same event rather than waiting for the worker's single-page reply,
@@ -1511,11 +1494,36 @@ impl App {
         self.request_redraw();
     }
 
+    /// Append committed IME text to the active prompt or command menu.
+    fn commit_text(&mut self, text: &str) {
+        let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(menu) = self.command_menu.as_mut() {
+            menu.query.push_str(&text);
+            self.menu_query_changed();
+            return;
+        }
+        match &mut self.prompt {
+            Prompt::Goto(input) | Prompt::Outline(input) => {
+                input.extend(text.chars().filter(char::is_ascii_digit));
+            }
+            Prompt::Search(input, _) => input.push_str(&text),
+            Prompt::None => return,
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn handle_prompt_key(&mut self, event: &winit::event::KeyEvent) {
         if self.modifiers.control_key()
             && matches!(event.logical_key.as_ref(), Key::Character(ch) if ch == "g")
         {
             self.cancel_prompt();
+            return;
+        }
+        if self.modifiers.control_key() || self.modifiers.alt_key() {
             return;
         }
 
@@ -1636,16 +1644,7 @@ impl App {
             || self.rotation != page.rotation
             || (self.font_scale - page.font_scale).abs() > 1.0e-4;
         let new_scale = page.scale;
-        let restore = if page_changed {
-            self.pending_zooms.clear();
-            self.pending_restore = None;
-            self.zoom_baseline = None;
-            None
-        } else {
-            self.pending_restore
-                .take_if(|pending| (pending.scale - new_scale).abs() < 1.0e-4)
-        };
-        let zoom_anchor = if restore.is_some() || page_changed {
+        let zoom_anchor = if page_changed {
             self.pending_zooms.clear();
             None
         } else {
@@ -1673,17 +1672,12 @@ impl App {
         self.text = page.text;
         self.bitmap = Some(page.bitmap);
         self.resize_preview = false;
-        self.window_index = self
-            .page
-            .saturating_sub(self.pages.first().copied().unwrap_or(self.page));
+        self.window_index = window_index_for(&self.pages, self.page);
         self.spread_offset = self.normal_offset();
         if page_changed {
             self.clear_selection();
             self.scroll_x = 0.0;
             self.scroll_y = 0.0;
-        } else if let Some(restore) = restore {
-            self.scroll_x = restore.scroll.0;
-            self.scroll_y = restore.scroll.1;
         } else if let Some((anchor, screen)) = zoom_anchor {
             self.place_page_point(anchor, screen);
         }
@@ -1810,11 +1804,16 @@ impl App {
                 self.request_redraw();
             }
             WorkerEvent::Status(status) => {
+                self.outline_requested_start = None;
                 self.status = Some(status);
                 self.update_title();
             }
             WorkerEvent::Error(e) => {
                 eprintln!("{TITLE}: {e}");
+                // A failed render would otherwise leave a page-turn or
+                // outline request waiting forever.
+                self.pending_turn = None;
+                self.outline_requested_start = None;
                 self.status = Some(e);
                 self.update_title();
             }
@@ -2339,10 +2338,18 @@ impl ApplicationHandler<UserEvent> for App {
         self.surface = Some(surface);
         self.update_title();
         if let Some(window) = self.window.as_ref() {
+            window.set_ime_allowed(true);
             self.activation.activate(window);
         }
 
-        let worker = WorkerHandle::spawn(self.proxy.clone());
+        let worker = match WorkerHandle::spawn(self.proxy.clone()) {
+            Ok(worker) => worker,
+            Err(e) => {
+                eprintln!("{TITLE}: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
         let viewport_w = if self.outline_open {
             viewport_w.saturating_sub(OUTLINE_WIDTH).max(1)
         } else {
@@ -2410,8 +2417,6 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if size.width > 0 && size.height > 0 {
                     self.pending_zooms.clear();
-                    self.pending_restore = None;
-                    self.zoom_baseline = None;
                     self.last_requested_scale = self.scale;
                     self.schedule_viewport();
                     self.clamp_scroll();
@@ -2421,6 +2426,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
+            WindowEvent::Ime(Ime::Commit(text)) => self.commit_text(&text),
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event_loop, event),
             WindowEvent::CursorMoved { position, .. } => self.handle_cursor_moved(position),
@@ -2522,6 +2528,23 @@ fn page_left_offset(viewport: (u32, u32), content_left: i32, page_width: u32) ->
     content_left + ((content_w - page_width as i32) as f32 / 2.0).round() as i32
 }
 
+/// Whether a viewport update already ends the resize preview. At an explicit
+/// zoom the worker intentionally keeps the current bitmap, and an unchanged
+/// viewport produces no new render either way.
+fn resize_preview_done(fit: Fit, unchanged: bool) -> bool {
+    unchanged || fit == Fit::None
+}
+
+/// Slot of the current page in the rendered strip. Pages can be
+/// non-contiguous when blank reflow pages are filtered out, so this must not
+/// be computed from the page-number difference.
+fn window_index_for(pages: &[usize], page: usize) -> usize {
+    pages
+        .iter()
+        .position(|&candidate| candidate == page)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 fn page_point_at_viewport_center(
     viewport: (u32, u32),
@@ -2592,10 +2615,16 @@ fn scroll_for_page_point_at_screen(
     )
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let config: Config = config::load();
-    let Some(path) = startup::pick_document() else {
-        return Ok(());
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let Some(path) = startup::pick_document() else {
+                return Ok(());
+            };
+            path
+        }
     };
     let fonts = Arc::new(FontCatalog::new(config.font_family().as_deref())?);
     mupdf::set_font_loader(EpubFontLoader::new(fonts.clone()));
@@ -2619,11 +2648,20 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() {
+    // Validate the command line before detaching so usage errors still reach
+    // the invoking shell with a non-zero status.
+    let path = match startup::document_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{TITLE}: {e}");
+            std::process::exit(2);
+        }
+    };
     if let Err(e) = startup::detach() {
         eprintln!("{TITLE}: detach failed: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = run() {
+    if let Err(e) = run(path) {
         eprintln!("{TITLE}: {e}");
         std::process::exit(1);
     }
@@ -2713,6 +2751,37 @@ mod tests {
         let short_point = page_point_at_viewport_center(viewport, 0, short_page, short_scroll);
         let restored = scroll_for_page_point(viewport, 0, fit_page, short_point);
         assert!(close(restored.0, 0.0));
+        assert!(close(restored.1, 0.0));
+    }
+
+    #[test]
+    fn resize_preview_finishes_without_a_render_at_explicit_zoom() {
+        assert!(resize_preview_done(Fit::None, false));
+        assert!(resize_preview_done(Fit::Page, true));
+        assert!(!resize_preview_done(Fit::Page, false));
+    }
+
+    #[test]
+    fn window_index_handles_non_contiguous_reflow_pages() {
+        assert_eq!(window_index_for(&[1, 2, 3, 4], 3), 2);
+        assert_eq!(window_index_for(&[1, 3, 4, 6], 3), 1);
+        assert_eq!(window_index_for(&[2, 4], 2), 0);
+        assert_eq!(window_index_for(&[], 7), 0);
+    }
+
+    #[test]
+    fn visible_window_anchor_ignores_strip_offset() {
+        // The page bitmap for a spread is wider than the visible window. The
+        // anchor must be relative to the window edge, not the strip origin.
+        let viewport = (1100, 900);
+        let visible_window = (1100, 900);
+        let scroll = (100.0, 0.0);
+        let point = page_point_at_screen(viewport, 0, visible_window, scroll, (450.0, 450.0));
+        assert!(close(point.0, 0.5));
+        assert!(close(point.1, 0.5));
+        let restored =
+            scroll_for_page_point_at_screen(viewport, 0, visible_window, point, (450.0, 450.0));
+        assert!(close(restored.0, scroll.0));
         assert!(close(restored.1, 0.0));
     }
 }

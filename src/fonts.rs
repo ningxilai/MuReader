@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Shared font discovery for the outline panel and MuPDF.
 //!
 //! One `fontdb::Database` serves both the native-HarfBuzz UI text stack and the
@@ -213,7 +214,11 @@ impl FontCatalog {
                         let face = Face::from_bytes(data, index);
                         let upem = face.upem().max(1) as f32;
                         let font = harfbuzz_rs::Font::new(face);
-                        let glyph = font.get_nominal_glyph(ch)?;
+                        // Fall back to glyph 0 (.notdef) when the character
+                        // is missing everywhere. A zero-width fallback makes
+                        // the line breaker underestimate the line and lets
+                        // MuPDF wrap it again.
+                        let glyph = font.get_nominal_glyph(ch).unwrap_or(0);
                         Some(font.get_glyph_h_advance(glyph) as f32 / upem)
                     })
                     .flatten();

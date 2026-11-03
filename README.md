@@ -16,10 +16,12 @@ Or install MuReader:
 cargo install --git https://github.com/ningxilai/MuReader.git
 ```
 
-MuPDF is built from `ningxilai/mupdf-rs` (branch `main`), which carries the
-reflow layout fixes used by MuReader. This keeps the MuPDF C changes in the
-fork instead of vendoring the whole C source tree in this repository. Cargo
-fetches the fork and its MuPDF submodules during the first build.
+MuPDF is built from `ningxilai/mupdf-rs` at a pinned revision
+(`ccbeff0373aba5d83eddfc9c44190c1552c4fb22`), which carries the reflow layout
+fixes used by MuReader. Pinning the revision and committing `Cargo.lock` keeps
+builds reproducible. This keeps the MuPDF C changes in the fork instead of
+vendoring the whole C source tree in this repository. Cargo fetches the fork
+and its MuPDF submodules during the first build.
 
 ## Test
 
@@ -32,13 +34,20 @@ cargo test
 ## Run
 
 ```bash
-target/release/mureader
+target/release/mureader [FILE]
 ```
 
-With no arguments, MuReader asks the XDG Desktop Portal for a document, then
-detaches from the invoking shell. The window provides page navigation,
-page/book search, outline, zoom, rotation, text selection/copy, and mouse-wheel
-scrolling.
+With no arguments, MuReader asks the XDG Desktop Portal for a document. Pass a
+file path to open it directly. Either way the process detaches from the
+invoking shell; set `MUREADER_FOREGROUND=1` to keep it attached. The window
+provides page navigation, page/book search, outline, zoom, rotation, text
+selection/copy, and mouse-wheel scrolling.
+
+Supported inputs depend on MuPDF: PDF, EPUB, MOBI, FB2, XPS/OXPS, CBZ, SVG,
+HTML, Office formats such as DOCX/XLSX/PPTX, and common images. `txt`, `text`,
+`md`/`markdown`/`mdown`/`mkd`, `rst`, `org`, `adoc`/`asciidoc`, `tex`, and
+`log` files can also use the plain-text pretty layout described below.
+`Reset view` (`0`) discards an explicit zoom and fits the page again.
 
 MuReader creates one native window and needs no compositor socket. On Wayland
 it requests focus through `xdg_activation_v1` when `XDG_ACTIVATION_TOKEN` is
@@ -94,6 +103,7 @@ Shift. Bindings replace the built-in action, and an empty array disables it.
 Press `:` for the command menu. While it is open, the page is frozen and normal
 shortcuts are disabled. For reflowable documents, `C-=` and `C--` change the base
 text size; the document is reflowed and the current reading position is kept.
+`0` re-fits the page after zooming, page turns, or window resizing.
 
 ## Changelog
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Small single-line text stack for the outline panel.
 //!
 //! Font discovery and fallback come from the shared `FontCatalog` (backed by
