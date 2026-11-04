@@ -336,7 +336,7 @@ next_page = "n"
         assert_eq!(config.reflowable.css_file(), None);
         assert!(config.reflowable.pretty);
         assert!(config.keys.contains_key("quit"));
-        assert!(config.keys.contains_key("goto_page"));
+        assert!(config.keys.contains_key("outline"));
     }
 
     #[test]

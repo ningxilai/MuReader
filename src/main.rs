@@ -71,8 +71,6 @@ pub enum UserEvent {
 
 enum Prompt {
     None,
-    Goto(String),
-    Outline(String),
     Search(String, SearchScope),
 }
 
@@ -82,7 +80,6 @@ enum MenuAction {
     PrevPage,
     FirstPage,
     LastPage,
-    GotoPage,
     Outline,
     SearchPage,
     SearchBook,
@@ -123,11 +120,6 @@ const COMMANDS: &[CommandEntry] = &[
         label: "Last page",
         keywords: "last end finish",
         action: MenuAction::LastPage,
-    },
-    CommandEntry {
-        label: "Go to page…",
-        keywords: "goto jump page number",
-        action: MenuAction::GotoPage,
     },
     CommandEntry {
         label: "Show outline",
@@ -267,6 +259,8 @@ struct App {
     outline_bitmap_start: usize,
     outline_requested_start: Option<usize>,
     outline_scroll: f32,
+    /// Page shown before the outline started previewing other entries.
+    outline_preview_origin: Option<usize>,
     page: usize,
     pages: Vec<usize>,
     page_widths: Vec<u32>,
@@ -344,6 +338,7 @@ impl App {
             outline_bitmap_start: 0,
             outline_requested_start: None,
             outline_scroll: 0.0,
+            outline_preview_origin: None,
             page: 1,
             pages: Vec::new(),
             page_widths: Vec::new(),
@@ -709,11 +704,27 @@ impl App {
 
     fn close_outline(&mut self) {
         self.finish_animation();
+        // A preview may still be in flight, so restore the original page even
+        // when `self.page` has not caught up yet.
+        if let Some(origin) = self.outline_preview_origin.take() {
+            self.send(Command::GotoPage(origin));
+        }
         self.outline_open = false;
         self.spread_blocked = false;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
         self.send_viewport();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn select_outline(&mut self, index: usize) {
+        if self.outline.is_empty() {
+            return;
+        }
+        self.outline_selected = index.min(self.outline.len() - 1);
+        self.ensure_outline_visible();
+        self.preview_outline_selection();
         self.update_title();
         self.request_redraw();
     }
@@ -724,13 +735,29 @@ impl App {
         }
         let last = self.outline.len() - 1;
         let next = (self.outline_selected as isize + delta).clamp(0, last as isize) as usize;
-        if next == self.outline_selected {
+        if next != self.outline_selected {
+            self.select_outline(next);
+        }
+    }
+
+    /// Show the selected outline target in the page area without committing
+    /// the jump. Escape restores the page that was visible before the outline
+    /// opened; Enter keeps the previewed page.
+    fn preview_outline_selection(&mut self) {
+        if self.outline_preview_origin.is_none() {
             return;
         }
-        self.outline_selected = next;
-        self.ensure_outline_visible();
-        self.update_title();
-        self.request_redraw();
+        let Some(page) = self
+            .outline
+            .get(self.outline_selected)
+            .and_then(|entry| entry.page)
+        else {
+            return;
+        };
+        if page != self.page {
+            self.finish_animation();
+            self.send(Command::GotoPage(page));
+        }
     }
 
     fn activate_outline(&mut self) {
@@ -740,8 +767,13 @@ impl App {
             .get(self.outline_selected)
             .and_then(|entry| entry.page);
         if let Some(page) = page {
+            self.outline_preview_origin = None;
             self.send(Command::GotoPage(page));
             self.close_outline();
+        } else {
+            self.status = Some("outline entry has no page".to_string());
+            self.update_title();
+            self.request_redraw();
         }
     }
 
@@ -772,17 +804,11 @@ impl App {
                 true
             }
             Key::Named(NamedKey::Home) => {
-                self.outline_selected = 0;
-                self.ensure_outline_visible();
-                self.update_title();
-                self.request_redraw();
+                self.select_outline(0);
                 true
             }
             Key::Named(NamedKey::End) => {
-                self.outline_selected = self.outline.len().saturating_sub(1);
-                self.ensure_outline_visible();
-                self.update_title();
-                self.request_redraw();
+                self.select_outline(self.outline.len().saturating_sub(1));
                 true
             }
             Key::Character(ch) => match ch {
@@ -994,16 +1020,6 @@ impl App {
         }
 
         match &self.prompt {
-            Prompt::Goto(input) => {
-                window.set_title(&format!("{name} — Goto page: {input}"));
-                return;
-            }
-            Prompt::Outline(input) => {
-                window.set_title(&format!(
-                    "{name} — Outline page (empty for outline): {input}"
-                ));
-                return;
-            }
             Prompt::Search(input, scope) => {
                 let scope = match scope {
                     SearchScope::Page => "Search page",
@@ -1071,18 +1087,6 @@ impl App {
         ));
     }
 
-    fn start_goto_prompt(&mut self) {
-        self.prompt = Prompt::Goto(String::new());
-        self.update_title();
-        self.request_redraw();
-    }
-
-    fn start_outline_prompt(&mut self) {
-        self.prompt = Prompt::Outline(String::new());
-        self.update_title();
-        self.request_redraw();
-    }
-
     fn start_search_prompt(&mut self, scope: SearchScope) {
         self.prompt = Prompt::Search(String::new(), scope);
         self.update_title();
@@ -1092,8 +1096,6 @@ impl App {
     /// The visible, single-line prompt shown above the page.
     fn prompt_line(&self) -> Option<(String, String)> {
         match &self.prompt {
-            Prompt::Goto(input) => Some(("Go to page: ".to_string(), input.clone())),
-            Prompt::Outline(input) => Some(("Outline page: ".to_string(), input.clone())),
             Prompt::Search(query, SearchScope::Page) => {
                 Some(("Search page: ".to_string(), query.clone()))
             }
@@ -1178,8 +1180,7 @@ impl App {
             MenuAction::PrevPage => self.prev_page(),
             MenuAction::FirstPage => self.first_page(),
             MenuAction::LastPage => self.last_page(),
-            MenuAction::GotoPage => self.start_goto_prompt(),
-            MenuAction::Outline => self.open_outline(None),
+            MenuAction::Outline => self.open_outline(),
             MenuAction::SearchPage => self.start_search_prompt(SearchScope::Page),
             MenuAction::SearchBook => self.start_search_prompt(SearchScope::Book),
             MenuAction::ZoomIn => self.zoom_in(),
@@ -1422,26 +1423,22 @@ impl App {
         ))
     }
 
-    fn open_outline(&mut self, target: Option<usize>) {
+    fn open_outline(&mut self) {
         self.finish_animation();
-        let target = target.map(|page| {
-            let page = page.max(1);
-            self.page_count.map_or(page, |count| page.min(count))
-        });
-        if let Some(page) = target {
-            self.send(Command::GotoPage(page));
-        }
         if self.outline.is_empty() {
             self.status = Some("this document has no outline".to_string());
             self.update_title();
             return;
         }
-        let reference = target.unwrap_or(self.page);
         self.outline_selected = self
             .outline
             .iter()
-            .position(|entry| matches!(entry.page, Some(page) if page >= reference))
+            .position(|entry| matches!(entry.page, Some(page) if page >= self.page))
             .unwrap_or_else(|| self.outline.len().saturating_sub(1));
+        // Remember where the reader was so Escape can undo live previews.
+        if self.outline_preview_origin.is_none() {
+            self.outline_preview_origin = Some(self.page);
+        }
         self.outline_open = true;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
@@ -1469,15 +1466,6 @@ impl App {
 
     fn commit_prompt(&mut self) {
         match std::mem::replace(&mut self.prompt, Prompt::None) {
-            Prompt::Goto(input) => {
-                if let Ok(page) = input.parse::<usize>() {
-                    self.goto_page(page);
-                }
-            }
-            Prompt::Outline(input) => {
-                let page = input.parse::<usize>().ok();
-                self.open_outline(page);
-            }
             Prompt::Search(query, scope) => {
                 if !query.is_empty() {
                     self.finish_animation();
@@ -1506,9 +1494,6 @@ impl App {
             return;
         }
         match &mut self.prompt {
-            Prompt::Goto(input) | Prompt::Outline(input) => {
-                input.extend(text.chars().filter(char::is_ascii_digit));
-            }
             Prompt::Search(input, _) => input.push_str(&text),
             Prompt::None => return,
         }
@@ -1538,7 +1523,7 @@ impl App {
                 }
             }
             Key::Named(NamedKey::Backspace) => match &mut self.prompt {
-                Prompt::Goto(input) | Prompt::Outline(input) | Prompt::Search(input, _) => {
+                Prompt::Search(input, _) => {
                     input.pop();
                     self.update_title();
                     self.request_redraw();
@@ -1546,15 +1531,6 @@ impl App {
                 Prompt::None => {}
             },
             Key::Character(ch) => match &mut self.prompt {
-                Prompt::Goto(input) | Prompt::Outline(input) => {
-                    for c in ch.chars() {
-                        if c.is_ascii_digit() {
-                            input.push(c);
-                        }
-                    }
-                    self.update_title();
-                    self.request_redraw();
-                }
                 Prompt::Search(input, _) => {
                     for c in ch.chars() {
                         if !c.is_control() {
@@ -1623,8 +1599,7 @@ impl App {
             Action::ScrollRight => self.scroll_horizontal(60.0),
             Action::ScrollLeftMost => self.scroll_left_most(),
             Action::ScrollRightMost => self.scroll_right_most(),
-            Action::GotoPage => self.start_goto_prompt(),
-            Action::Outline => self.start_outline_prompt(),
+            Action::Outline => self.open_outline(),
             Action::SearchPage => self.start_search_prompt(SearchScope::Page),
             Action::SearchBook => self.start_search_prompt(SearchScope::Book),
             Action::ZoomIn => self.zoom_in(),
@@ -2699,6 +2674,10 @@ mod tests {
             vec!["Show outline"]
         );
         assert!(filtered_commands("nonsense").is_empty());
+        assert!(
+            filtered_commands("goto").is_empty(),
+            "page jumps now live in the outline"
+        );
         assert_eq!(
             COMMANDS[filtered_commands("right")[0]].label,
             "Rotate right"

@@ -23,7 +23,6 @@ pub enum Action {
     ScrollRight,
     ScrollLeftMost,
     ScrollRightMost,
-    GotoPage,
     Outline,
     SearchPage,
     SearchBook,
@@ -54,7 +53,6 @@ impl Action {
             "scroll_right" => Self::ScrollRight,
             "scroll_left_most" => Self::ScrollLeftMost,
             "scroll_right_most" => Self::ScrollRightMost,
-            "goto_page" => Self::GotoPage,
             "outline" => Self::Outline,
             "search_page" => Self::SearchPage,
             "search_book" => Self::SearchBook,
@@ -329,7 +327,6 @@ const DEFAULT_BINDINGS: &[(Action, &str)] = &[
     (Action::ScrollRight, "C-f"),
     (Action::ScrollLeftMost, "C-a"),
     (Action::ScrollRightMost, "C-e"),
-    (Action::GotoPage, "M-g g"),
     (Action::Outline, "o"),
     (Action::SearchPage, "C-s"),
     (Action::SearchBook, "M-s"),
@@ -389,12 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn goto_page_is_a_two_key_sequence() {
+    fn outline_is_bound_to_o() {
         let keymap = Keymap::new(&BTreeMap::new());
-        let first = Chord::parse("M-g").unwrap();
-        let second = Chord::parse("g").unwrap();
-        assert!(keymap.is_prefix(&[first]));
-        assert_eq!(keymap.exact(&[first, second]), Some(Action::GotoPage));
+        let key = Chord::parse("o").unwrap();
+        assert_eq!(keymap.exact(&[key]), Some(Action::Outline));
     }
 
     #[test]

@@ -43,6 +43,13 @@ invoking shell; set `MUREADER_FOREGROUND=1` to keep it attached. The window
 provides page navigation, page/book search, outline, zoom, rotation, text
 selection/copy, and mouse-wheel scrolling.
 
+Navigation follows the document outline. Reflowable plain text is scanned for
+Markdown, reStructuredText, Org, AsciiDoc, and LaTeX headings so the outline
+lists sections instead of pages. Other formats use their embedded table of
+contents when present and fall back to a page-number outline when they do not.
+Moving in the outline previews the highlighted page; Enter keeps it, and
+Escape restores the page that was visible before the outline opened.
+
 Supported inputs depend on MuPDF: PDF, EPUB, MOBI, FB2, XPS/OXPS, CBZ, SVG,
 HTML, Office formats such as DOCX/XLSX/PPTX, and common images. `txt`, `text`,
 `md`/`markdown`/`mdown`/`mkd`, `rst`, `org`, `adoc`/`asciidoc`, `tex`, and
@@ -73,7 +80,6 @@ pretty = true
 quit = ["q", "Q", "Escape"]
 next_page = "n"
 prev_page = "p"
-goto_page = "M-g g"
 outline = "o"
 search_page = "C-s"
 search_book = "M-s"

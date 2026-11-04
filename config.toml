@@ -54,7 +54,6 @@ scroll_left = ["Left", "C-b"]
 scroll_right = ["Right", "C-f"]
 scroll_left_most = "C-a"
 scroll_right_most = "C-e"
-goto_page = "M-g g"
 outline = "o"
 search_page = "C-s"
 search_book = "M-s"
