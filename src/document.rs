@@ -309,23 +309,16 @@ impl RenderEngine {
             .map_err(|e| format!("reflowable CSS: {e}"))?;
 
         let mut pretty_text = pretty && crate::pretty_text::is_plain_text(path);
-        let mut generated_outline = Vec::new();
         let mut doc = if pretty_text {
-            match crate::pretty_text::html_and_outline_for_path(path, &fonts) {
-                Ok((html, headings)) => {
-                    match Document::from_copied_bytes(html.as_bytes(), "text/html") {
-                        Ok(document) => {
-                            generated_outline = headings;
-                            document
-                        }
-                        Err(error) => {
-                            eprintln!("MuReader: pretty text render failed: {error}; using MuPDF");
-                            pretty_text = false;
-                            Document::open(path)
-                                .map_err(|e| format!("open {}: {e}", path.display()))?
-                        }
+            match crate::pretty_text::html_for_path(path, &fonts) {
+                Ok(html) => match Document::from_copied_bytes(html.as_bytes(), "text/html") {
+                    Ok(document) => document,
+                    Err(error) => {
+                        eprintln!("MuReader: pretty text render failed: {error}; using MuPDF");
+                        pretty_text = false;
+                        Document::open(path).map_err(|e| format!("open {}: {e}", path.display()))?
                     }
-                }
+                },
                 Err(error) => {
                     eprintln!("MuReader: pretty text failed: {error}; using MuPDF");
                     pretty_text = false;
@@ -347,7 +340,7 @@ impl RenderEngine {
             return Err("document has no pages".to_string());
         }
         let page_count = Some(count);
-        let outline = build_outline(&doc, count, generated_outline);
+        let outline = build_outline(&doc, count);
         let mut engine = Self {
             doc,
             page: 0,
@@ -394,24 +387,19 @@ impl RenderEngine {
         let anchor = self.page_anchor();
         self.search_query = None;
 
-        let generated_outline = if self.pretty_text {
-            let (html, headings) = crate::pretty_text::html_and_outline_for_path_at(
-                &self.source_path,
-                &self.fonts,
-                target,
-            )?;
+        if self.pretty_text {
+            let html =
+                crate::pretty_text::html_for_path_at(&self.source_path, &self.fonts, target)?;
             let mut doc = Document::from_copied_bytes(html.as_bytes(), "text/html")
                 .map_err(|e| format!("pretty text render: {e}"))?;
             doc.layout(LAYOUT_WIDTH, LAYOUT_HEIGHT, target)
                 .map_err(|e| format!("layout: {e}"))?;
             self.doc = doc;
-            headings
         } else {
             self.doc
                 .layout(LAYOUT_WIDTH, LAYOUT_HEIGHT, target)
                 .map_err(|e| format!("layout: {e}"))?;
-            Vec::new()
-        };
+        }
 
         self.font_size = target;
         let count = self
@@ -422,7 +410,7 @@ impl RenderEngine {
             return Err("document has no pages".to_string());
         }
         self.page_count = Some(count);
-        self.outline = build_outline(&self.doc, count, generated_outline);
+        self.outline = build_outline(&self.doc, count);
         self.page = self
             .find_anchor(anchor.as_deref(), old_page, count)
             .unwrap_or_else(|| {
@@ -1369,28 +1357,14 @@ fn flatten_outlines(outlines: &[Outline], depth: usize) -> Vec<OutlineEntry> {
     entries
 }
 
-/// Prefer a generated section outline, then the document's own table of
-/// contents, then a page-number outline. The last fallback keeps outline
-/// navigation useful for image-only or untagged documents.
-fn build_outline(
-    doc: &Document,
-    page_count: usize,
-    generated: Vec<crate::pretty_text::Heading>,
-) -> Vec<OutlineEntry> {
-    let mut outline = if generated.is_empty() {
-        doc.outlines()
-            .map(|outlines| flatten_outlines(&outlines, 0))
-            .unwrap_or_default()
-    } else {
-        generated
-            .into_iter()
-            .map(|heading| OutlineEntry {
-                title: heading.title,
-                page: Some(heading.page + 1),
-                depth: heading.level.saturating_sub(1),
-            })
-            .collect()
-    };
+/// Use the document's own table of contents when MuPDF provides one, then
+/// fall back to a page-number outline. The fallback keeps outline navigation
+/// useful for image-only, untagged, or styleless text documents.
+fn build_outline(doc: &Document, page_count: usize) -> Vec<OutlineEntry> {
+    let mut outline = doc
+        .outlines()
+        .map(|outlines| flatten_outlines(&outlines, 0))
+        .unwrap_or_default();
     for entry in &mut outline {
         if entry.title.trim().is_empty() {
             entry.title = entry
@@ -1642,10 +1616,10 @@ mod tests {
     }
 
     #[test]
-    fn pretty_text_outline_uses_sections_then_pages() {
+    fn plain_text_outline_falls_back_to_pages() {
         let _guard = doc_test_guard();
         let dir = test_dir("outline");
-        let path = dir.join("sections.md");
+        let path = dir.join("notes.md");
         let mut text = String::from("# Chapter One\n\nIntro paragraph.\n\n## Section A\n\n");
         for i in 0..80 {
             text.push_str(&format!(
@@ -1664,38 +1638,46 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog.clone(), None, true).unwrap();
         let outline = engine.outline();
-        assert_eq!(outline[0].title, "Chapter One");
-        assert_eq!(outline[0].depth, 0);
-        assert_eq!(outline[0].page, Some(1));
-        assert!(outline
-            .iter()
-            .any(|entry| entry.title == "Section A" && entry.depth == 1));
-        let second = outline
-            .iter()
-            .find(|entry| entry.title == "Chapter Two")
-            .expect("second chapter missing from outline");
-        let second_page = second.page.unwrap();
-        assert!(second_page > 1);
-
-        assert!(engine.adjust_font(1.5).unwrap());
-        let reflowed = engine.outline();
-        assert_eq!(reflowed[0].title, "Chapter One");
-        let second = reflowed
-            .iter()
-            .find(|entry| entry.title == "Chapter Two")
-            .expect("second chapter missing after reflow");
-        assert!(
-            second.page.unwrap() > second_page,
-            "outline page numbers must follow the reflowed document"
-        );
-
-        let plain = dir.join("plain.txt");
-        std::fs::write(&plain, "no headings here\n\njust text").unwrap();
-        let engine = RenderEngine::open(&plain, catalog, None, true).unwrap();
-        let outline = engine.outline();
         assert_eq!(outline.len(), engine.page_count.unwrap());
         assert_eq!(outline[0].title, "Page 1");
         assert!(outline.iter().all(|entry| entry.title.starts_with("Page ")));
+
+        assert!(engine.adjust_font(1.5).unwrap());
+        let reflowed = engine.outline();
+        assert_eq!(reflowed.len(), engine.page_count.unwrap());
+        assert!(reflowed
+            .iter()
+            .all(|entry| entry.title.starts_with("Page ")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn html_outline_comes_from_the_document() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("html-outline");
+        let path = dir.join("sections.html");
+        let mut html =
+            String::from("<!doctype html><html><body><h1>Chapter One</h1><h2>Section A</h2>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("<h1>Chapter Two</h1></body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        let titles: Vec<&str> = engine
+            .outline()
+            .iter()
+            .map(|entry| entry.title.as_str())
+            .collect();
+        assert!(titles.contains(&"Chapter One"), "{titles:?}");
+        assert!(titles.contains(&"Section A"), "{titles:?}");
+        assert!(titles.contains(&"Chapter Two"), "{titles:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

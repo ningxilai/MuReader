@@ -43,10 +43,9 @@ invoking shell; set `MUREADER_FOREGROUND=1` to keep it attached. The window
 provides page navigation, page/book search, outline, zoom, rotation, text
 selection/copy, and mouse-wheel scrolling.
 
-Navigation follows the document outline. Reflowable plain text is scanned for
-Markdown, reStructuredText, Org, AsciiDoc, and LaTeX headings so the outline
-lists sections instead of pages. Other formats use their embedded table of
-contents when present and fall back to a page-number outline when they do not.
+Navigation uses the table of contents MuPDF provides for PDF, EPUB, HTML,
+FB2, and other structured documents. Documents without a table of contents,
+including styleless plain-text and markup sources, use a page-number outline.
 Moving in the outline previews the highlighted page; Enter keeps it, and
 Escape restores the page that was visible before the outline opened.
 

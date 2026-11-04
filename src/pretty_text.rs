@@ -79,45 +79,17 @@ pub fn is_plain_text(path: &Path) -> bool {
         })
 }
 
-/// A section heading detected in a styleless source file. Page indices are
-/// zero-based positions in the generated HTML document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Heading {
-    pub title: String,
-    /// One-based heading depth: 1 for a top-level section.
-    pub level: usize,
-    pub page: usize,
+/// Build a paginated HTML document for a plain-text file.
+pub fn html_for_path(path: &Path, fonts: &FontCatalog) -> Result<String, String> {
+    html_for_path_at(path, fonts, FONT_SIZE)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceFormat {
-    Text,
-    Markdown,
-    Rest,
-    Org,
-    AsciiDoc,
-    Latex,
-}
-
-struct Paragraph {
-    text: String,
-    heading: Option<(String, usize)>,
-}
-
-/// Build a paginated HTML document and its section outline for a plain-text
-/// file. The outline page numbers refer to the generated HTML pages.
-pub fn html_and_outline_for_path(
-    path: &Path,
-    fonts: &FontCatalog,
-) -> Result<(String, Vec<Heading>), String> {
-    html_and_outline_for_path_at(path, fonts, FONT_SIZE)
-}
-
-pub fn html_and_outline_for_path_at(
+/// Build a plain-text document at a specific base font size.
+pub fn html_for_path_at(
     path: &Path,
     fonts: &FontCatalog,
     font_size: f32,
-) -> Result<(String, Vec<Heading>), String> {
+) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let text = String::from_utf8(bytes).map_err(|_| {
         format!(
@@ -126,12 +98,7 @@ pub fn html_and_outline_for_path_at(
         )
     })?;
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-    Ok(html_and_outline_for_text_at(
-        text,
-        fonts,
-        font_size,
-        source_format(path),
-    ))
+    Ok(html_for_text_at(text, fonts, font_size))
 }
 
 /// Build a paginated HTML document from text.
@@ -141,37 +108,20 @@ pub fn html_for_text(text: &str, fonts: &FontCatalog) -> String {
 }
 
 /// Build a paginated HTML document from text at a specific base font size.
-#[cfg(test)]
 pub fn html_for_text_at(text: &str, fonts: &FontCatalog, font_size: f32) -> String {
-    html_and_outline_for_text_at(text, fonts, font_size, SourceFormat::Text).0
-}
-
-fn html_and_outline_for_text_at(
-    text: &str,
-    fonts: &FontCatalog,
-    font_size: f32,
-    format: SourceFormat,
-) -> (String, Vec<Heading>) {
-    let paragraphs = split_paragraphs(text, format);
+    let paragraphs = split_paragraphs(text);
     let line_height = font_size * 1.5;
     let lines_per_page = ((CONTENT_HEIGHT / line_height) as usize).max(1);
     let mut pages: Vec<Vec<String>> = Vec::new();
     let mut current: Vec<String> = Vec::new();
-    let mut headings = Vec::new();
 
     for paragraph in paragraphs {
-        let lines = layout_paragraph_at(&paragraph.text, font_size, |piece| {
+        let lines = layout_paragraph_at(&paragraph, font_size, |piece| {
             fonts.measure_text(piece, font_size)
         });
         let remaining = lines_per_page.saturating_sub(current.len());
         if remaining < 2 && lines.len() > remaining {
             pages.push(std::mem::take(&mut current));
-        }
-        let page = pages.len();
-        if let Some((title, level)) = paragraph.heading {
-            if !lines.is_empty() {
-                headings.push(Heading { title, level, page });
-            }
         }
         for line in lines {
             if current.len() >= lines_per_page {
@@ -190,170 +140,42 @@ fn html_and_outline_for_text_at(
             page.pop();
         }
     }
-    let mut remap = vec![None; pages.len()];
-    let mut next_page = 0;
-    for (index, page) in pages.iter().enumerate() {
-        if !page.is_empty() {
-            remap[index] = Some(next_page);
-            next_page += 1;
-        }
-    }
     pages.retain(|page| !page.is_empty());
     if pages.is_empty() {
         pages.push(Vec::new());
     }
-    headings = headings
-        .into_iter()
-        .filter_map(|mut heading| {
-            let page = remap.get(heading.page).copied().flatten()?;
-            heading.page = page;
-            Some(heading)
-        })
-        .collect();
 
-    (render_html(&pages, font_size, line_height), headings)
+    render_html(&pages, font_size, line_height)
 }
 
-fn source_format(path: &Path) -> SourceFormat {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" | "markdown" | "mdown" | "mkd" => SourceFormat::Markdown,
-        "rst" => SourceFormat::Rest,
-        "org" => SourceFormat::Org,
-        "adoc" | "asciidoc" => SourceFormat::AsciiDoc,
-        "tex" => SourceFormat::Latex,
-        _ => SourceFormat::Text,
-    }
-}
-
-fn split_paragraphs(text: &str, format: SourceFormat) -> Vec<Paragraph> {
+fn split_paragraphs(text: &str) -> Vec<String> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut paragraphs = Vec::new();
     let mut current = String::new();
-    let mut lines = normalized.lines().map(str::trim).peekable();
 
-    while let Some(line) = lines.next() {
+    for line in normalized.lines() {
+        let line = line.trim();
         if line.is_empty() {
-            flush_paragraph(&mut paragraphs, &mut current);
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
+            }
             continue;
         }
-        if let Some((title, level)) = line_heading(line, format) {
-            flush_paragraph(&mut paragraphs, &mut current);
-            paragraphs.push(Paragraph {
-                text: line.to_string(),
-                heading: Some((title, level)),
-            });
-            continue;
-        }
-        if let Some(underline) = lines.peek() {
-            if let Some(level) = setext_heading(underline, format) {
-                flush_paragraph(&mut paragraphs, &mut current);
-                paragraphs.push(Paragraph {
-                    text: format!("{line} {underline}"),
-                    heading: Some((line.to_string(), level)),
-                });
-                lines.next();
-                continue;
+        if !current.is_empty() {
+            let previous = current.chars().last().unwrap_or(' ');
+            let next = line.chars().next().unwrap_or(' ');
+            if previous == '-' && next.is_lowercase() {
+                current.pop();
+            } else if !(is_cjk(previous) && is_cjk(next)) {
+                current.push(' ');
             }
         }
-        merge_line(&mut current, line);
+        current.push_str(line);
     }
-    flush_paragraph(&mut paragraphs, &mut current);
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
     paragraphs
-}
-
-fn flush_paragraph(paragraphs: &mut Vec<Paragraph>, current: &mut String) {
-    if !current.is_empty() {
-        paragraphs.push(Paragraph {
-            text: std::mem::take(current),
-            heading: None,
-        });
-    }
-}
-
-fn merge_line(current: &mut String, line: &str) {
-    if !current.is_empty() {
-        let previous = current.chars().last().unwrap_or(' ');
-        let next = line.chars().next().unwrap_or(' ');
-        if previous == '-' && next.is_lowercase() {
-            current.pop();
-        } else if !(is_cjk(previous) && is_cjk(next)) {
-            current.push(' ');
-        }
-    }
-    current.push_str(line);
-}
-
-/// Recognize a heading written on a single line.
-fn line_heading(line: &str, format: SourceFormat) -> Option<(String, usize)> {
-    let line = line.trim_start();
-    match format {
-        SourceFormat::Markdown => atx_heading(line, '#', true),
-        SourceFormat::Org => atx_heading(line, '*', false),
-        SourceFormat::AsciiDoc => atx_heading(line, '=', false),
-        SourceFormat::Latex => latex_heading(line),
-        SourceFormat::Text | SourceFormat::Rest => None,
-    }
-}
-
-fn atx_heading(line: &str, marker: char, closing_marker: bool) -> Option<(String, usize)> {
-    let level = line.chars().take_while(|&ch| ch == marker).count();
-    if level == 0 || level > 6 {
-        return None;
-    }
-    let rest = &line[level..];
-    if !rest.starts_with([' ', '\t']) {
-        return None;
-    }
-    let mut title = rest.trim();
-    if closing_marker {
-        title = title.trim_end_matches(marker).trim();
-    }
-    (!title.is_empty()).then(|| (title.to_string(), level))
-}
-
-fn latex_heading(line: &str) -> Option<(String, usize)> {
-    let rest = line.strip_prefix('\\')?;
-    let (command, tail) = rest.split_once('{')?;
-    let level = match command.trim_end_matches('*') {
-        "part" => 1,
-        "chapter" => 2,
-        "section" => 3,
-        "subsection" => 4,
-        "subsubsection" => 5,
-        "paragraph" => 6,
-        _ => return None,
-    };
-    let title = tail.strip_suffix('}')?.trim();
-    (!title.is_empty()).then(|| (title.to_string(), level))
-}
-
-fn setext_heading(line: &str, format: SourceFormat) -> Option<usize> {
-    let line = line.trim();
-    let marker = line.chars().next()?;
-    let allowed = match format {
-        SourceFormat::Markdown => matches!(marker, '=' | '-'),
-        SourceFormat::Rest => matches!(marker, '=' | '-' | '~' | '^' | '"' | '\''),
-        SourceFormat::Text | SourceFormat::Org | SourceFormat::AsciiDoc | SourceFormat::Latex => {
-            false
-        }
-    };
-    if !allowed || line.chars().count() < 3 || !line.chars().all(|ch| ch == marker) {
-        return None;
-    }
-    Some(match marker {
-        '=' => 1,
-        '-' => 2,
-        '~' => 3,
-        '^' => 4,
-        '"' => 5,
-        _ => 6,
-    })
 }
 
 #[cfg(test)]
@@ -735,65 +557,8 @@ mod tests {
 
     #[test]
     fn joins_soft_wrapped_lines_and_cjk_without_spaces() {
-        let paragraphs = split_paragraphs("hello\nworld\n\n你\n好", SourceFormat::Text);
-        let texts: Vec<&str> = paragraphs
-            .iter()
-            .map(|paragraph| paragraph.text.as_str())
-            .collect();
-        assert_eq!(texts, vec!["hello world", "你好"]);
-    }
-
-    #[test]
-    fn extracts_markdown_headings_for_the_outline() {
-        let fonts = FontCatalog::new(None).unwrap();
-        let text =
-            "# Chapter One\n\nbody\n\n## Section A\n\nbody\n\nSetext title\n------------\n\nbody";
-        let (_, headings) =
-            html_and_outline_for_text_at(text, &fonts, 12.0, SourceFormat::Markdown);
-        let titles: Vec<&str> = headings
-            .iter()
-            .map(|heading| heading.title.as_str())
-            .collect();
-        assert_eq!(titles, vec!["Chapter One", "Section A", "Setext title"]);
-        assert_eq!(headings[0].level, 1);
-        assert_eq!(headings[1].level, 2);
-        assert_eq!(headings[2].level, 2);
-    }
-
-    #[test]
-    fn extracts_org_asciidoc_rest_and_latex_headings() {
-        let fonts = FontCatalog::new(None).unwrap();
-        let org = "* Chapter\n** Section\n";
-        let (_, headings) = html_and_outline_for_text_at(org, &fonts, 12.0, SourceFormat::Org);
-        assert_eq!(headings[0].title, "Chapter");
-        assert_eq!(headings[1].level, 2);
-
-        let asciidoc = "= Chapter\n== Section\n";
-        let (_, headings) =
-            html_and_outline_for_text_at(asciidoc, &fonts, 12.0, SourceFormat::AsciiDoc);
-        assert_eq!(headings[0].title, "Chapter");
-        assert_eq!(headings[1].level, 2);
-
-        let rest = "Chapter\n=======\n\nSection\n-------\n";
-        let (_, headings) = html_and_outline_for_text_at(rest, &fonts, 12.0, SourceFormat::Rest);
-        assert_eq!(headings[0].title, "Chapter");
-        assert_eq!(headings[0].level, 1);
-        assert_eq!(headings[1].title, "Section");
-        assert_eq!(headings[1].level, 2);
-
-        let latex = "\\chapter{Chapter}\n\\section{Section}\n";
-        let (_, headings) = html_and_outline_for_text_at(latex, &fonts, 12.0, SourceFormat::Latex);
-        assert_eq!(headings[0].title, "Chapter");
-        assert_eq!(headings[1].title, "Section");
-        assert_eq!(headings[1].level, 3);
-    }
-
-    #[test]
-    fn plain_text_does_not_invent_headings() {
-        let fonts = FontCatalog::new(None).unwrap();
-        let text = "# Not a heading in plain text\n\n* nor this\n";
-        let (_, headings) = html_and_outline_for_text_at(text, &fonts, 12.0, SourceFormat::Text);
-        assert!(headings.is_empty());
+        let paragraphs = split_paragraphs("hello\nworld\n\n你\n好");
+        assert_eq!(paragraphs, vec!["hello world", "你好"]);
     }
 
     #[test]
