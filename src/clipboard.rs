@@ -89,6 +89,9 @@ impl Drop for ClipboardHandle {
     }
 }
 
+/// Clipboard worker. `libc::poll` is the only unsafe operation here; the file
+/// descriptors stay valid for the lifetime of the loop iteration.
+#[allow(unsafe_code)]
 fn run(rx: Receiver<Command>, wake: UnixStream, proxy: EventLoopProxy<UserEvent>) {
     let mut backend = match ClipboardProxy::new() {
         Some(backend) => backend,
@@ -116,6 +119,8 @@ fn run(rx: Receiver<Command>, wake: UnixStream, proxy: EventLoopProxy<UserEvent>
                 revents: 0,
             },
         ];
+        // SAFETY: `fds` is a live array of two initialized poll descriptors,
+        // and `poll` only reads and updates those entries during this call.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
         if ready < 0 {
             let err = std::io::Error::last_os_error();

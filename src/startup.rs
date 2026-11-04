@@ -6,6 +6,11 @@
 //! shell that launched it. The foreground escape hatch exists only for
 //! debugging and automated checks.
 
+// Detaching a process inherently calls libc (`pipe`, `fork`, `setsid`,
+// `dup2`, ...). Keep that FFI boundary in this module and document each
+// unsafe operation rather than spreading it through the UI code.
+#![allow(unsafe_code)]
+
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -113,32 +118,48 @@ pub fn detach() -> io::Result<()> {
 
 /// Run in the first child. On success this function returns only in the
 /// grandchild; the intermediate parent exits without running destructors.
+///
+/// # Safety
+///
+/// Must be called in the child returned by `fork`, before any worker threads
+/// exist. The process may only call async-signal-safe operations until the
+/// second fork completes.
 unsafe fn detach_child(write_fd: RawFd) -> io::Result<()> {
-    if libc::setsid() == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    match libc::fork() {
-        -1 => return Err(io::Error::last_os_error()),
-        0 => {}
-        _ => libc::_exit(0),
-    }
+    // SAFETY: this function is only reached in the single-threaded child
+    // created by `detach`, before the event loop or workers start.
+    unsafe {
+        if libc::setsid() == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {}
+            _ => libc::_exit(0),
+        }
 
-    if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
-        return Err(io::Error::last_os_error());
-    }
-    redirect_standard_fds()?;
-    if !write_status(write_fd, true) {
+        if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        redirect_standard_fds()?;
+        if !write_status(write_fd, true) {
+            libc::close(write_fd);
+            return Err(io::Error::last_os_error());
+        }
         libc::close(write_fd);
-        return Err(io::Error::last_os_error());
     }
-    libc::close(write_fd);
     Ok(())
 }
 
+/// # Safety
+///
+/// `fd` must be the write end of the status pipe created by `detach`, and the
+/// pipe must remain open for the duration of the call.
 unsafe fn write_status(fd: RawFd, success: bool) -> bool {
     let byte = [if success { 0 } else { 1 }];
     loop {
-        let written = libc::write(fd, byte.as_ptr().cast(), 1);
+        // SAFETY: `fd` is a live pipe file descriptor and `byte` is a valid
+        // one-byte source buffer.
+        let written = unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
         if written == 1 {
             return true;
         }
@@ -149,6 +170,10 @@ unsafe fn write_status(fd: RawFd, success: bool) -> bool {
     }
 }
 
+/// # Safety
+///
+/// `fd` must be the read end of the status pipe created by `detach`, and the
+/// pipe must remain open for the duration of the call.
 unsafe fn wait_status(fd: RawFd) -> bool {
     let mut poll = libc::pollfd {
         fd,
@@ -156,9 +181,11 @@ unsafe fn wait_status(fd: RawFd) -> bool {
         revents: 0,
     };
     loop {
-        let ready = libc::poll(&mut poll, 1, DETACH_TIMEOUT_MS);
+        // SAFETY: `poll` is a live descriptor and the timeout is fixed.
+        let ready = unsafe { libc::poll(&mut poll, 1, DETACH_TIMEOUT_MS) };
         if ready > 0 {
-            return read_status(fd);
+            // SAFETY: `fd` remains the read end of the same status pipe.
+            return unsafe { read_status(fd) };
         }
         if ready == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
@@ -167,10 +194,16 @@ unsafe fn wait_status(fd: RawFd) -> bool {
     }
 }
 
+/// # Safety
+///
+/// `fd` must be the read end of the status pipe created by `detach`, and the
+/// pipe must remain open for the duration of the call.
 unsafe fn read_status(fd: RawFd) -> bool {
     let mut byte = [1u8];
     loop {
-        let read = libc::read(fd, byte.as_mut_ptr().cast(), 1);
+        // SAFETY: `fd` is a live pipe file descriptor and `byte` is a valid
+        // one-byte destination buffer.
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if read == 1 {
             return byte[0] == 0;
         }
@@ -188,6 +221,8 @@ fn redirect_standard_fds() -> io::Result<()> {
         .open("/dev/null")?;
     let null_fd = null.as_raw_fd();
     for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO] {
+        // SAFETY: `null_fd` is an open descriptor; `dup2` only replaces the
+        // descriptor table entry for the standard file descriptor.
         if unsafe { libc::dup2(null_fd, fd) } == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -195,6 +230,8 @@ fn redirect_standard_fds() -> io::Result<()> {
 
     let log = log_file();
     let error_fd = log.as_ref().map_or(null_fd, AsRawFd::as_raw_fd);
+    // SAFETY: `error_fd` is either the open `/dev/null` descriptor or the open
+    // log file; both outlive this call.
     if unsafe { libc::dup2(error_fd, libc::STDERR_FILENO) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -221,6 +258,8 @@ mod tests {
     #[test]
     fn status_pipe_reports_success_and_failure() {
         for expected in [true, false] {
+            // SAFETY: these tests own both ends of the pipe and keep them valid
+            // until every read, write, and close below has completed.
             let mut pipe = [-1; 2];
             assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
             assert!(unsafe { write_status(pipe[1], expected) });
@@ -232,6 +271,8 @@ mod tests {
 
     #[test]
     fn closed_status_pipe_is_a_failure() {
+        // SAFETY: the test owns both ends of the pipe and closes them only
+        // after the status check.
         let mut pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         unsafe { libc::close(pipe[1]) };

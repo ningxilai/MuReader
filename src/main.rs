@@ -10,6 +10,11 @@
 //! The UI thread never touches MuPDF. The worker owns the `Document`; only
 //! finished page bitmaps and plain text-layer data cross the thread boundary.
 
+// Keep the document, renderer, input, and progress paths free of unsafe code.
+// The platform modules below opt out individually because they wrap FFI.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod activation;
 mod clipboard;
 mod config;

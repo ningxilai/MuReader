@@ -65,6 +65,9 @@ impl Activation {
     }
 }
 
+/// Activation is an FFI boundary: winit owns the raw Wayland objects, and
+/// `from_foreign_display`/`ObjectId::from_ptr` only borrow them for this call.
+#[allow(unsafe_code)]
 fn request_activation(window: &Window, token: &str) -> Result<bool, String> {
     let RawDisplayHandle::Wayland(display) = window
         .display_handle()
