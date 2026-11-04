@@ -29,9 +29,6 @@ const ENV_PROGRESS: &str = "MUREADER_PROGRESS";
 /// Prefix for paths that are not valid UTF-8. The rest of the mark is the
 /// path's bytes in lowercase hexadecimal.
 const BYTES_PREFIX: &str = "@bytes:";
-/// Keep the history bounded. Vim keeps ten file marks; a reader can
-/// reasonably remember more, but the file should not grow without limit.
-const MAX_ENTRIES: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
@@ -39,24 +36,32 @@ struct Entry {
     page: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProgressStore {
     file: Option<PathBuf>,
     entries: Vec<Entry>,
+    max_entries: usize,
 }
 
 impl ProgressStore {
-    pub fn load() -> Self {
-        Self::from_file(progress_path())
+    pub fn load(max_entries: usize) -> Self {
+        Self::from_file(progress_path(), max_entries)
     }
 
-    fn from_file(file: Option<PathBuf>) -> Self {
-        let entries = file
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map(|text| parse(&text))
-            .unwrap_or_default();
-        Self { file, entries }
+    fn from_file(file: Option<PathBuf>, max_entries: usize) -> Self {
+        let entries = if max_entries == 0 {
+            Vec::new()
+        } else {
+            file.as_ref()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .map(|text| parse(&text, max_entries))
+                .unwrap_or_default()
+        };
+        Self {
+            file,
+            entries,
+            max_entries,
+        }
     }
 
     /// The last recorded page for a document, if any.
@@ -71,7 +76,7 @@ impl ProgressStore {
     /// Record a document's current page. The mark is moved to the front and
     /// the file is rewritten immediately so an abrupt exit cannot lose it.
     pub fn record(&mut self, document: &Path, page: usize) {
-        if page == 0 {
+        if page == 0 || self.max_entries == 0 {
             return;
         }
         let key = canonicalize(document);
@@ -82,7 +87,7 @@ impl ProgressStore {
             self.entries.remove(index);
         }
         self.entries.insert(0, Entry { path: key, page });
-        self.entries.truncate(MAX_ENTRIES);
+        self.entries.truncate(self.max_entries);
         self.save();
     }
 
@@ -120,8 +125,11 @@ fn canonicalize(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn parse(text: &str) -> Vec<Entry> {
+fn parse(text: &str, max_entries: usize) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
+    if max_entries == 0 {
+        return entries;
+    }
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         if line.is_empty() || line.starts_with('#') {
@@ -144,7 +152,7 @@ fn parse(text: &str) -> Vec<Entry> {
             continue;
         }
         entries.push(Entry { path, page });
-        if entries.len() == MAX_ENTRIES {
+        if entries.len() == max_entries {
             break;
         }
     }
@@ -305,6 +313,7 @@ mod tests {
              '0 /ignored\n\
              random noise\n\
              '4 /home/user/books/one.pdf\n",
+            100,
         );
         assert_eq!(
             entries,
@@ -325,13 +334,13 @@ mod tests {
     fn round_trips_paths_with_spaces_and_escapes() {
         let dir = test_dir("progress");
         let file = dir.join("progress");
-        let mut store = ProgressStore::from_file(Some(file.clone()));
+        let mut store = ProgressStore::from_file(Some(file.clone()), 100);
         let title = "a book\\with\todd\nname.pdf";
         let document = dir.join(title);
         fs::write(&document, b"x").unwrap();
 
         store.record(&document, 42);
-        let loaded = ProgressStore::from_file(Some(file));
+        let loaded = ProgressStore::from_file(Some(file), 100);
         assert_eq!(loaded.page_for(&document), Some(42));
 
         let _ = fs::remove_dir_all(&dir);
@@ -349,9 +358,9 @@ mod tests {
         let document = dir.join(name);
         fs::write(&document, b"x").unwrap();
 
-        let mut store = ProgressStore::from_file(Some(file.clone()));
+        let mut store = ProgressStore::from_file(Some(file.clone()), 100);
         store.record(&document, 5);
-        let loaded = ProgressStore::from_file(Some(file));
+        let loaded = ProgressStore::from_file(Some(file), 100);
         assert_eq!(loaded.page_for(&document), Some(5));
 
         let _ = fs::remove_dir_all(&dir);
@@ -359,21 +368,59 @@ mod tests {
 
     #[test]
     fn newest_document_comes_first_and_repeats_move_to_front() {
-        let entries = parse("'1 /a\n'2 /b\n");
+        let entries = parse("'1 /a\n'2 /b\n", 100);
         assert_eq!(entries[0].path, PathBuf::from("/a"));
         assert_eq!(entries[1].path, PathBuf::from("/b"));
 
-        let parsed = parse(&render(&[
-            Entry {
-                path: PathBuf::from("/b"),
-                page: 9,
-            },
-            Entry {
-                path: PathBuf::from("/a"),
-                page: 1,
-            },
-        ]));
+        let parsed = parse(
+            &render(&[
+                Entry {
+                    path: PathBuf::from("/b"),
+                    page: 9,
+                },
+                Entry {
+                    path: PathBuf::from("/a"),
+                    page: 1,
+                },
+            ]),
+            100,
+        );
         assert_eq!(parsed[0].path, PathBuf::from("/b"));
         assert_eq!(parsed[0].page, 9);
+    }
+
+    #[test]
+    fn keeps_only_the_configured_number_of_documents() {
+        let dir = test_dir("progress-limit");
+        let file = dir.join("progress");
+        let mut store = ProgressStore::from_file(Some(file.clone()), 2);
+
+        for (name, page) in [("a.pdf", 1), ("b.pdf", 2), ("c.pdf", 3)] {
+            let document = dir.join(name);
+            fs::write(&document, b"x").unwrap();
+            store.record(&document, page);
+        }
+
+        let loaded = ProgressStore::from_file(Some(file), 2);
+        assert_eq!(loaded.page_for(&dir.join("c.pdf")), Some(3));
+        assert_eq!(loaded.page_for(&dir.join("b.pdf")), Some(2));
+        assert_eq!(loaded.page_for(&dir.join("a.pdf")), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_limit_disables_progress() {
+        let dir = test_dir("progress-off");
+        let file = dir.join("progress");
+        let document = dir.join("book.pdf");
+        fs::write(&document, b"x").unwrap();
+
+        let mut store = ProgressStore::from_file(Some(file.clone()), 0);
+        store.record(&document, 9);
+        assert_eq!(store.page_for(&document), None);
+        assert!(!file.exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

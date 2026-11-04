@@ -318,8 +318,9 @@ impl App {
         pretty_text: bool,
         page_turn_duration: Duration,
         window_fit_duration: Duration,
+        progress_limit: usize,
     ) -> Self {
-        let progress = ProgressStore::load();
+        let progress = ProgressStore::load(progress_limit);
         let resume_page = progress.page_for(&path).filter(|&page| page > 1);
         Self {
             path,
@@ -2648,6 +2649,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         config.reflowable.pretty,
         Duration::from_millis(config.animation.page_turn_ms),
         Duration::from_millis(config.animation.window_fit_ms),
+        config.progress.max_documents,
     );
     event_loop.run_app(&mut app)?;
     Ok(())

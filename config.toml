@@ -37,6 +37,11 @@ css_file = ""
 # Markup is kept verbatim. EPUB/HTML/FB2 keep MuPDF's own layout.
 pretty = true
 
+[progress]
+# Number of documents whose last-read page is remembered. New entries
+# replace the oldest one. Set to 0 to disable reading progress.
+max_documents = 100
+
 [keys]
 # Each binding is a key sequence; put spaces between sequence steps.
 # Multiple bindings for one action use an array.

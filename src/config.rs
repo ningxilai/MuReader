@@ -20,6 +20,7 @@ const DEFAULT_CONFIG: &str = include_str!("../config.toml");
 pub struct Config {
     pub animation: AnimationConfig,
     pub reflowable: ReflowableConfig,
+    pub progress: ProgressConfig,
     pub keys: BTreeMap<String, KeySpec>,
     #[serde(skip)]
     base_dir: Option<PathBuf>,
@@ -61,6 +62,20 @@ impl Default for ReflowableConfig {
             css_file: None,
             pretty: true,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProgressConfig {
+    /// How many documents keep a last-read page. The newest entries win.
+    /// Zero disables reading progress.
+    pub max_documents: usize,
+}
+
+impl Default for ProgressConfig {
+    fn default() -> Self {
+        Self { max_documents: 100 }
     }
 }
 
@@ -335,6 +350,7 @@ next_page = "n"
         assert_eq!(config.reflowable.css(), None);
         assert_eq!(config.reflowable.css_file(), None);
         assert!(config.reflowable.pretty);
+        assert_eq!(config.progress.max_documents, 100);
         assert!(config.keys.contains_key("quit"));
         assert!(config.keys.contains_key("outline"));
     }
@@ -363,6 +379,27 @@ pretty = false
         )
         .unwrap();
         assert!(!config.reflowable.pretty);
+    }
+
+    #[test]
+    fn progress_document_limit_is_configurable() {
+        let config: Config = toml::from_str(
+            r#"
+[progress]
+max_documents = 25
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.progress.max_documents, 25);
+
+        let config: Config = toml::from_str(
+            r#"
+[progress]
+max_documents = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.progress.max_documents, 0);
     }
 
     #[test]

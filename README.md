@@ -80,6 +80,9 @@ so spaces need no quoting:
 
 Only settled pages are recorded: outline previews do not overwrite progress
 until they are committed. The file is rewritten atomically with mode `0600`.
+`progress.max_documents` controls how many documents are remembered (default
+`100`); the oldest entry is dropped when the limit is reached, and `0` disables
+reading progress.
 
 ## Configuration
 
@@ -96,6 +99,9 @@ window_fit_ms = 120
 css = ""
 css_file = ""
 pretty = true
+
+[progress]
+max_documents = 100
 
 [keys]
 quit = ["q", "Q", "Escape"]
