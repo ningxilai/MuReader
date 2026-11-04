@@ -28,6 +28,7 @@ pub enum Command {
         fonts: Arc<FontCatalog>,
         css: Option<String>,
         pretty: bool,
+        page: Option<usize>,
     },
     NextPage,
     PrevPage,
@@ -127,6 +128,7 @@ fn run(
                 fonts,
                 css,
                 pretty,
+                page,
             } => {
                 let mut opened = match RenderEngine::open(&path, fonts, css, pretty) {
                     Ok(engine) => engine,
@@ -136,6 +138,9 @@ fn run(
                     }
                 };
                 opened.set_viewport(viewport.0, viewport.1);
+                if let Some(page) = page {
+                    opened.goto_page(page);
+                }
                 engine = Some(opened);
                 if let Some(engine) = engine.as_ref() {
                     let _ = proxy

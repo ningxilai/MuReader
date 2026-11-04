@@ -59,6 +59,28 @@ MuReader creates one native window and needs no compositor socket. On Wayland
 it requests focus through `xdg_activation_v1` when `XDG_ACTIVATION_TOKEN` is
 present.
 
+## Reading progress
+
+MuReader remembers the last page of every document it opens and returns to it
+on the next launch. Progress lives in `$XDG_STATE_HOME/mureader/progress`
+(usually `~/.local/state/mureader/progress`). `MUREADER_PROGRESS` overrides
+that path, and a relative `XDG_STATE_HOME` is ignored as required by the XDG
+Base Directory specification.
+
+The file uses viminfo-style file marks, newest first. Paths are the last field,
+so spaces need no quoting:
+
+```text
+# MuReader reading progress.
+# Written automatically; lines starting with ' are file marks stored
+# newest first: '<page> <path>.
+'42 /home/user/Documents/book.pdf
+'7 /home/user/Documents/notes.epub
+```
+
+Only settled pages are recorded: outline previews do not overwrite progress
+until they are committed. The file is rewritten atomically with mode `0600`.
+
 ## Configuration
 
 The default config file is `~/.config/mureader/config.toml`; set

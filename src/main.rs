@@ -18,6 +18,7 @@ mod fonts;
 mod keymap;
 mod outline_text;
 mod pretty_text;
+mod progress;
 mod startup;
 mod worker;
 
@@ -40,6 +41,7 @@ use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
 use keymap::{Action, Keymap, Resolution};
 use outline_text::{TextEngine, TextTarget};
+use progress::ProgressStore;
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -298,6 +300,11 @@ struct App {
     spread_blocked: bool,
     pending_turn: Option<TurnDirection>,
     animation: Option<SpreadAnimation>,
+    progress: ProgressStore,
+    /// Last page written to the progress file.
+    recorded_page: Option<usize>,
+    /// Page restored from the progress file, used for the initial status.
+    resume_page: Option<usize>,
 }
 
 impl App {
@@ -312,6 +319,8 @@ impl App {
         page_turn_duration: Duration,
         window_fit_duration: Duration,
     ) -> Self {
+        let progress = ProgressStore::load();
+        let resume_page = progress.page_for(&path).filter(|&page| page > 1);
         Self {
             path,
             proxy,
@@ -373,6 +382,9 @@ impl App {
             spread_blocked: false,
             pending_turn: None,
             animation: None,
+            progress,
+            recorded_page: None,
+            resume_page,
         }
     }
 
@@ -1666,6 +1678,12 @@ impl App {
         };
         self.clamp_scroll();
         self.update_spread_layout();
+        // Outline entries are previews until Enter keeps them, so only a
+        // settled page belongs in the progress file.
+        if !self.outline_open && self.recorded_page != Some(self.page) {
+            self.progress.record(&self.path, self.page);
+            self.recorded_page = Some(self.page);
+        }
         self.update_title();
         self.request_redraw();
     }
@@ -1673,6 +1691,13 @@ impl App {
     fn handle_page(&mut self, page: RenderedPage) {
         self.pending_turn = None;
         self.install_page(page);
+        if let Some(resume) = self.resume_page.take() {
+            if self.page == resume {
+                self.status = Some(format!("resumed at page {resume}"));
+                self.update_title();
+                self.request_redraw();
+            }
+        }
     }
 
     fn can_slide(&self, direction: TurnDirection) -> bool {
@@ -2337,6 +2362,7 @@ impl ApplicationHandler<UserEvent> for App {
             fonts: self.fonts.clone(),
             css: self.css.clone(),
             pretty: self.pretty_text,
+            page: self.resume_page,
         });
         self.worker = Some(worker);
         self.request_redraw();
