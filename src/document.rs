@@ -303,6 +303,16 @@ impl RenderEngine {
         css: Option<String>,
         pretty: bool,
     ) -> Result<Self, String> {
+        // MuPDF's TXT handler also claims .log, but log output is machine
+        // text, not a document. Reject it instead of showing it as a book.
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+        {
+            return Err(format!("unsupported document format: {}", path.display()));
+        }
+
         let mut context = Context::get();
         context
             .set_user_css(css.as_deref().unwrap_or(""))
@@ -1688,6 +1698,24 @@ mod tests {
         assert_eq!(outline.len(), 3);
         assert_eq!(outline[0].title, "Page 1");
         assert_eq!(outline[2].page, Some(3));
+    }
+
+    #[test]
+    fn log_files_are_not_documents() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("log");
+        let path = dir.join("session.log");
+        std::fs::write(&path, "2026-11-04 INFO started\n").unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let result = RenderEngine::open(&path, catalog, None, true);
+        let Err(error) = result else {
+            panic!("log files must not open as documents");
+        };
+        assert!(error.contains("unsupported document format"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

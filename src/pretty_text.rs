@@ -65,8 +65,9 @@ struct Unit {
 /// their line breaking; it is deliberately not a fallback for formats MuPDF
 /// cannot parse. Do not add Markdown, reST, Org, AsciiDoc, or LaTeX here:
 /// MuPDF has no handler for them, and showing their markup as raw text is not
-/// supported.
-const PLAIN_TEXT_EXTENSIONS: &[&str] = &["txt", "text", "log"];
+/// supported. Log files are excluded too: they are machine output, not
+/// human-readable documents.
+const PLAIN_TEXT_EXTENSIONS: &[&str] = &["txt", "text"];
 
 /// Whether this path is read as unstyled plain text.
 pub fn is_plain_text(path: &Path) -> bool {
@@ -533,10 +534,11 @@ mod tests {
 
     #[test]
     fn recognizes_native_plain_text_formats() {
-        for name in ["a.txt", "a.text", "a.log", "a.TXT"] {
+        for name in ["a.txt", "a.text", "a.TXT"] {
             assert!(is_plain_text(Path::new(name)), "{name}");
         }
         for name in [
+            "a.log",
             "a.md",
             "a.markdown",
             "a.mdown",

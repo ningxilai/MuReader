@@ -32,8 +32,8 @@ css = ""
 css_file = ""
 
 # Read plain-text files with Unicode line breaking and a total-fit pass.
-# MuPDF provides the handlers for txt, text, and log files; formats without a
-# MuPDF handler are not opened.
+# MuPDF provides the handlers for txt and text files; formats without a MuPDF
+# handler are not opened.
 pretty = true
 
 [progress]

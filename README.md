@@ -50,10 +50,12 @@ Moving in the outline previews the highlighted page; Enter keeps it, and
 Escape restores the page that was visible before the outline opened.
 
 Supported inputs depend on MuPDF: PDF, EPUB, MOBI, FB2, XPS/OXPS, CBZ, SVG,
-HTML, Office formats such as DOCX/XLSX/PPTX, and common images. `txt`, `text`,
-and `log` files use the plain-text pretty layout described below. Markdown,
-reStructuredText, Org, AsciiDoc, and LaTeX are not supported: MuPDF has no
-handler for them, and displaying their markup as raw text would be misleading.
+HTML, Office formats such as DOCX/XLSX/PPTX, and common images. `txt` and
+`text` files use the plain-text pretty layout described below. Markdown,
+reStructuredText, Org, AsciiDoc, and LaTeX are not supported because MuPDF has
+no handler for them; log files are excluded as well because they are machine
+output rather than readable documents. Showing any of these as raw text would
+be misleading.
 `Reset view` (`0`) discards an explicit zoom and fits the page again.
 
 MuReader creates one native window and needs no compositor socket. On Wayland
@@ -129,7 +131,7 @@ fastest response (one frame).
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
 CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
-line-breaking pass for TXT, text, and log files.
+line-breaking pass for TXT and text files.
 
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
