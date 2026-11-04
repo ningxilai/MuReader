@@ -41,7 +41,10 @@ With no arguments, MuReader asks the XDG Desktop Portal for a document. Pass a
 file path to open it directly. Either way the process detaches from the
 invoking shell; set `MUREADER_FOREGROUND=1` to keep it attached. The window
 provides page navigation, page/book search, outline, zoom, rotation, text
-selection/copy, and mouse-wheel scrolling.
+selection/copy, and mouse-wheel scrolling. MuPDF rasterizes pages on the
+worker thread; the window uploads the finished bitmaps as textures and
+composites pages, highlights, selection, outline, menus, and prompts with
+wgpu.
 
 Navigation uses the table of contents MuPDF provides for PDF, EPUB, HTML,
 FB2, and other structured documents. Documents without a table of contents,

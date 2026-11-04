@@ -15,6 +15,7 @@ mod clipboard;
 mod config;
 mod document;
 mod fonts;
+mod gpu;
 mod keymap;
 mod outline_text;
 mod pretty_text;
@@ -24,7 +25,6 @@ mod worker;
 
 use std::collections::VecDeque;
 use std::error::Error;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,10 +39,10 @@ use document::{
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
+use gpu::{rgb, DrawList, GpuRenderer, Rect};
 use keymap::{Action, Keymap, Resolution};
 use outline_text::{TextEngine, TextTarget};
 use progress::ProgressStore;
-use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -63,8 +63,10 @@ const MENU_ROW_HEIGHT: u32 = 30;
 const MENU_MAX_ROWS: usize = 10;
 const MENU_PADDING: u32 = 16;
 
-type SoftContext = Context<Arc<Window>>;
-type SoftSurface = Surface<Arc<Window>, Arc<Window>>;
+const PAGE_TEXTURE: u64 = 1;
+const OUTLINE_TEXTURE: u64 = 2;
+const MENU_TEXTURE: u64 = 3;
+const PROMPT_TEXTURE: u64 = 4;
 
 pub enum UserEvent {
     Worker(WorkerEvent),
@@ -212,6 +214,15 @@ struct CommandMenu {
     scroll: usize,
     dirty: bool,
     bitmap: Option<PageBitmap>,
+    revision: u64,
+}
+
+struct PromptBitmap {
+    text: String,
+    width: u32,
+    height: u32,
+    revision: u64,
+    bitmap: PageBitmap,
 }
 
 struct PendingZoom {
@@ -238,12 +249,11 @@ struct App {
     path: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
     worker: Option<WorkerHandle>,
-    // Drop order matters: surface before context before window.
-    surface: Option<SoftSurface>,
-    context: Option<SoftContext>,
+    // Drop order matters: the GPU surface before the window.
+    gpu: Option<GpuRenderer>,
     window: Option<Arc<Window>>,
-    surface_size: (u32, u32),
     bitmap: Option<PageBitmap>,
+    page_revision: u64,
     text: TextLayer,
     selection: Option<TextSelection>,
     selecting: bool,
@@ -259,6 +269,7 @@ struct App {
     outline_selected: usize,
     outline_bitmap: Option<PageBitmap>,
     outline_bitmap_start: usize,
+    outline_revision: u64,
     outline_requested_start: Option<usize>,
     outline_scroll: f32,
     /// Page shown before the outline started previewing other entries.
@@ -280,6 +291,7 @@ struct App {
     modifiers: ModifiersState,
     prompt: Prompt,
     command_menu: Option<CommandMenu>,
+    prompt_bitmap: Option<PromptBitmap>,
     menu_text: Option<TextEngine>,
     status: Option<String>,
     fonts: Arc<FontCatalog>,
@@ -326,11 +338,10 @@ impl App {
             path,
             proxy,
             worker: None,
-            surface: None,
-            context: None,
+            gpu: None,
             window: None,
-            surface_size: (0, 0),
             bitmap: None,
+            page_revision: 0,
             text: TextLayer::default(),
             selection: None,
             selecting: false,
@@ -346,6 +357,7 @@ impl App {
             outline_selected: 0,
             outline_bitmap: None,
             outline_bitmap_start: 0,
+            outline_revision: 0,
             outline_requested_start: None,
             outline_scroll: 0.0,
             outline_preview_origin: None,
@@ -366,6 +378,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             prompt: Prompt::None,
             command_menu: None,
+            prompt_bitmap: None,
             menu_text: None,
             status: None,
             fonts,
@@ -1119,6 +1132,75 @@ impl App {
         }
     }
 
+    fn ensure_prompt_bitmap(&mut self, viewport: (u32, u32)) {
+        let Some((label, value)) = self.prompt_line() else {
+            self.prompt_bitmap = None;
+            return;
+        };
+        let panel_w = viewport
+            .0
+            .saturating_sub(80)
+            .clamp(260, 560)
+            .min(viewport.0.max(1));
+        let panel_h = 44;
+        let mut line = format!("{label}{value}");
+        if value.is_empty() {
+            line.push('_');
+        } else {
+            line.push('▏');
+        }
+        let max_chars = (panel_w / 8).max(16) as usize;
+        if line.chars().count() > max_chars {
+            line = line
+                .chars()
+                .skip(line.chars().count() - max_chars)
+                .collect();
+        }
+        if let Some(cached) = self.prompt_bitmap.as_ref() {
+            if cached.text == line && cached.width == panel_w && cached.height == panel_h {
+                return;
+            }
+        }
+
+        let mut pixels = vec![0x00202020; panel_w as usize * panel_h as usize];
+        let border = 0x00484848;
+        for x in 0..panel_w {
+            pixels[x as usize] = border;
+            pixels[(panel_h - 1) as usize * panel_w as usize + x as usize] = border;
+        }
+        if self.menu_text.is_none() {
+            self.menu_text = TextEngine::new(self.fonts.clone()).ok();
+        }
+        if let Some(text) = self.menu_text.as_mut() {
+            let mut target = TextTarget::new(&mut pixels, panel_w, panel_h, 0, panel_h);
+            text.draw_line(
+                &line,
+                15.0,
+                Weight::NORMAL,
+                &mut target,
+                16,
+                0,
+                panel_h,
+                (235, 235, 235),
+            );
+        }
+        let revision = self
+            .prompt_bitmap
+            .as_ref()
+            .map_or(1, |prompt| prompt.revision.wrapping_add(1));
+        self.prompt_bitmap = Some(PromptBitmap {
+            text: line,
+            width: panel_w,
+            height: panel_h,
+            revision,
+            bitmap: PageBitmap {
+                width: panel_w,
+                height: panel_h,
+                pixels,
+            },
+        });
+    }
+
     fn open_command_menu(&mut self) {
         self.finish_animation();
         self.prompt = Prompt::None;
@@ -1128,6 +1210,7 @@ impl App {
             scroll: 0,
             dirty: true,
             bitmap: None,
+            revision: 0,
         });
         self.keymap.reset();
         self.update_title();
@@ -1420,6 +1503,7 @@ impl App {
             return;
         };
         menu.scroll = scroll;
+        menu.revision = menu.revision.wrapping_add(1);
         menu.bitmap = Some(PageBitmap {
             width,
             height,
@@ -1659,6 +1743,7 @@ impl App {
         self.links = page.links;
         self.text = page.text;
         self.bitmap = Some(page.bitmap);
+        self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
         self.window_index = window_index_for(&self.pages, self.page);
         self.spread_offset = self.normal_offset();
@@ -1799,6 +1884,7 @@ impl App {
                     return;
                 }
                 self.outline_bitmap = Some(bitmap);
+                self.outline_revision = self.outline_revision.wrapping_add(1);
                 self.outline_bitmap_start = start;
                 self.outline_requested_start = None;
                 self.ensure_outline_visible();
@@ -2031,112 +2117,71 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let (Some(width), Some(height)) =
-            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
+        if size.width == 0 || size.height == 0 {
             return;
-        };
+        }
         if self.command_menu.is_some() {
             self.ensure_command_menu_bitmap((size.width, size.height));
         }
-        let content_left = self.content_left();
-        let viewport = self.viewport();
-        let bitmap = self.bitmap.as_ref();
-        let highlights = &self.highlights;
-        let scroll_x = self.scroll_x;
-        let scroll_y = self.scroll_y;
-        let spread_offset = self.spread_offset;
-        let visible_width = self.visible_width() as i32;
-        let page_vertical_offset = bitmap
-            .map(|page| self.page_vertical_offset(page.height))
-            .unwrap_or(0);
-        let menu_position = self.command_menu_position(viewport);
-        let prompt = self.prompt_line();
-        let Some(surface) = self.surface.as_mut() else {
-            return;
-        };
-        if self.surface_size != (size.width, size.height) {
-            if let Err(e) = surface.resize(width, height) {
-                eprintln!("{TITLE}: resize failed: {e}");
-                return;
-            }
-            self.surface_size = (size.width, size.height);
-        }
+        self.ensure_prompt_bitmap((size.width, size.height));
 
+        let viewport = (size.width, size.height);
+        let content_left = self.content_left();
         let vw = size.width as i32;
         let vh = size.height as i32;
-        let mut buffer = match surface.buffer_mut() {
-            Ok(buffer) => buffer,
-            Err(e) => {
-                eprintln!("{TITLE}: buffer failed: {e}");
-                return;
-            }
-        };
-        buffer.fill(BACKGROUND);
+        let full = Rect::new(0, 0, vw, vh);
+        let mut list = DrawList::new();
 
         if self.resize_preview {
-            if let Some(page) = bitmap {
-                draw_page_preview(&mut buffer, (size.width, size.height), page);
+            if let Some(page) = self.bitmap.as_ref() {
+                let scale = (vw as f32 / page.width as f32).min(vh as f32 / page.height as f32);
+                let target_w = (page.width as f32 * scale).round().max(1.0) as i32;
+                let target_h = (page.height as f32 * scale).round().max(1.0) as i32;
+                let target_w = target_w.min(vw);
+                let target_h = target_h.min(vh);
+                let left = (vw - target_w) / 2;
+                let top = (vh - target_h) / 2;
+                list.texture(PAGE_TEXTURE, Rect::new(left, top, target_w, target_h), full);
             }
-        } else if let Some(page) = bitmap {
+        } else if let Some(page) = self.bitmap.as_ref() {
             let bw = page.width as i32;
             let bh = page.height as i32;
+            let visible_width = self.visible_width() as i32;
             let window_left = page_left_offset(viewport, content_left, visible_width.max(1) as u32)
-                - scroll_x.round() as i32;
-            let origin_x = window_left - spread_offset.round() as i32;
-            let y0 = page_vertical_offset - scroll_y.round() as i32;
+                - self.scroll_x.round() as i32;
+            let origin_x = window_left - self.spread_offset.round() as i32;
+            let y0 = self.page_vertical_offset(page.height) - self.scroll_y.round() as i32;
+            let clip = Rect::new(window_left, 0, visible_width, vh);
+            list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
 
-            let src_left = (spread_offset.round() as i32).max(0);
-            let src_right = (spread_offset.round() as i32 + visible_width).min(bw);
-            let dst_left = window_left;
-            let clip_left = (-dst_left).max(0);
-            let src_start_x = src_left + clip_left;
-            let dst_x = dst_left + clip_left;
-            let copy_w = (src_right - src_start_x).min(vw - dst_x).max(0);
-            let clip_x0 = window_left;
-            let clip_x1 = window_left + visible_width;
-            if copy_w > 0 {
-                for y in 0..bh {
-                    let dy = y0 + y;
-                    if dy < 0 || dy >= vh {
-                        continue;
-                    }
-                    let src_start = y as usize * page.width as usize + src_start_x as usize;
-                    let src_end = src_start + copy_w as usize;
-                    let dst_start = dy as usize * size.width as usize + dst_x as usize;
-                    buffer[dst_start..dst_start + copy_w as usize]
-                        .copy_from_slice(&page.pixels[src_start..src_end]);
-                }
+            for highlight in &self.highlights {
+                list.solid(
+                    Rect::new(
+                        origin_x + highlight.x0 as i32,
+                        y0 + highlight.y0 as i32,
+                        (highlight.x1 - highlight.x0) as i32,
+                        (highlight.y1 - highlight.y0) as i32,
+                    ),
+                    rgb(0x00ff_e61e, 0.45),
+                    clip,
+                );
+            }
 
-                for highlight in highlights {
-                    overlay_rect(
-                        &mut buffer,
-                        (vw, vh),
-                        (origin_x, y0),
-                        *highlight,
-                        (255, 230, 30),
-                        45,
-                        clip_x0,
-                        clip_x1,
-                    );
-                }
-
-                if let Some(selection) = self.selection {
-                    let (start, end) = selection.bounds();
-                    if start < self.text.chars.len() {
-                        let end = end.min(self.text.chars.len() - 1);
-                        for ch in &self.text.chars[start..=end] {
-                            overlay_rect(
-                                &mut buffer,
-                                (vw, vh),
-                                (origin_x, y0),
-                                ch.rect,
-                                (80, 120, 210),
-                                38,
-                                clip_x0,
-                                clip_x1,
-                            );
-                        }
+            if let Some(selection) = self.selection {
+                let (start, end) = selection.bounds();
+                if start < self.text.chars.len() {
+                    let end = end.min(self.text.chars.len() - 1);
+                    for ch in &self.text.chars[start..=end] {
+                        list.solid(
+                            Rect::new(
+                                origin_x + ch.rect.x0 as i32,
+                                y0 + ch.rect.y0 as i32,
+                                (ch.rect.x1 - ch.rect.x0) as i32,
+                                (ch.rect.y1 - ch.rect.y0) as i32,
+                            ),
+                            rgb(0x0050_78d2, 0.38),
+                            clip,
+                        );
                     }
                 }
             }
@@ -2144,142 +2189,81 @@ impl App {
 
         if self.outline_open && !self.outline.is_empty() {
             let panel_w = (OUTLINE_WIDTH as i32).min(vw);
-            let scroll = self.outline_scroll as i32;
-            for y in 0..vh {
-                let row = y as usize * size.width as usize;
-                for x in 0..panel_w {
-                    buffer[row + x as usize] = 0x00202020;
-                }
-            }
+            let panel_clip = Rect::new(0, 0, panel_w, vh);
+            list.solid(panel_clip, rgb(0x0020_2020, 1.0), full);
 
             if let Some(panel) = self.outline_bitmap.as_ref() {
-                let copy_w = panel_w.min(panel.width as i32);
                 let row_height = OUTLINE_ROW_HEIGHT as i32;
-                let rows = panel.height as i32 / row_height;
-                let start = self.outline_bitmap_start as i32;
-                for row in 0..rows {
-                    let top = (start + row) * row_height - scroll;
-                    for line in 0..row_height {
-                        let dy = top + line;
-                        if dy < 0 || dy >= vh {
-                            continue;
-                        }
-                        let src_y = row * row_height + line;
-                        let src_start = src_y as usize * panel.width as usize;
-                        let dst_start = dy as usize * size.width as usize;
-                        buffer[dst_start..dst_start + copy_w as usize]
-                            .copy_from_slice(&panel.pixels[src_start..src_start + copy_w as usize]);
-                    }
-                }
+                let top =
+                    self.outline_bitmap_start as i32 * row_height - self.outline_scroll as i32;
+                list.texture(
+                    OUTLINE_TEXTURE,
+                    Rect::new(0, top, panel.width as i32, panel.height as i32),
+                    panel_clip,
+                );
             }
 
-            let row_top = self.outline_selected as i32 * OUTLINE_ROW_HEIGHT as i32 - scroll;
-            let row_bottom = row_top + OUTLINE_ROW_HEIGHT as i32;
-            let hy0 = row_top.max(0);
-            let hy1 = row_bottom.min(vh);
-            if hy0 < hy1 {
-                for y in hy0..hy1 {
-                    let row = y as usize * size.width as usize;
-                    for x in 0..panel_w {
-                        let idx = row + x as usize;
-                        let dst = buffer[idx];
-                        let dr = (dst >> 16) & 0xff;
-                        let dg = (dst >> 8) & 0xff;
-                        let db = dst & 0xff;
-                        let r = (dr * 62 + 70 * 38) / 100;
-                        let g = (dg * 62 + 110 * 38) / 100;
-                        let b = (db * 62 + 180 * 38) / 100;
-                        buffer[idx] = (r << 16) | (g << 8) | b;
-                    }
-                }
-            }
+            let row_top = self.outline_selected as i32 * OUTLINE_ROW_HEIGHT as i32
+                - self.outline_scroll as i32;
+            list.solid(
+                Rect::new(0, row_top, panel_w, OUTLINE_ROW_HEIGHT as i32),
+                rgb(0x0046_6eb4, 0.38),
+                panel_clip,
+            );
 
-            let border_x = panel_w - 1;
-            if border_x >= 0 {
-                for y in 0..vh {
-                    let idx = y as usize * size.width as usize + border_x as usize;
-                    buffer[idx] = 0x003c3c3c;
-                }
-            }
-        }
-
-        if let (Some(panel), Some((panel_x, panel_y))) = (
-            self.command_menu
-                .as_ref()
-                .and_then(|menu| menu.bitmap.as_ref()),
-            menu_position,
-        ) {
-            let copy_w = (panel.width as i32).min(vw - panel_x);
-            let copy_h = (panel.height as i32).min(vh - panel_y);
-            if copy_w > 0 && copy_h > 0 {
-                for row in 0..copy_h {
-                    let dst_y = panel_y + row;
-                    if dst_y < 0 || dst_y >= vh {
-                        continue;
-                    }
-                    let src_start = row as usize * panel.width as usize;
-                    let dst_start = dst_y as usize * size.width as usize + panel_x as usize;
-                    buffer[dst_start..dst_start + copy_w as usize]
-                        .copy_from_slice(&panel.pixels[src_start..src_start + copy_w as usize]);
-                }
-            }
-        }
-
-        if let Some((label, value)) = prompt {
-            let panel_w = size
-                .width
-                .saturating_sub(80)
-                .clamp(260, 560)
-                .min(size.width.max(1));
-            let panel_h = 44;
-            let panel_x = ((vw - panel_w as i32) / 2).max(0);
-            let panel_y = (vh - panel_h as i32 - 40).max(0);
-            let mut line = format!("{label}{value}");
-            if value.is_empty() {
-                line.push('_');
-            } else {
-                line.push('▏');
-            }
-            // Keep long search queries inside the panel.
-            let max_chars = (panel_w / 8).max(16) as usize;
-            if line.chars().count() > max_chars {
-                line = line
-                    .chars()
-                    .skip(line.chars().count() - max_chars)
-                    .collect();
-            }
-            for row in panel_y..(panel_y + panel_h as i32).min(vh) {
-                let start = row as usize * size.width as usize + panel_x as usize;
-                let end = start + (panel_w.min((vw - panel_x).max(0) as u32)) as usize;
-                buffer[start..end].fill(0x00202020);
-            }
-            let border = 0x00484848;
-            for x in panel_x..(panel_x + panel_w as i32).min(vw) {
-                buffer[panel_y as usize * size.width as usize + x as usize] = border;
-                buffer[(panel_y + panel_h as i32 - 1).min(vh - 1) as usize * size.width as usize
-                    + x as usize] = border;
-            }
-            if self.menu_text.is_none() {
-                self.menu_text = TextEngine::new(self.fonts.clone()).ok();
-            }
-            if let Some(text) = self.menu_text.as_mut() {
-                let mut target =
-                    TextTarget::new(&mut buffer, size.width, size.height, panel_y, panel_h);
-                text.draw_line(
-                    &line,
-                    15.0,
-                    Weight::NORMAL,
-                    &mut target,
-                    panel_x + 16,
-                    panel_y,
-                    panel_h,
-                    (235, 235, 235),
+            if panel_w > 0 {
+                list.solid(
+                    Rect::new(panel_w - 1, 0, 1, vh),
+                    rgb(0x003c_3c3c, 1.0),
+                    full,
                 );
             }
         }
 
+        if let (Some(menu), Some((panel_x, panel_y))) = (
+            self.command_menu.as_ref(),
+            self.command_menu_position(viewport),
+        ) {
+            if let Some(panel) = menu.bitmap.as_ref() {
+                list.texture(
+                    MENU_TEXTURE,
+                    Rect::new(panel_x, panel_y, panel.width as i32, panel.height as i32),
+                    full,
+                );
+            }
+        }
+
+        if let Some(prompt) = self.prompt_bitmap.as_ref() {
+            let panel_x = ((vw - prompt.width as i32) / 2).max(0);
+            let panel_y = (vh - prompt.height as i32 - 40).max(0);
+            list.texture(
+                PROMPT_TEXTURE,
+                Rect::new(panel_x, panel_y, prompt.width as i32, prompt.height as i32),
+                full,
+            );
+        }
+
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        gpu.resize(size.width, size.height);
+        if let Some(page) = self.bitmap.as_ref() {
+            gpu.upload(PAGE_TEXTURE, self.page_revision, page);
+        }
+        if let Some(panel) = self.outline_bitmap.as_ref() {
+            gpu.upload(OUTLINE_TEXTURE, self.outline_revision, panel);
+        }
+        if let Some(menu) = self.command_menu.as_ref() {
+            if let Some(panel) = menu.bitmap.as_ref() {
+                gpu.upload(MENU_TEXTURE, menu.revision, panel);
+            }
+        }
+        if let Some(prompt) = self.prompt_bitmap.as_ref() {
+            gpu.upload(PROMPT_TEXTURE, prompt.revision, &prompt.bitmap);
+        }
+
         window.pre_present_notify();
-        if let Err(e) = buffer.present() {
+        if let Err(e) = gpu.render(rgb(BACKGROUND, 1.0), &list) {
             eprintln!("{TITLE}: present failed: {e}");
         }
     }
@@ -2311,32 +2295,22 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        let context = match Context::new(window.clone()) {
-            Ok(context) => context,
-            Err(e) => {
-                eprintln!("{TITLE}: softbuffer context failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let surface = match Surface::new(&context, window.clone()) {
-            Ok(surface) => surface,
-            Err(e) => {
-                eprintln!("{TITLE}: softbuffer surface failed: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-
         let (viewport_w, viewport_h) = {
             let size = window.inner_size();
             (size.width.max(1), size.height.max(1))
         };
+        let gpu = match GpuRenderer::new(window.clone(), viewport_w, viewport_h) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                eprintln!("{TITLE}: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
         let path = self.path.clone();
 
         self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.gpu = Some(gpu);
         self.update_title();
         if let Some(window) = self.window.as_ref() {
             window.set_ime_allowed(true);
@@ -2417,7 +2391,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.finish_animation();
-                self.surface_size = (0, 0);
                 self.spread_blocked = false;
                 if let Some(menu) = self.command_menu.as_mut() {
                     menu.dirty = true;
@@ -2463,69 +2436,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             _ => {}
-        }
-    }
-}
-
-fn draw_page_preview(buffer: &mut [u32], viewport: (u32, u32), page: &PageBitmap) {
-    if page.width == 0 || page.height == 0 || viewport.0 == 0 || viewport.1 == 0 {
-        return;
-    }
-    let vw = viewport.0 as f32;
-    let vh = viewport.1 as f32;
-    let scale = (vw / page.width as f32).min(vh / page.height as f32);
-    let target_w = (page.width as f32 * scale).round().max(1.0) as u32;
-    let target_h = (page.height as f32 * scale).round().max(1.0) as u32;
-    let target_w = target_w.min(viewport.0);
-    let target_h = target_h.min(viewport.1);
-    let left = (viewport.0 - target_w) / 2;
-    let top = (viewport.1 - target_h) / 2;
-    let viewport_w = viewport.0 as usize;
-
-    for dy in 0..target_h {
-        let sy = (dy as u64 * page.height as u64 / target_h as u64) as usize;
-        let src_row = sy * page.width as usize;
-        let dst_row = (top + dy) as usize * viewport_w + left as usize;
-        for dx in 0..target_w {
-            let sx = (dx as u64 * page.width as u64 / target_w as u64) as usize;
-            buffer[dst_row + dx as usize] = page.pixels[src_row + sx];
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn overlay_rect(
-    buffer: &mut [u32],
-    (viewport_w, viewport_h): (i32, i32),
-    (origin_x, origin_y): (i32, i32),
-    rect: HighlightRect,
-    color: (u32, u32, u32),
-    alpha_percent: u32,
-    clip_x0: i32,
-    clip_x1: i32,
-) {
-    let x0 = (origin_x + rect.x0 as i32).max(clip_x0).max(0);
-    let y0 = (origin_y + rect.y0 as i32).max(0);
-    let x1 = (origin_x + rect.x1 as i32).min(clip_x1).min(viewport_w);
-    let y1 = (origin_y + rect.y1 as i32).min(viewport_h);
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-    let alpha = alpha_percent.min(100);
-    let inverse = 100 - alpha;
-    let (cr, cg, cb) = color;
-    for y in y0..y1 {
-        let row = y as usize * viewport_w as usize;
-        for x in x0..x1 {
-            let idx = row + x as usize;
-            let dst = buffer[idx];
-            let dr = (dst >> 16) & 0xff;
-            let dg = (dst >> 8) & 0xff;
-            let db = dst & 0xff;
-            let r = (dr * inverse + cr * alpha) / 100;
-            let g = (dg * inverse + cg * alpha) / 100;
-            let b = (db * inverse + cb * alpha) / 100;
-            buffer[idx] = (r << 16) | (g << 8) | b;
         }
     }
 }

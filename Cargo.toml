@@ -10,6 +10,7 @@ description = "MuReader: standalone MuPDF document reader"
 
 [dependencies]
 ab_glyph = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
 fontdb = "0.24"
 harfbuzz_rs = "2"
 hypher = "0.1"
@@ -27,9 +28,9 @@ mupdf = { git = "https://github.com/ningxilai/mupdf-rs", rev = "ccbeff0373aba5d8
 ] }
 mupdf-fonts-droid = "0.8"
 mupdf-fonts-noto = "0.8"
+pollster = "1"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1", features = ["derive"] }
-softbuffer = "0.4"
 toml = "0.8"
 unicode-bidi = "0.3"
 unicode-bidi-mirroring = "0.4"
@@ -38,6 +39,7 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wgpu = "30"
 winit = "0.30"
 
 [profile.release]
