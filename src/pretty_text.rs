@@ -61,12 +61,12 @@ struct Unit {
     hyphen_after: bool,
 }
 
-/// Styleless source formats this module can read as plain text. Markup such
-/// as Markdown, reST, Org, AsciiDoc and LaTeX is kept verbatim; it is not
-/// rendered as a rich document.
-const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
-    "txt", "text", "md", "markdown", "mdown", "mkd", "rst", "org", "adoc", "asciidoc", "tex", "log",
-];
+/// Extensions with a native MuPDF text handler. The pretty layout improves
+/// their line breaking; it is deliberately not a fallback for formats MuPDF
+/// cannot parse. Do not add Markdown, reST, Org, AsciiDoc, or LaTeX here:
+/// MuPDF has no handler for them, and showing their markup as raw text is not
+/// supported.
+const PLAIN_TEXT_EXTENSIONS: &[&str] = &["txt", "text", "log"];
 
 /// Whether this path is read as unstyled plain text.
 pub fn is_plain_text(path: &Path) -> bool {
@@ -532,10 +532,11 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_common_plain_text_source_formats() {
+    fn recognizes_native_plain_text_formats() {
+        for name in ["a.txt", "a.text", "a.log", "a.TXT"] {
+            assert!(is_plain_text(Path::new(name)), "{name}");
+        }
         for name in [
-            "a.txt",
-            "a.text",
             "a.md",
             "a.markdown",
             "a.mdown",
@@ -545,12 +546,12 @@ mod tests {
             "a.adoc",
             "a.asciidoc",
             "a.tex",
-            "a.log",
-            "a.MD",
+            "a.epub",
+            "a.html",
+            "a.pdf",
+            "a.fb2",
+            "a.docx",
         ] {
-            assert!(is_plain_text(Path::new(name)), "{name}");
-        }
-        for name in ["a.epub", "a.html", "a.pdf", "a.fb2", "a.docx"] {
             assert!(!is_plain_text(Path::new(name)), "{name}");
         }
     }

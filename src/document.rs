@@ -1619,7 +1619,7 @@ mod tests {
     fn plain_text_outline_falls_back_to_pages() {
         let _guard = doc_test_guard();
         let dir = test_dir("outline");
-        let path = dir.join("notes.md");
+        let path = dir.join("notes.txt");
         let mut text = String::from("# Chapter One\n\nIntro paragraph.\n\n## Section A\n\n");
         for i in 0..80 {
             text.push_str(&format!(

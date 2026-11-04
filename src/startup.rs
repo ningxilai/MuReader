@@ -22,8 +22,7 @@ pub fn pick_document() -> Option<PathBuf> {
             "Documents",
             &[
                 "pdf", "epub", "mobi", "fb2", "xps", "oxps", "cbz", "svg", "html", "htm", "txt",
-                "text", "md", "markdown", "mdown", "mkd", "rst", "org", "adoc", "asciidoc", "tex",
-                "log", "docx", "xlsx", "pptx", "hwpx", "png", "jpg", "jpeg",
+                "text", "log", "docx", "xlsx", "pptx", "hwpx", "png", "jpg", "jpeg",
             ],
         )
         .add_filter("All files", &["*"])

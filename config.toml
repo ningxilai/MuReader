@@ -31,10 +31,9 @@ css = ""
 # against this config file's directory.
 css_file = ""
 
-# Read styleless source files as plain text and reflow them with Unicode
-# line breaking and a KP-style total-fit pass. Supported extensions: txt,
-# text, md, markdown, mdown, mkd, rst, org, adoc, asciidoc, tex, log.
-# Markup is kept verbatim. EPUB/HTML/FB2 keep MuPDF's own layout.
+# Read plain-text files with Unicode line breaking and a total-fit pass.
+# MuPDF provides the handlers for txt, text, and log files; formats without a
+# MuPDF handler are not opened.
 pretty = true
 
 [progress]
