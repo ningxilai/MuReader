@@ -63,15 +63,31 @@ const BACKGROUND: u32 = 0x00181818;
 const TITLE: &str = "MuReader";
 const OUTLINE_WIDTH: u32 = 320;
 const OUTLINE_ROW_HEIGHT: u32 = 28;
+/// Rows requested at once when the outline needs a new bitmap window. A tall
+/// window also gets enough margin to cover the viewport in a single request.
+const OUTLINE_WINDOW_MIN_ROWS: usize = 256;
 const MENU_HEADER_HEIGHT: u32 = 36;
 const MENU_ROW_HEIGHT: u32 = 30;
+const MENU_FOOTER_HEIGHT: u32 = 34;
 const MENU_MAX_ROWS: usize = 10;
 const MENU_PADDING: u32 = 16;
+/// Wait for the outline selection to settle before previewing it. Without this
+/// debounce, holding an arrow key queues one full page render per row.
+const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
+/// At an explicit zoom a page bitmap can be large. Skip live previews once it
+/// exceeds this many pixels so outline browsing cannot stall the UI on an
+/// expensive render/upload.
+const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
+/// A quiet left rail reads as a selection without replacing the row's
+/// background under the text.
+const SELECTION_ACCENT: u32 = 0x00d7_a45e;
+const SELECTION_TINT_ALPHA: f32 = 0.06;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
 const MENU_TEXTURE: u64 = 3;
 const PROMPT_TEXTURE: u64 = 4;
+const LOADING_TEXTURE: u64 = 5;
 
 pub enum UserEvent {
     Worker(WorkerEvent),
@@ -105,129 +121,128 @@ enum MenuAction {
 
 struct CommandEntry {
     label: &'static str,
-    keywords: &'static str,
+    /// The key that runs this command directly while the menu is open.
+    key: char,
     action: MenuAction,
 }
 
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         label: "Next page",
-        keywords: "next forward n page turn",
+        key: 'n',
         action: MenuAction::NextPage,
     },
     CommandEntry {
         label: "Previous page",
-        keywords: "previous prev back p page turn",
+        key: 'p',
         action: MenuAction::PrevPage,
     },
     CommandEntry {
         label: "First page",
-        keywords: "first beginning start home",
+        key: 'g',
         action: MenuAction::FirstPage,
     },
     CommandEntry {
         label: "Last page",
-        keywords: "last end finish",
+        key: 'G',
         action: MenuAction::LastPage,
     },
     CommandEntry {
         label: "Show outline",
-        keywords: "outline contents toc table",
+        key: 'o',
         action: MenuAction::Outline,
     },
     CommandEntry {
-        label: "Search this page…",
-        keywords: "search find page",
+        label: "Search this page",
+        key: 's',
         action: MenuAction::SearchPage,
     },
     CommandEntry {
-        label: "Search the whole book…",
-        keywords: "search find book whole",
+        label: "Search the whole book",
+        key: 'S',
         action: MenuAction::SearchBook,
     },
     CommandEntry {
         label: "Zoom in",
-        keywords: "zoom in larger magnify",
+        key: '+',
         action: MenuAction::ZoomIn,
     },
     CommandEntry {
         label: "Zoom out",
-        keywords: "zoom out smaller",
+        key: '-',
         action: MenuAction::ZoomOut,
     },
     CommandEntry {
         label: "Increase text size",
-        keywords: "font text size larger increase bigger",
+        key: ']',
         action: MenuAction::FontIncrease,
     },
     CommandEntry {
         label: "Decrease text size",
-        keywords: "font text size smaller decrease reduce",
+        key: '[',
         action: MenuAction::FontDecrease,
     },
     CommandEntry {
         label: "Reset view",
-        keywords: "reset restore fit zoom pan",
+        key: '0',
         action: MenuAction::ResetView,
     },
     CommandEntry {
         label: "Rotate right",
-        keywords: "rotate right turn",
+        key: 'r',
         action: MenuAction::RotateRight,
     },
     CommandEntry {
         label: "Rotate left",
-        keywords: "rotate left turn",
+        key: 'l',
         action: MenuAction::RotateLeft,
     },
     CommandEntry {
         label: "Copy selection",
-        keywords: "copy selection text clipboard",
+        key: 'y',
         action: MenuAction::Copy,
     },
     CommandEntry {
         label: "Quit",
-        keywords: "quit exit close",
+        key: 'Q',
         action: MenuAction::Quit,
     },
 ];
 
-fn filtered_commands(query: &str) -> Vec<usize> {
-    let query = query.to_ascii_lowercase();
-    let parts: Vec<&str> = query.split_whitespace().collect();
-    COMMANDS
-        .iter()
-        .enumerate()
-        .filter(|(_, command)| {
-            if parts.is_empty() {
-                return true;
-            }
-            let haystack = format!(
-                "{} {}",
-                command.label.to_ascii_lowercase(),
-                command.keywords
-            );
-            parts.iter().all(|part| haystack.contains(part))
-        })
-        .map(|(index, _)| index)
-        .collect()
+fn command_index_for_key(key: char) -> Option<usize> {
+    COMMANDS.iter().position(|command| command.key == key)
+}
+
+/// How many command rows fit in the panel without hiding it under the window
+/// edge. The panel still scrolls when the window is short.
+fn menu_visible_rows(viewport_h: u32) -> usize {
+    let reserved = MENU_HEADER_HEIGHT + MENU_FOOTER_HEIGHT + 8;
+    let available = viewport_h.saturating_sub(reserved);
+    ((available / MENU_ROW_HEIGHT) as usize).clamp(1, COMMANDS.len())
 }
 
 struct CommandMenu {
-    query: String,
     selected: usize,
     scroll: usize,
+    rows: usize,
+    /// Last action, echoed in the panel footer and the window title.
+    echo: Option<String>,
     dirty: bool,
     bitmap: Option<PageBitmap>,
     revision: u64,
 }
 
-struct PromptBitmap {
+struct PanelBitmap {
     text: String,
     width: u32,
     height: u32,
     revision: u64,
     bitmap: PageBitmap,
+}
+
+struct PendingOutlinePreview {
+    page: usize,
+    at: Instant,
 }
 
 struct PendingZoom {
@@ -277,6 +292,8 @@ struct App {
     outline_revision: u64,
     outline_requested_start: Option<usize>,
     outline_scroll: f32,
+    /// Pending, debounced preview of the outline selection.
+    outline_preview: Option<PendingOutlinePreview>,
     /// Page shown before the outline started previewing other entries.
     outline_preview_origin: Option<usize>,
     page: usize,
@@ -296,7 +313,8 @@ struct App {
     modifiers: ModifiersState,
     prompt: Prompt,
     command_menu: Option<CommandMenu>,
-    prompt_bitmap: Option<PromptBitmap>,
+    prompt_bitmap: Option<PanelBitmap>,
+    loading_bitmap: Option<PanelBitmap>,
     menu_text: Option<TextEngine>,
     status: Option<String>,
     fonts: Arc<FontCatalog>,
@@ -322,6 +340,9 @@ struct App {
     recorded_page: Option<usize>,
     /// Page restored from the progress file, used for the initial status.
     resume_page: Option<usize>,
+    /// The window stays hidden until a frame has actually been presented, so
+    /// the compositor never shows an uninitialized black surface.
+    window_shown: bool,
 }
 
 impl App {
@@ -365,6 +386,7 @@ impl App {
             outline_revision: 0,
             outline_requested_start: None,
             outline_scroll: 0.0,
+            outline_preview: None,
             outline_preview_origin: None,
             page: 1,
             pages: Vec::new(),
@@ -384,6 +406,7 @@ impl App {
             prompt: Prompt::None,
             command_menu: None,
             prompt_bitmap: None,
+            loading_bitmap: None,
             menu_text: None,
             status: None,
             fonts,
@@ -404,6 +427,7 @@ impl App {
             progress,
             recorded_page: None,
             resume_page,
+            window_shown: false,
         }
     }
 
@@ -511,6 +535,12 @@ impl App {
 
     fn maybe_enable_spread(&mut self) {
         if self.spread_active || self.spread_blocked || self.pages.len() >= 2 {
+            return;
+        }
+        // Enabling a spread while the panel is open would make the worker
+        // render a wide strip into a narrower content area, which then
+        // immediately disables the spread again. Leave it for after close.
+        if self.outline_open {
             return;
         }
         if self.page_count.unwrap_or(0) < 2 {
@@ -668,15 +698,15 @@ impl App {
         (self.outline_height() - viewport_h as f32).max(0.0)
     }
 
-    fn request_outline_window(&mut self, start: usize) {
-        if self.outline.is_empty() {
+    fn request_outline_window(&mut self, start: usize, count: usize) {
+        if !self.outline_open || self.outline.is_empty() {
             return;
         }
         let start = start.min(self.outline.len() - 1);
+        let count = count.clamp(1, self.outline.len() - start);
         if self.outline_requested_start == Some(start) {
             return;
         }
-        let count = 256.min(self.outline.len() - start);
         self.outline_requested_start = Some(start);
         self.send(Command::RenderOutline {
             width: OUTLINE_WIDTH,
@@ -691,32 +721,22 @@ impl App {
             return;
         }
         let (_, viewport_h) = self.viewport();
-        let row_height = OUTLINE_ROW_HEIGHT as f32;
-        let first = (self.outline_scroll / row_height).floor() as usize;
-        let last = ((self.outline_scroll + viewport_h as f32) / row_height).ceil() as usize;
-        let current_start = self.outline_bitmap_start;
         let current_rows = self
             .outline_bitmap
             .as_ref()
             .map(|bitmap| (bitmap.height as usize / OUTLINE_ROW_HEIGHT as usize).max(1))
             .unwrap_or(0);
-        let selected_outside = self.outline_selected < current_start
-            || self.outline_selected >= current_start + current_rows;
-        let needed_first = first;
-        let needed_last = last.min(self.outline.len());
-        let current_end = (current_start + current_rows).min(self.outline.len());
-        if current_rows == 0
-            || selected_outside
-            || needed_first < current_start
-            || needed_last > current_end
-        {
-            let start = if selected_outside {
-                self.outline_selected.saturating_sub(32)
-            } else {
-                first.saturating_sub(16)
-            };
-            self.request_outline_window(start);
-        }
+        let Some((start, count)) = outline_window_request(
+            self.outline.len(),
+            self.outline_scroll,
+            viewport_h,
+            OUTLINE_ROW_HEIGHT,
+            self.outline_bitmap_start,
+            current_rows,
+        ) else {
+            return;
+        };
+        self.request_outline_window(start, count);
     }
 
     fn ensure_outline_visible(&mut self) {
@@ -735,6 +755,7 @@ impl App {
 
     fn close_outline(&mut self) {
         self.finish_animation();
+        self.outline_preview = None;
         // A preview may still be in flight, so restore the original page even
         // when `self.page` has not caught up yet.
         if let Some(origin) = self.outline_preview_origin.take() {
@@ -771,10 +792,11 @@ impl App {
         }
     }
 
-    /// Show the selected outline target in the page area without committing
-    /// the jump. Escape restores the page that was visible before the outline
-    /// opened; Enter keeps the previewed page.
+    /// Preview the selected outline target after the selection settles.
+    /// Escape restores the page that was visible before the outline opened;
+    /// Enter keeps the previewed page.
     fn preview_outline_selection(&mut self) {
+        self.outline_preview = None;
         if self.outline_preview_origin.is_none() {
             return;
         }
@@ -785,14 +807,18 @@ impl App {
         else {
             return;
         };
-        if page != self.page {
-            self.finish_animation();
-            self.send(Command::GotoPage(page));
+        if page == self.page || !outline_preview_allowed(self.page_fit, self.bitmap.as_ref()) {
+            return;
         }
+        self.outline_preview = Some(PendingOutlinePreview {
+            page,
+            at: Instant::now() + OUTLINE_PREVIEW_DELAY,
+        });
     }
 
     fn activate_outline(&mut self) {
         self.finish_animation();
+        self.outline_preview = None;
         let page = self
             .outline
             .get(self.outline_selected)
@@ -1046,7 +1072,12 @@ impl App {
             .unwrap_or_else(|| self.path.display().to_string());
 
         if let Some(menu) = self.command_menu.as_ref() {
-            window.set_title(&format!("{name} — Command: {}", menu.query));
+            let echo = menu
+                .echo
+                .as_ref()
+                .map(|echo| format!(" — {echo}"))
+                .unwrap_or_default();
+            window.set_title(&format!("{name} — Commands{echo}"));
             return;
         }
 
@@ -1193,7 +1224,83 @@ impl App {
             .prompt_bitmap
             .as_ref()
             .map_or(1, |prompt| prompt.revision.wrapping_add(1));
-        self.prompt_bitmap = Some(PromptBitmap {
+        self.prompt_bitmap = Some(PanelBitmap {
+            text: line,
+            width: panel_w,
+            height: panel_h,
+            revision,
+            bitmap: PageBitmap {
+                width: panel_w,
+                height: panel_h,
+                pixels,
+            },
+        });
+    }
+
+    /// A small centered panel shown until the first page bitmap arrives. It
+    /// turns the unavoidable startup wait into an intentional loading state
+    /// instead of an empty black window.
+    fn ensure_loading_bitmap(&mut self, viewport: (u32, u32)) {
+        if self.bitmap.is_some() || self.outline_open {
+            self.loading_bitmap = None;
+            return;
+        }
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string());
+        let mut line = format!("Loading {name}…");
+        let panel_w = viewport
+            .0
+            .saturating_sub(80)
+            .clamp(220, 420)
+            .min(viewport.0.max(1));
+        let panel_h = 60;
+        if panel_w < 120 || panel_h > viewport.1 {
+            self.loading_bitmap = None;
+            return;
+        }
+        let max_chars = (panel_w.saturating_sub(32) / 8).max(8) as usize;
+        if line.chars().count() > max_chars {
+            line = line.chars().take(max_chars.saturating_sub(1)).collect();
+            line.push('…');
+        }
+        if let Some(cached) = self.loading_bitmap.as_ref() {
+            if cached.text == line && cached.width == panel_w && cached.height == panel_h {
+                return;
+            }
+        }
+
+        let mut pixels = vec![0x00242424; panel_w as usize * panel_h as usize];
+        let border = 0x00484848;
+        for x in 0..panel_w {
+            pixels[x as usize] = border;
+            pixels[(panel_h - 1) as usize * panel_w as usize + x as usize] = border;
+        }
+        if self.menu_text.is_none() {
+            self.menu_text = TextEngine::new(self.fonts.clone()).ok();
+        }
+        if let Some(text) = self.menu_text.as_mut() {
+            let text_w = (line.chars().count() as u32 * 8).min(panel_w.saturating_sub(32));
+            let x = panel_w.saturating_sub(text_w) / 2;
+            let mut target = TextTarget::new(&mut pixels, panel_w, panel_h, 0, panel_h);
+            text.draw_line(
+                &line,
+                15.0,
+                Weight::NORMAL,
+                &mut target,
+                x as i32,
+                0,
+                panel_h,
+                (215, 215, 215),
+            );
+        }
+        let revision = self
+            .loading_bitmap
+            .as_ref()
+            .map_or(1, |panel| panel.revision.wrapping_add(1));
+        self.loading_bitmap = Some(PanelBitmap {
             text: line,
             width: panel_w,
             height: panel_h,
@@ -1210,9 +1317,10 @@ impl App {
         self.finish_animation();
         self.prompt = Prompt::None;
         self.command_menu = Some(CommandMenu {
-            query: String::new(),
             selected: 0,
             scroll: 0,
+            rows: MENU_MAX_ROWS.min(COMMANDS.len()),
+            echo: None,
             dirty: true,
             bitmap: None,
             revision: 0,
@@ -1228,51 +1336,46 @@ impl App {
         self.request_redraw();
     }
 
-    fn menu_query_changed(&mut self) {
-        if let Some(menu) = self.command_menu.as_mut() {
-            menu.selected = 0;
-            menu.scroll = 0;
-            menu.dirty = true;
-        }
-        self.update_title();
-        self.request_redraw();
-    }
-
     fn move_menu_selection(&mut self, delta: isize) {
         let Some(menu) = self.command_menu.as_ref() else {
             return;
         };
-        let count = filtered_commands(&menu.query).len();
-        if count == 0 {
+        let last = COMMANDS.len().saturating_sub(1) as isize;
+        let selected = (menu.selected as isize + delta).clamp(0, last) as usize;
+        self.select_menu_index(selected);
+    }
+
+    fn select_menu_index(&mut self, index: usize) {
+        let Some(menu) = self.command_menu.as_mut() else {
             return;
-        }
-        let selected =
-            (menu.selected as isize + delta).clamp(0, count.saturating_sub(1) as isize) as usize;
-        let visible = count.min(MENU_MAX_ROWS);
-        let menu = self.command_menu.as_mut().expect("menu is open");
-        menu.selected = selected;
-        if selected < menu.scroll {
-            menu.scroll = selected;
-        } else if selected >= menu.scroll + visible {
-            menu.scroll = selected + 1 - visible;
-        }
-        menu.scroll = menu.scroll.min(count.saturating_sub(visible));
+        };
+        menu.selected = index.min(COMMANDS.len().saturating_sub(1));
+        scroll_menu_to_selection(menu);
         menu.dirty = true;
         self.request_redraw();
     }
 
     fn execute_menu_command(&mut self, event_loop: &ActiveEventLoop) {
-        let action = self.command_menu.as_ref().and_then(|menu| {
-            let commands = filtered_commands(&menu.query);
-            commands
-                .get(menu.selected)
-                .map(|index| COMMANDS[*index].action)
-        });
-        let Some(action) = action else {
+        let Some(menu) = self.command_menu.as_ref() else {
             return;
         };
-        self.close_command_menu();
+        let Some(entry) = COMMANDS.get(menu.selected) else {
+            return;
+        };
+        let action = entry.action;
+        let label = entry.label;
+        if menu_action_closes(action) {
+            self.close_command_menu();
+            self.run_menu_action(event_loop, action);
+            return;
+        }
         self.run_menu_action(event_loop, action);
+        if let Some(menu) = self.command_menu.as_mut() {
+            menu.echo = Some(label.to_string());
+            menu.dirty = true;
+        }
+        self.update_title();
+        self.request_redraw();
     }
 
     fn run_menu_action(&mut self, event_loop: &ActiveEventLoop, action: MenuAction) {
@@ -1301,28 +1404,14 @@ impl App {
         event_loop: &ActiveEventLoop,
         event: &winit::event::KeyEvent,
     ) {
-        if self.modifiers.control_key() {
-            match event.logical_key.as_ref() {
-                Key::Character("g") => {
-                    self.close_command_menu();
-                    return;
+        if self.modifiers.control_key() || self.modifiers.alt_key() {
+            if self.modifiers.control_key() {
+                match event.logical_key.as_ref() {
+                    Key::Character("g") => self.close_command_menu(),
+                    Key::Character("n") => self.move_menu_selection(1),
+                    Key::Character("p") => self.move_menu_selection(-1),
+                    _ => {}
                 }
-                Key::Character("u") => {
-                    if let Some(menu) = self.command_menu.as_mut() {
-                        menu.query.clear();
-                    }
-                    self.menu_query_changed();
-                    return;
-                }
-                Key::Character("n") => {
-                    self.move_menu_selection(1);
-                    return;
-                }
-                Key::Character("p") => {
-                    self.move_menu_selection(-1);
-                    return;
-                }
-                _ => {}
             }
             return;
         }
@@ -1332,62 +1421,43 @@ impl App {
             Key::Named(NamedKey::Enter) => self.execute_menu_command(event_loop),
             Key::Named(NamedKey::ArrowDown) => self.move_menu_selection(1),
             Key::Named(NamedKey::ArrowUp) => self.move_menu_selection(-1),
-            Key::Named(NamedKey::PageDown) => self.move_menu_selection(MENU_MAX_ROWS as isize),
-            Key::Named(NamedKey::PageUp) => self.move_menu_selection(-(MENU_MAX_ROWS as isize)),
-            Key::Named(NamedKey::Home) => {
-                if let Some(menu) = self.command_menu.as_mut() {
-                    menu.selected = 0;
-                    menu.scroll = 0;
-                    menu.dirty = true;
-                }
-                self.request_redraw();
+            Key::Named(NamedKey::PageDown) => {
+                let rows = self
+                    .command_menu
+                    .as_ref()
+                    .map_or(MENU_MAX_ROWS, |menu| menu.rows.max(1));
+                self.move_menu_selection(rows as isize);
             }
+            Key::Named(NamedKey::PageUp) => {
+                let rows = self
+                    .command_menu
+                    .as_ref()
+                    .map_or(MENU_MAX_ROWS, |menu| menu.rows.max(1));
+                self.move_menu_selection(-(rows as isize));
+            }
+            Key::Named(NamedKey::Home) => self.select_menu_index(0),
             Key::Named(NamedKey::End) => {
-                let last = self
-                    .command_menu
-                    .as_ref()
-                    .map(|menu| filtered_commands(&menu.query).len().saturating_sub(1))
-                    .unwrap_or(0);
+                self.select_menu_index(COMMANDS.len().saturating_sub(1));
+            }
+            Key::Character(ch) => {
+                let Some(key) = ch.chars().next() else {
+                    return;
+                };
+                if key == 'q' {
+                    self.close_command_menu();
+                    return;
+                }
+                if let Some(index) = command_index_for_key(key) {
+                    self.select_menu_index(index);
+                    self.execute_menu_command(event_loop);
+                    return;
+                }
                 if let Some(menu) = self.command_menu.as_mut() {
-                    menu.selected = last;
+                    menu.echo = Some(format!("No command for {key}"));
                     menu.dirty = true;
                 }
-                self.move_menu_selection(0);
+                self.update_title();
                 self.request_redraw();
-            }
-            Key::Named(NamedKey::Backspace) => {
-                let empty = self
-                    .command_menu
-                    .as_ref()
-                    .is_none_or(|menu| menu.query.is_empty());
-                if empty {
-                    self.close_command_menu();
-                } else {
-                    if let Some(menu) = self.command_menu.as_mut() {
-                        menu.query.pop();
-                    }
-                    self.menu_query_changed();
-                }
-            }
-            Key::Named(NamedKey::Space) => {
-                if let Some(menu) = self.command_menu.as_mut() {
-                    menu.query.push(' ');
-                }
-                self.menu_query_changed();
-            }
-            Key::Character(ch) if !self.modifiers.alt_key() => {
-                let mut changed = false;
-                for c in ch.chars() {
-                    if !c.is_control() {
-                        if let Some(menu) = self.command_menu.as_mut() {
-                            menu.query.push(c);
-                        }
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.menu_query_changed();
-                }
             }
             _ => {}
         }
@@ -1401,37 +1471,45 @@ impl App {
             return;
         }
 
-        let query = menu.query.clone();
-        let selected = menu.selected;
-        let filtered = filtered_commands(&query);
-        let visible = filtered.len().clamp(1, MENU_MAX_ROWS);
-        let mut scroll = menu.scroll.min(filtered.len().saturating_sub(visible));
-        if !filtered.is_empty() && selected >= scroll + visible {
-            scroll = selected + 1 - visible;
+        let count = COMMANDS.len();
+        let rows = menu_visible_rows(viewport.1).min(count);
+        let selected = menu.selected.min(count.saturating_sub(1));
+        let echo = menu.echo.clone();
+        let mut scroll = menu.scroll.min(count.saturating_sub(rows));
+        if selected < scroll {
+            scroll = selected;
+        } else if selected >= scroll + rows {
+            scroll = selected + 1 - rows;
         }
-        let rows = visible;
         let width = viewport
             .0
             .saturating_sub(80)
-            .clamp(280, 680)
+            .clamp(320, 560)
             .min(viewport.0.max(1));
-        let height = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT + 8;
+        let height = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT + MENU_FOOTER_HEIGHT + 8;
         let mut pixels = vec![0x001c1c1c; width as usize * height as usize];
 
         for y in 0..MENU_HEADER_HEIGHT.min(height) {
             let row = y as usize * width as usize;
             pixels[row..row + width as usize].fill(0x00242424);
         }
+        let footer_top = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT;
+        for y in footer_top..(footer_top + MENU_FOOTER_HEIGHT).min(height) {
+            let row = y as usize * width as usize;
+            pixels[row..row + width as usize].fill(0x00222222);
+        }
 
         for row in 0..rows {
-            let Some(&index) = filtered.get(scroll + row) else {
+            let index = scroll + row;
+            if index != selected {
                 continue;
-            };
-            if index == selected {
-                let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
-                for y in top..(top + MENU_ROW_HEIGHT).min(height) {
-                    let start = y as usize * width as usize;
-                    pixels[start..start + width as usize].fill(0x00304a70);
+            }
+            let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
+            for y in top..(top + MENU_ROW_HEIGHT).min(height) {
+                let start = y as usize * width as usize;
+                pixels[start..start + width as usize].fill(0x002a2e34);
+                if width >= 4 {
+                    pixels[start + 1..start + 4].fill(SELECTION_ACCENT);
                 }
             }
         }
@@ -1440,10 +1518,10 @@ impl App {
             self.menu_text = TextEngine::new(self.fonts.clone()).ok();
         }
         if let Some(text) = self.menu_text.as_mut() {
-            let query_label = format!(":{query}");
+            let header = format!("Commands  {}/{}   q/Esc closes", selected + 1, count);
             let mut target = TextTarget::new(&mut pixels, width, height, 0, MENU_HEADER_HEIGHT);
             text.draw_line(
-                &query_label,
+                &header,
                 15.0,
                 Weight::NORMAL,
                 &mut target,
@@ -1453,45 +1531,75 @@ impl App {
                 (230, 230, 230),
             );
 
-            if filtered.is_empty() {
-                let top = MENU_HEADER_HEIGHT;
+            for row in 0..rows {
+                let index = scroll + row;
+                let Some(entry) = COMMANDS.get(index) else {
+                    continue;
+                };
+                let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
+                let selected_row = index == selected;
+                let key_color = if selected_row {
+                    (240, 200, 140)
+                } else {
+                    (150, 150, 150)
+                };
                 let mut target =
                     TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
                 text.draw_line(
-                    "No matching commands",
+                    &entry.key.to_string(),
+                    14.0,
+                    Weight::BOLD,
+                    &mut target,
+                    MENU_PADDING as i32,
+                    top as i32,
+                    MENU_ROW_HEIGHT,
+                    key_color,
+                );
+                let color = if selected_row {
+                    (255, 255, 255)
+                } else {
+                    (215, 215, 215)
+                };
+                let mut target =
+                    TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
+                text.draw_line(
+                    entry.label,
                     14.0,
                     Weight::NORMAL,
                     &mut target,
-                    MENU_PADDING as i32 + 4,
+                    MENU_PADDING as i32 + 34,
                     top as i32,
                     MENU_ROW_HEIGHT,
-                    (160, 160, 160),
+                    color,
                 );
-            } else {
-                for row in 0..rows {
-                    let Some(&index) = filtered.get(scroll + row) else {
-                        continue;
-                    };
-                    let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
-                    let color = if index == selected {
-                        (255, 255, 255)
-                    } else {
-                        (215, 215, 215)
-                    };
-                    let mut target =
-                        TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
-                    text.draw_line(
-                        COMMANDS[index].label,
-                        14.0,
-                        Weight::NORMAL,
-                        &mut target,
-                        MENU_PADDING as i32 + 4,
-                        top as i32,
-                        MENU_ROW_HEIGHT,
-                        color,
-                    );
-                }
             }
+
+            let footer = echo.as_ref().map_or_else(
+                || "Press a command key, or ↑↓ then Enter".to_string(),
+                |echo| format!("→ {echo}"),
+            );
+            let footer_color = if echo.is_some() {
+                (235, 215, 175)
+            } else {
+                (150, 150, 150)
+            };
+            let mut target = TextTarget::new(
+                &mut pixels,
+                width,
+                height,
+                footer_top as i32,
+                MENU_FOOTER_HEIGHT,
+            );
+            text.draw_line(
+                &footer,
+                13.0,
+                Weight::NORMAL,
+                &mut target,
+                MENU_PADDING as i32,
+                footer_top as i32,
+                MENU_FOOTER_HEIGHT,
+                footer_color,
+            );
         }
 
         let border = 0x00484848;
@@ -1507,6 +1615,7 @@ impl App {
         let Some(menu) = self.command_menu.as_mut() else {
             return;
         };
+        menu.rows = rows;
         menu.scroll = scroll;
         menu.revision = menu.revision.wrapping_add(1);
         menu.bitmap = Some(PageBitmap {
@@ -1532,6 +1641,7 @@ impl App {
             self.update_title();
             return;
         }
+        self.outline_preview = None;
         self.outline_selected = self
             .outline
             .iter()
@@ -1584,15 +1694,14 @@ impl App {
         self.request_redraw();
     }
 
-    /// Append committed IME text to the active prompt or command menu.
+    /// Append committed IME text to the active prompt. The command menu is
+    /// shortcut-driven, so committed text is ignored there.
     fn commit_text(&mut self, text: &str) {
         let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
         if text.is_empty() {
             return;
         }
-        if let Some(menu) = self.command_menu.as_mut() {
-            menu.query.push_str(&text);
-            self.menu_query_changed();
+        if self.command_menu.is_some() {
             return;
         }
         match &mut self.prompt {
@@ -1868,9 +1977,11 @@ impl App {
                 if self.outline.is_empty() {
                     if self.outline_open {
                         self.outline_open = false;
+                        self.outline_preview = None;
                         self.send_viewport();
                     }
                 } else if self.outline_open {
+                    self.outline_preview = None;
                     self.outline_selected = self
                         .outline
                         .iter()
@@ -1892,7 +2003,10 @@ impl App {
                 self.outline_revision = self.outline_revision.wrapping_add(1);
                 self.outline_bitmap_start = start;
                 self.outline_requested_start = None;
-                self.ensure_outline_visible();
+                // Only fetch the part of the outline that is visible. Do not
+                // move the scroll position here: mouse-wheel scrolling must
+                // not snap back to a selection that has scrolled off-screen.
+                self.ensure_outline_window();
                 self.request_redraw();
             }
             WorkerEvent::Status(status) => {
@@ -2129,6 +2243,7 @@ impl App {
             self.ensure_command_menu_bitmap((size.width, size.height));
         }
         self.ensure_prompt_bitmap((size.width, size.height));
+        self.ensure_loading_bitmap((size.width, size.height));
 
         let viewport = (size.width, size.height);
         let content_left = self.content_left();
@@ -2192,6 +2307,21 @@ impl App {
             }
         }
 
+        if let Some(loading) = self.loading_bitmap.as_ref() {
+            let panel_x = ((vw - loading.width as i32) / 2).max(0);
+            let panel_y = ((vh - loading.height as i32) / 2).max(0);
+            list.texture(
+                LOADING_TEXTURE,
+                Rect::new(
+                    panel_x,
+                    panel_y,
+                    loading.width as i32,
+                    loading.height as i32,
+                ),
+                full,
+            );
+        }
+
         if self.outline_open && !self.outline.is_empty() {
             let panel_w = (OUTLINE_WIDTH as i32).min(vw);
             let panel_clip = Rect::new(0, 0, panel_w, vh);
@@ -2208,11 +2338,19 @@ impl App {
                 );
             }
 
+            // Lift the selected row very slightly and mark its left edge;
+            // leaving the row background intact keeps the text itself clear.
             let row_top = self.outline_selected as i32 * OUTLINE_ROW_HEIGHT as i32
                 - self.outline_scroll as i32;
+            let row_height = OUTLINE_ROW_HEIGHT as i32;
             list.solid(
-                Rect::new(0, row_top, panel_w, OUTLINE_ROW_HEIGHT as i32),
-                rgb(0x0046_6eb4, 0.38),
+                Rect::new(0, row_top, panel_w, row_height),
+                rgb(0x00ff_ffff, SELECTION_TINT_ALPHA),
+                panel_clip,
+            );
+            list.solid(
+                Rect::new(1, row_top, 3, row_height),
+                rgb(SELECTION_ACCENT, 0.95),
                 panel_clip,
             );
 
@@ -2266,11 +2404,36 @@ impl App {
         if let Some(prompt) = self.prompt_bitmap.as_ref() {
             gpu.upload(PROMPT_TEXTURE, prompt.revision, &prompt.bitmap);
         }
+        if let Some(loading) = self.loading_bitmap.as_ref() {
+            gpu.upload(LOADING_TEXTURE, loading.revision, &loading.bitmap);
+        }
 
         window.pre_present_notify();
-        if let Err(e) = gpu.render(rgb(BACKGROUND, 1.0), &list) {
-            eprintln!("{TITLE}: present failed: {e}");
+        match gpu.render(rgb(BACKGROUND, 1.0), &list) {
+            Ok(true) => self.show_window(),
+            Ok(false) => {
+                // A hidden window can miss a frame on some compositors. Ask
+                // for another frame instead of leaving it invisible.
+                if !self.window_shown {
+                    window.request_redraw();
+                }
+            }
+            Err(e) => {
+                eprintln!("{TITLE}: present failed: {e}");
+                self.show_window();
+            }
         }
+    }
+
+    fn show_window(&mut self) {
+        if self.window_shown {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.set_visible(true);
+        }
+        self.window_shown = true;
+        self.request_redraw();
     }
 }
 
@@ -2288,7 +2451,10 @@ impl ApplicationHandler<UserEvent> for App {
         let attributes = Window::default_attributes()
             .with_title(title)
             .with_inner_size(LogicalSize::new(1100.0, 900.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 240.0));
+            .with_min_inner_size(LogicalSize::new(320.0, 240.0))
+            // Keep the surface unmapped while wgpu initializes, then show it
+            // only after a real frame is available.
+            .with_visible(false);
         #[cfg(target_os = "linux")]
         let attributes = attributes.with_name("mureader", "mureader");
 
@@ -2317,6 +2483,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.update_title();
+        // Present the loading panel before mapping the window. If the
+        // compositor refuses that first hidden frame, show the window anyway
+        // and let the queued redraw fill it in.
+        self.draw();
+        self.show_window();
         if let Some(window) = self.window.as_ref() {
             window.set_ime_allowed(true);
             self.activation.activate(window);
@@ -2370,20 +2541,44 @@ impl ApplicationHandler<UserEvent> for App {
         if self.animation.is_some() {
             self.request_redraw();
         }
-        if let Some(deadline) = self.pending_viewport {
-            if Instant::now() >= deadline {
+        let now = Instant::now();
+        let mut deadline = None;
+
+        match self.pending_viewport {
+            Some(at) if now >= at => {
                 self.send_viewport();
                 self.clamp_scroll();
                 self.request_redraw();
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                return;
+            }
+            Some(at) => deadline = Some(at),
+            None => {}
+        }
+
+        if self
+            .outline_preview
+            .as_ref()
+            .is_some_and(|preview| now >= preview.at)
+        {
+            let preview = self.outline_preview.take().expect("outline preview is due");
+            if self.outline_open
+                && self.outline_preview_origin.is_some()
+                && preview.page != self.page
+            {
+                self.send(Command::GotoPage(preview.page));
             }
         }
-        // `WaitUntil` persists after its deadline: leaving it set makes the
-        // event loop wake immediately on every iteration and burn CPU. Go
-        // back to sleeping until the next event once the debounce has run.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        if let Some(preview) = self.outline_preview.as_ref() {
+            deadline = Some(deadline.map_or(preview.at, |current| current.min(preview.at)));
+        }
+
+        if let Some(deadline) = deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            // `WaitUntil` persists after its deadline: leaving it set makes
+            // the event loop wake immediately on every iteration and burn
+            // CPU. Go back to sleeping once the debounce has run.
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 
     fn window_event(
@@ -2442,6 +2637,69 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             _ => {}
         }
+    }
+}
+
+fn scroll_menu_to_selection(menu: &mut CommandMenu) {
+    let count = COMMANDS.len();
+    let rows = menu.rows.clamp(1, count);
+    let selected = menu.selected.min(count.saturating_sub(1));
+    if selected < menu.scroll {
+        menu.scroll = selected;
+    } else if selected >= menu.scroll + rows {
+        menu.scroll = selected + 1 - rows;
+    }
+    menu.scroll = menu.scroll.min(count.saturating_sub(rows));
+    menu.rows = rows;
+}
+
+fn menu_action_closes(action: MenuAction) -> bool {
+    matches!(
+        action,
+        MenuAction::Outline | MenuAction::SearchPage | MenuAction::SearchBook | MenuAction::Quit
+    )
+}
+
+/// Decide whether the outline actually needs a new bitmap window. The
+/// returned window covers the viewport plus a margin, so even a window taller
+/// than the old fixed 256-row request settles after one round trip.
+fn outline_window_request(
+    len: usize,
+    scroll: f32,
+    viewport_h: u32,
+    row_height: u32,
+    current_start: usize,
+    current_rows: usize,
+) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let row_height = row_height.max(1) as f32;
+    let scroll = scroll.max(0.0);
+    let viewport_rows = (viewport_h as f32 / row_height).ceil() as usize + 1;
+    let first = (scroll / row_height).floor() as usize;
+    let last = (((scroll + viewport_h as f32) / row_height).ceil() as usize).min(len);
+    let current_end = current_start.saturating_add(current_rows).min(len);
+    if current_rows > 0 && first >= current_start && last <= current_end {
+        return None;
+    }
+    let start = first.saturating_sub(16).min(len - 1);
+    let count = viewport_rows
+        .saturating_add(64)
+        .max(OUTLINE_WINDOW_MIN_ROWS)
+        .min(len - start)
+        .max(1);
+    Some((start, count))
+}
+
+/// Live previews are cheap at fit-page scale. At an explicit zoom the page
+/// bitmap can already be huge, so only preview while it stays modest.
+fn outline_preview_allowed(fit: Fit, bitmap: Option<&PageBitmap>) -> bool {
+    match fit {
+        Fit::Page => true,
+        Fit::None => bitmap.is_some_and(|bitmap| {
+            u64::from(bitmap.width) * u64::from(bitmap.height) <= OUTLINE_PREVIEW_MAX_PIXELS
+        }),
     }
 }
 
@@ -2599,32 +2857,110 @@ mod tests {
     }
 
     #[test]
-    fn command_menu_filters_with_intuitive_names() {
-        let all = filtered_commands("");
-        assert_eq!(all.len(), COMMANDS.len());
+    fn command_menu_shortcuts_are_unique_and_run_the_right_action() {
+        let mut seen = std::collections::HashSet::new();
+        for command in COMMANDS {
+            assert!(
+                seen.insert(command.key),
+                "duplicate command shortcut {:?}",
+                command.key
+            );
+        }
+
+        let action = |key| command_index_for_key(key).map(|index| COMMANDS[index].action);
+        assert_eq!(action('n'), Some(MenuAction::NextPage));
+        assert_eq!(action('p'), Some(MenuAction::PrevPage));
+        assert_eq!(action('g'), Some(MenuAction::FirstPage));
+        assert_eq!(action('G'), Some(MenuAction::LastPage));
+        assert_eq!(action('o'), Some(MenuAction::Outline));
+        assert_eq!(action('s'), Some(MenuAction::SearchPage));
+        assert_eq!(action('S'), Some(MenuAction::SearchBook));
+        assert_eq!(action('+'), Some(MenuAction::ZoomIn));
+        assert_eq!(action('-'), Some(MenuAction::ZoomOut));
+        assert_eq!(action('Q'), Some(MenuAction::Quit));
+        assert_eq!(action('q'), None, "q closes the menu");
+        assert_eq!(action('z'), None);
+    }
+
+    #[test]
+    fn command_menu_rows_fit_the_window() {
+        assert_eq!(menu_visible_rows(900), COMMANDS.len());
+        let small = menu_visible_rows(240);
+        assert!(small >= 1 && small < COMMANDS.len());
+        assert_eq!(menu_visible_rows(0), 1);
+    }
+
+    #[test]
+    fn menu_selection_scrolls_into_view() {
+        let mut menu = CommandMenu {
+            selected: 12,
+            scroll: 0,
+            rows: 5,
+            echo: None,
+            dirty: false,
+            bitmap: None,
+            revision: 0,
+        };
+        scroll_menu_to_selection(&mut menu);
+        assert!(menu.scroll <= menu.selected && menu.selected < menu.scroll + menu.rows);
+
+        menu.selected = 0;
+        scroll_menu_to_selection(&mut menu);
+        assert_eq!(menu.scroll, 0);
+    }
+
+    #[test]
+    fn outline_window_covers_tall_viewports_and_settles() {
+        // More rows than a fixed 256-row window; the request must still cover
+        // the viewport so the next response does not re-request forever.
+        let (start, count) =
+            outline_window_request(1000, 0.0, 10_000, OUTLINE_ROW_HEIGHT, 0, 0).unwrap();
+        assert_eq!(start, 0);
+        assert!(count > 256);
         assert_eq!(
-            filtered_commands("rotate")
-                .into_iter()
-                .map(|index| COMMANDS[index].label)
-                .collect::<Vec<_>>(),
-            vec!["Rotate right", "Rotate left"]
+            outline_window_request(1000, 0.0, 10_000, OUTLINE_ROW_HEIGHT, start, count),
+            None
         );
+    }
+
+    #[test]
+    fn outline_window_follows_scrolling() {
+        let (start, count) =
+            outline_window_request(1000, 10_000.0, 900, OUTLINE_ROW_HEIGHT, 0, 256).unwrap();
+        assert_eq!(start, 341);
         assert_eq!(
-            filtered_commands("toc")
-                .into_iter()
-                .map(|index| COMMANDS[index].label)
-                .collect::<Vec<_>>(),
-            vec!["Show outline"]
+            outline_window_request(1000, 10_000.0, 900, OUTLINE_ROW_HEIGHT, start, count),
+            None
         );
-        assert!(filtered_commands("nonsense").is_empty());
-        assert!(
-            filtered_commands("goto").is_empty(),
-            "page jumps now live in the outline"
-        );
+    }
+
+    #[test]
+    fn outline_window_clamps_at_the_end() {
+        let (start, count) =
+            outline_window_request(10, 0.0, 900, OUTLINE_ROW_HEIGHT, 0, 0).unwrap();
+        assert_eq!((start, count), (0, 10));
         assert_eq!(
-            COMMANDS[filtered_commands("right")[0]].label,
-            "Rotate right"
+            outline_window_request(10, 0.0, 900, OUTLINE_ROW_HEIGHT, start, count),
+            None
         );
+    }
+
+    #[test]
+    fn outline_preview_skips_oversized_zoomed_pages() {
+        let small = PageBitmap {
+            width: 1000,
+            height: 1000,
+            pixels: Vec::new(),
+        };
+        let large = PageBitmap {
+            width: 3000,
+            height: 2000,
+            pixels: Vec::new(),
+        };
+        assert!(outline_preview_allowed(Fit::Page, Some(&large)));
+        assert!(outline_preview_allowed(Fit::None, Some(&small)));
+        assert!(!outline_preview_allowed(Fit::None, Some(&large)));
+        assert!(!outline_preview_allowed(Fit::None, None));
     }
 
     #[test]

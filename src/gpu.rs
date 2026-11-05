@@ -440,7 +440,9 @@ impl GpuRenderer {
         }
     }
 
-    pub fn render(&self, clear: [f32; 4], list: &DrawList) -> Result<(), String> {
+    /// Draw one frame. Returns whether a frame was actually presented; a
+    /// timeout or an occluded surface leaves the window's contents unchanged.
+    pub fn render(&self, clear: [f32; 4], list: &DrawList) -> Result<bool, String> {
         let clear = self.solid_color(clear);
         let clear = wgpu::Color {
             r: clear[0] as f64,
@@ -453,10 +455,10 @@ impl GpuRenderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+                return Ok(false);
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err("wgpu surface validation error".to_string());
@@ -550,7 +552,7 @@ impl GpuRenderer {
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
-        Ok(())
+        Ok(true)
     }
 
     /// Solid colors arrive as sRGB fractions because that is what the CPU
