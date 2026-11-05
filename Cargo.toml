@@ -15,7 +15,7 @@ fontdb = "0.24"
 harfbuzz_rs = "2"
 hypher = "0.1"
 libc = "0.2"
-mupdf = { git = "https://github.com/ningxilai/mupdf-rs", rev = "ccbeff0373aba5d83eddfc9c44190c1552c4fb22", default-features = false, features = [
+mupdf = { git = "https://github.com/ningxilai/mupdf-rs", rev = "53a5bb885e7c29f9a8905a6b66c6cec28aa9c7c6", default-features = false, features = [
     "epub",
     "cbz",
     "xps",
