@@ -45,7 +45,7 @@ use document::{
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
 use gpu::{rgb, DrawList, GpuRenderer, Rect};
-use keymap::{Action, Keymap, Resolution};
+use keymap::{Action, Keymap, MenuKeymap, MenuResolution, Resolution};
 use outline_text::{TextEngine, TextTarget};
 use progress::ProgressStore;
 use winit::application::ApplicationHandler;
@@ -71,6 +71,8 @@ const MENU_ROW_HEIGHT: u32 = 30;
 const MENU_FOOTER_HEIGHT: u32 = 34;
 const MENU_MAX_ROWS: usize = 10;
 const MENU_PADDING: u32 = 16;
+/// Room for a modifier combination such as `C-=` or `M-w`.
+const MENU_KEY_COLUMN: u32 = 76;
 /// Wait for the outline selection to settle before previewing it. Without this
 /// debounce, holding an arrow key queues one full page render per row.
 const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
@@ -99,126 +101,143 @@ enum Prompt {
     Search(String, SearchScope),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MenuAction {
-    NextPage,
-    PrevPage,
-    FirstPage,
-    LastPage,
-    Outline,
-    SearchPage,
-    SearchBook,
-    ZoomIn,
-    ZoomOut,
-    FontIncrease,
-    FontDecrease,
-    ResetView,
-    RotateRight,
-    RotateLeft,
-    Copy,
-    Quit,
-}
-
+#[derive(Clone, Copy)]
 struct CommandEntry {
     label: &'static str,
-    /// The key that runs this command directly while the menu is open.
-    key: char,
-    action: MenuAction,
+    action: Action,
 }
 
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         label: "Next page",
-        key: 'n',
-        action: MenuAction::NextPage,
+        action: Action::NextPage,
     },
     CommandEntry {
         label: "Previous page",
-        key: 'p',
-        action: MenuAction::PrevPage,
+        action: Action::PrevPage,
     },
     CommandEntry {
         label: "First page",
-        key: 'g',
-        action: MenuAction::FirstPage,
+        action: Action::FirstPage,
     },
     CommandEntry {
         label: "Last page",
-        key: 'G',
-        action: MenuAction::LastPage,
+        action: Action::LastPage,
     },
     CommandEntry {
         label: "Show outline",
-        key: 'o',
-        action: MenuAction::Outline,
+        action: Action::Outline,
     },
     CommandEntry {
         label: "Search this page",
-        key: 's',
-        action: MenuAction::SearchPage,
+        action: Action::SearchPage,
     },
     CommandEntry {
         label: "Search the whole book",
-        key: 'S',
-        action: MenuAction::SearchBook,
+        action: Action::SearchBook,
     },
     CommandEntry {
         label: "Zoom in",
-        key: '+',
-        action: MenuAction::ZoomIn,
+        action: Action::ZoomIn,
     },
     CommandEntry {
         label: "Zoom out",
-        key: '-',
-        action: MenuAction::ZoomOut,
+        action: Action::ZoomOut,
     },
     CommandEntry {
         label: "Increase text size",
-        key: ']',
-        action: MenuAction::FontIncrease,
+        action: Action::FontIncrease,
     },
     CommandEntry {
         label: "Decrease text size",
-        key: '[',
-        action: MenuAction::FontDecrease,
+        action: Action::FontDecrease,
     },
     CommandEntry {
         label: "Reset view",
-        key: '0',
-        action: MenuAction::ResetView,
+        action: Action::ResetView,
     },
     CommandEntry {
         label: "Rotate right",
-        key: 'r',
-        action: MenuAction::RotateRight,
+        action: Action::RotateRight,
     },
     CommandEntry {
         label: "Rotate left",
-        key: 'l',
-        action: MenuAction::RotateLeft,
+        action: Action::RotateLeft,
     },
     CommandEntry {
         label: "Copy selection",
-        key: 'y',
-        action: MenuAction::Copy,
+        action: Action::Copy,
     },
     CommandEntry {
         label: "Quit",
-        key: 'Q',
-        action: MenuAction::Quit,
+        action: Action::Quit,
     },
 ];
 
-fn command_index_for_key(key: char) -> Option<usize> {
-    COMMANDS.iter().position(|command| command.key == key)
+/// Keys the panel owns. Bindings containing any of these are hidden from the
+/// panel, so a config cannot create a shortcut that the panel would intercept.
+const MENU_RESERVED: &[&str] = &[
+    "Escape",
+    "Enter",
+    "Up",
+    "Down",
+    "PageUp",
+    "PageDown",
+    "Home",
+    "End",
+    "Backspace",
+    "C-g",
+    "q",
+];
+
+fn menu_actions() -> Vec<Action> {
+    COMMANDS.iter().map(|entry| entry.action).collect()
+}
+
+fn command_label(action: Action) -> &'static str {
+    COMMANDS
+        .iter()
+        .find(|entry| entry.action == action)
+        .map_or("", |entry| entry.label)
+}
+
+fn action_closes_menu(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Outline | Action::SearchPage | Action::SearchBook | Action::Quit
+    )
+}
+
+/// Modifier keys are delivered as their own press events and are not bindable.
+/// They must be ignored rather than treated as a rejected chord.
+fn is_modifier_key<S>(key: Key<S>) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::CapsLock
+                | NamedKey::Control
+                | NamedKey::Fn
+                | NamedKey::FnLock
+                | NamedKey::Hyper
+                | NamedKey::Meta
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+                | NamedKey::Shift
+                | NamedKey::Super
+                | NamedKey::Symbol
+                | NamedKey::SymbolLock
+        )
+    )
 }
 
 /// How many command rows fit in the panel without hiding it under the window
 /// edge. The panel still scrolls when the window is short.
-fn menu_visible_rows(viewport_h: u32) -> usize {
+fn menu_visible_rows(viewport_h: u32, count: usize) -> usize {
     let reserved = MENU_HEADER_HEIGHT + MENU_FOOTER_HEIGHT + 8;
     let available = viewport_h.saturating_sub(reserved);
-    ((available / MENU_ROW_HEIGHT) as usize).clamp(1, COMMANDS.len())
+    ((available / MENU_ROW_HEIGHT) as usize).clamp(1, count.max(1))
 }
 
 struct CommandMenu {
@@ -319,6 +338,8 @@ struct App {
     status: Option<String>,
     fonts: Arc<FontCatalog>,
     keymap: Keymap,
+    menu_keys: MenuKeymap,
+    menu_entries: Vec<CommandEntry>,
     pending_zooms: VecDeque<PendingZoom>,
     last_requested_scale: f32,
     css: Option<String>,
@@ -360,6 +381,12 @@ impl App {
     ) -> Self {
         let progress = ProgressStore::load(progress_limit);
         let resume_page = progress.page_for(&path).filter(|&page| page > 1);
+        let menu_keys = keymap.menu_keymap(&menu_actions(), MENU_RESERVED);
+        let menu_entries: Vec<CommandEntry> = COMMANDS
+            .iter()
+            .copied()
+            .filter(|entry| menu_keys.has_binding(entry.action))
+            .collect();
         Self {
             path,
             proxy,
@@ -411,6 +438,8 @@ impl App {
             status: None,
             fonts,
             keymap,
+            menu_keys,
+            menu_entries,
             pending_zooms: VecDeque::new(),
             last_requested_scale: 1.0,
             css,
@@ -1072,12 +1101,13 @@ impl App {
             .unwrap_or_else(|| self.path.display().to_string());
 
         if let Some(menu) = self.command_menu.as_ref() {
-            let echo = menu
-                .echo
-                .as_ref()
-                .map(|echo| format!(" — {echo}"))
+            let context = self
+                .menu_keys
+                .pending_label()
+                .map(|prefix| format!(" — {prefix} …"))
+                .or_else(|| menu.echo.as_ref().map(|echo| format!(" — {echo}")))
                 .unwrap_or_default();
-            window.set_title(&format!("{name} — Commands{echo}"));
+            window.set_title(&format!("{name} — Commands{context}"));
             return;
         }
 
@@ -1314,12 +1344,18 @@ impl App {
     }
 
     fn open_command_menu(&mut self) {
+        if self.menu_entries.is_empty() {
+            self.status = Some("no commands available".to_string());
+            self.update_title();
+            return;
+        }
         self.finish_animation();
         self.prompt = Prompt::None;
+        self.menu_keys.reset();
         self.command_menu = Some(CommandMenu {
             selected: 0,
             scroll: 0,
-            rows: MENU_MAX_ROWS.min(COMMANDS.len()),
+            rows: MENU_MAX_ROWS.min(self.menu_entries.len()),
             echo: None,
             dirty: true,
             bitmap: None,
@@ -1332,6 +1368,7 @@ impl App {
 
     fn close_command_menu(&mut self) {
         self.command_menu = None;
+        self.menu_keys.reset();
         self.update_title();
         self.request_redraw();
     }
@@ -1340,7 +1377,7 @@ impl App {
         let Some(menu) = self.command_menu.as_ref() else {
             return;
         };
-        let last = COMMANDS.len().saturating_sub(1) as isize;
+        let last = self.menu_entries.len().saturating_sub(1) as isize;
         let selected = (menu.selected as isize + delta).clamp(0, last) as usize;
         self.select_menu_index(selected);
     }
@@ -1349,8 +1386,19 @@ impl App {
         let Some(menu) = self.command_menu.as_mut() else {
             return;
         };
-        menu.selected = index.min(COMMANDS.len().saturating_sub(1));
-        scroll_menu_to_selection(menu);
+        menu.selected = index.min(self.menu_entries.len().saturating_sub(1));
+        scroll_menu_to_selection(menu, self.menu_entries.len());
+        menu.dirty = true;
+        self.request_redraw();
+    }
+
+    fn scroll_menu_candidates(&mut self, delta: isize) {
+        let count = self.menu_keys.candidates().len();
+        let Some(menu) = self.command_menu.as_mut() else {
+            return;
+        };
+        let max_scroll = count.saturating_sub(menu.rows.max(1)) as isize;
+        menu.scroll = (menu.scroll as isize + delta).clamp(0, max_scroll) as usize;
         menu.dirty = true;
         self.request_redraw();
     }
@@ -1359,44 +1407,64 @@ impl App {
         let Some(menu) = self.command_menu.as_ref() else {
             return;
         };
-        let Some(entry) = COMMANDS.get(menu.selected) else {
+        let Some(entry) = self.menu_entries.get(menu.selected) else {
             return;
         };
         let action = entry.action;
-        let label = entry.label;
-        if menu_action_closes(action) {
+        self.run_menu_action(event_loop, action);
+    }
+
+    fn run_menu_action(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+        self.menu_keys.reset();
+        let count = self.menu_entries.len();
+        if let Some(index) = self
+            .menu_entries
+            .iter()
+            .position(|entry| entry.action == action)
+        {
+            if let Some(menu) = self.command_menu.as_mut() {
+                menu.selected = index;
+                scroll_menu_to_selection(menu, count);
+            }
+        }
+        if action_closes_menu(action) {
             self.close_command_menu();
-            self.run_menu_action(event_loop, action);
+            self.run_action(event_loop, action);
             return;
         }
-        self.run_menu_action(event_loop, action);
+        self.run_action(event_loop, action);
         if let Some(menu) = self.command_menu.as_mut() {
-            menu.echo = Some(label.to_string());
+            menu.echo = Some(command_label(action).to_string());
             menu.dirty = true;
         }
         self.update_title();
         self.request_redraw();
     }
 
-    fn run_menu_action(&mut self, event_loop: &ActiveEventLoop, action: MenuAction) {
-        match action {
-            MenuAction::NextPage => self.next_page(),
-            MenuAction::PrevPage => self.prev_page(),
-            MenuAction::FirstPage => self.first_page(),
-            MenuAction::LastPage => self.last_page(),
-            MenuAction::Outline => self.open_outline(),
-            MenuAction::SearchPage => self.start_search_prompt(SearchScope::Page),
-            MenuAction::SearchBook => self.start_search_prompt(SearchScope::Book),
-            MenuAction::ZoomIn => self.zoom_in(),
-            MenuAction::ZoomOut => self.zoom_out(),
-            MenuAction::FontIncrease => self.font_increase(),
-            MenuAction::FontDecrease => self.font_decrease(),
-            MenuAction::ResetView => self.reset_view(),
-            MenuAction::RotateRight => self.rotate(true),
-            MenuAction::RotateLeft => self.rotate(false),
-            MenuAction::Copy => self.copy_selection(),
-            MenuAction::Quit => event_loop.exit(),
+    fn cancel_menu_pending(&mut self) {
+        self.menu_keys.reset();
+        let count = self.menu_entries.len();
+        if let Some(menu) = self.command_menu.as_mut() {
+            scroll_menu_to_selection(menu, count);
+            menu.dirty = true;
         }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn after_menu_pending_change(&mut self) {
+        let pending = self.menu_keys.has_pending();
+        let count = self.menu_entries.len();
+        if let Some(menu) = self.command_menu.as_mut() {
+            if pending {
+                menu.scroll = 0;
+            } else {
+                scroll_menu_to_selection(menu, count);
+            }
+            menu.dirty = true;
+        }
+        self.update_title();
+        self.request_redraw();
     }
 
     fn handle_command_menu_key(
@@ -1404,62 +1472,114 @@ impl App {
         event_loop: &ActiveEventLoop,
         event: &winit::event::KeyEvent,
     ) {
-        if self.modifiers.control_key() || self.modifiers.alt_key() {
-            if self.modifiers.control_key() {
-                match event.logical_key.as_ref() {
-                    Key::Character("g") => self.close_command_menu(),
-                    Key::Character("n") => self.move_menu_selection(1),
-                    Key::Character("p") => self.move_menu_selection(-1),
-                    _ => {}
-                }
-            }
+        let pending = self.menu_keys.has_pending();
+        let key = event.logical_key.as_ref();
+        let plain_q = !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && matches!(key, Key::Character(ch) if ch == "q");
+        let cancel = matches!(key, Key::Named(NamedKey::Escape))
+            || (self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && matches!(key, Key::Character(ch) if ch == "g"));
+
+        // `q` and Escape are panel controls. While a sequence is pending,
+        // Escape only drops the prefix; q still closes the whole panel.
+        if plain_q || (cancel && !pending) {
+            self.close_command_menu();
+            return;
+        }
+        if cancel {
+            self.cancel_menu_pending();
             return;
         }
 
-        match event.logical_key.as_ref() {
-            Key::Named(NamedKey::Escape) => self.close_command_menu(),
-            Key::Named(NamedKey::Enter) => self.execute_menu_command(event_loop),
-            Key::Named(NamedKey::ArrowDown) => self.move_menu_selection(1),
-            Key::Named(NamedKey::ArrowUp) => self.move_menu_selection(-1),
+        let rows = self
+            .command_menu
+            .as_ref()
+            .map_or(MENU_MAX_ROWS, |menu| menu.rows.max(1)) as isize;
+        match key {
+            Key::Named(NamedKey::Backspace) => {
+                if pending {
+                    self.menu_keys.pop_pending();
+                    self.after_menu_pending_change();
+                } else {
+                    self.close_command_menu();
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                if !pending {
+                    self.execute_menu_command(event_loop);
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if pending {
+                    self.scroll_menu_candidates(1);
+                } else {
+                    self.move_menu_selection(1);
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if pending {
+                    self.scroll_menu_candidates(-1);
+                } else {
+                    self.move_menu_selection(-1);
+                }
+            }
             Key::Named(NamedKey::PageDown) => {
-                let rows = self
-                    .command_menu
-                    .as_ref()
-                    .map_or(MENU_MAX_ROWS, |menu| menu.rows.max(1));
-                self.move_menu_selection(rows as isize);
+                if pending {
+                    self.scroll_menu_candidates(rows);
+                } else {
+                    self.move_menu_selection(rows);
+                }
             }
             Key::Named(NamedKey::PageUp) => {
-                let rows = self
-                    .command_menu
-                    .as_ref()
-                    .map_or(MENU_MAX_ROWS, |menu| menu.rows.max(1));
-                self.move_menu_selection(-(rows as isize));
+                if pending {
+                    self.scroll_menu_candidates(-rows);
+                } else {
+                    self.move_menu_selection(-rows);
+                }
             }
-            Key::Named(NamedKey::Home) => self.select_menu_index(0),
+            Key::Named(NamedKey::Home) => {
+                if pending {
+                    self.scroll_menu_candidates(-isize::MAX / 2);
+                } else {
+                    self.select_menu_index(0);
+                }
+            }
             Key::Named(NamedKey::End) => {
-                self.select_menu_index(COMMANDS.len().saturating_sub(1));
+                if pending {
+                    self.scroll_menu_candidates(isize::MAX / 2);
+                } else {
+                    self.select_menu_index(self.menu_entries.len().saturating_sub(1));
+                }
             }
-            Key::Character(ch) => {
-                let Some(key) = ch.chars().next() else {
-                    return;
-                };
-                if key == 'q' {
-                    self.close_command_menu();
-                    return;
+            _ => match self.menu_keys.press(event, self.modifiers) {
+                MenuResolution::Action(action) => self.run_menu_action(event_loop, action),
+                MenuResolution::Pending => {
+                    if let Some(menu) = self.command_menu.as_mut() {
+                        menu.scroll = 0;
+                        menu.echo = None;
+                        menu.dirty = true;
+                    }
+                    self.update_title();
+                    self.request_redraw();
                 }
-                if let Some(index) = command_index_for_key(key) {
-                    self.select_menu_index(index);
-                    self.execute_menu_command(event_loop);
-                    return;
+                MenuResolution::Ignored(attempted) => {
+                    let message = if attempted.is_empty() {
+                        "no command for that key".to_string()
+                    } else {
+                        format!("no command for {attempted}")
+                    };
+                    let count = self.menu_entries.len();
+                    if let Some(menu) = self.command_menu.as_mut() {
+                        menu.echo = Some(message);
+                        scroll_menu_to_selection(menu, count);
+                        menu.dirty = true;
+                    }
+                    self.update_title();
+                    self.request_redraw();
                 }
-                if let Some(menu) = self.command_menu.as_mut() {
-                    menu.echo = Some(format!("No command for {key}"));
-                    menu.dirty = true;
-                }
-                self.update_title();
-                self.request_redraw();
-            }
-            _ => {}
+            },
         }
     }
 
@@ -1471,16 +1591,46 @@ impl App {
             return;
         }
 
-        let count = COMMANDS.len();
-        let rows = menu_visible_rows(viewport.1).min(count);
-        let selected = menu.selected.min(count.saturating_sub(1));
+        let pending = self.menu_keys.pending_label();
+        let view: Vec<(String, &'static str)> = if pending.is_some() {
+            self.menu_keys
+                .candidates()
+                .into_iter()
+                .map(|candidate| (candidate.key, command_label(candidate.action)))
+                .collect()
+        } else {
+            self.menu_entries
+                .iter()
+                .map(|entry| {
+                    (
+                        self.menu_keys
+                            .primary_label(entry.action)
+                            .unwrap_or_else(|| "—".to_string()),
+                        entry.label,
+                    )
+                })
+                .collect()
+        };
+
+        let count = view.len();
+        let rows = menu_visible_rows(viewport.1, count);
+        let selected = if pending.is_some() {
+            0
+        } else {
+            menu.selected.min(self.menu_entries.len().saturating_sub(1))
+        };
         let echo = menu.echo.clone();
-        let mut scroll = menu.scroll.min(count.saturating_sub(rows));
-        if selected < scroll {
-            scroll = selected;
-        } else if selected >= scroll + rows {
-            scroll = selected + 1 - rows;
-        }
+        let scroll = if pending.is_some() {
+            menu.scroll.min(count.saturating_sub(rows))
+        } else {
+            let mut scroll = menu.scroll.min(count.saturating_sub(rows));
+            if selected < scroll {
+                scroll = selected;
+            } else if selected >= scroll + rows {
+                scroll = selected + 1 - rows;
+            }
+            scroll.min(count.saturating_sub(rows))
+        };
         let width = viewport
             .0
             .saturating_sub(80)
@@ -1499,17 +1649,19 @@ impl App {
             pixels[row..row + width as usize].fill(0x00222222);
         }
 
-        for row in 0..rows {
-            let index = scroll + row;
-            if index != selected {
-                continue;
-            }
-            let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
-            for y in top..(top + MENU_ROW_HEIGHT).min(height) {
-                let start = y as usize * width as usize;
-                pixels[start..start + width as usize].fill(0x002a2e34);
-                if width >= 4 {
-                    pixels[start + 1..start + 4].fill(SELECTION_ACCENT);
+        if pending.is_none() {
+            for row in 0..rows {
+                let index = scroll + row;
+                if index != selected {
+                    continue;
+                }
+                let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
+                for y in top..(top + MENU_ROW_HEIGHT).min(height) {
+                    let start = y as usize * width as usize;
+                    pixels[start..start + width as usize].fill(0x002a2e34);
+                    if width >= 4 {
+                        pixels[start + 1..start + 4].fill(SELECTION_ACCENT);
+                    }
                 }
             }
         }
@@ -1518,7 +1670,10 @@ impl App {
             self.menu_text = TextEngine::new(self.fonts.clone()).ok();
         }
         if let Some(text) = self.menu_text.as_mut() {
-            let header = format!("Commands  {}/{}   q/Esc closes", selected + 1, count);
+            let header = match pending.as_deref() {
+                Some(prefix) => format!("Commands  {prefix} …"),
+                None => format!("Commands  {}/{}   q/Esc closes", selected + 1, count.max(1)),
+            };
             let mut target = TextTarget::new(&mut pixels, width, height, 0, MENU_HEADER_HEIGHT);
             text.draw_line(
                 &header,
@@ -1532,12 +1687,11 @@ impl App {
             );
 
             for row in 0..rows {
-                let index = scroll + row;
-                let Some(entry) = COMMANDS.get(index) else {
+                let Some((key_label, label)) = view.get(scroll + row) else {
                     continue;
                 };
                 let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
-                let selected_row = index == selected;
+                let selected_row = pending.is_none() && scroll + row == selected;
                 let key_color = if selected_row {
                     (240, 200, 140)
                 } else {
@@ -1546,7 +1700,7 @@ impl App {
                 let mut target =
                     TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
                 text.draw_line(
-                    &entry.key.to_string(),
+                    key_label,
                     14.0,
                     Weight::BOLD,
                     &mut target,
@@ -1563,22 +1717,31 @@ impl App {
                 let mut target =
                     TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
                 text.draw_line(
-                    entry.label,
+                    label,
                     14.0,
                     Weight::NORMAL,
                     &mut target,
-                    MENU_PADDING as i32 + 34,
+                    MENU_PADDING as i32 + MENU_KEY_COLUMN as i32,
                     top as i32,
                     MENU_ROW_HEIGHT,
                     color,
                 );
             }
 
-            let footer = echo.as_ref().map_or_else(
-                || "Press a command key, or ↑↓ then Enter".to_string(),
-                |echo| format!("→ {echo}"),
-            );
-            let footer_color = if echo.is_some() {
+            let footer = if pending.is_some() {
+                let hidden = count.saturating_sub(rows);
+                if hidden > 0 {
+                    format!("Esc cancels · Backspace deletes · {hidden} more")
+                } else {
+                    "Esc cancels · Backspace deletes".to_string()
+                }
+            } else {
+                echo.as_ref().map_or_else(
+                    || "Type a shortcut, or ↑↓ then Enter".to_string(),
+                    |echo| format!("→ {echo}"),
+                )
+            };
+            let footer_color = if pending.is_none() && echo.is_some() {
                 (235, 215, 175)
             } else {
                 (150, 150, 150)
@@ -1759,6 +1922,11 @@ impl App {
 
     fn handle_key(&mut self, event_loop: &ActiveEventLoop, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        // A modifier press is its own event. It can never be bound, so it must
+        // not break a pending multi-key sequence or produce an error echo.
+        if is_modifier_key(event.logical_key.as_ref()) {
             return;
         }
 
@@ -2640,8 +2808,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn scroll_menu_to_selection(menu: &mut CommandMenu) {
-    let count = COMMANDS.len();
+fn scroll_menu_to_selection(menu: &mut CommandMenu, count: usize) {
+    let count = count.max(1);
     let rows = menu.rows.clamp(1, count);
     let selected = menu.selected.min(count.saturating_sub(1));
     if selected < menu.scroll {
@@ -2651,13 +2819,7 @@ fn scroll_menu_to_selection(menu: &mut CommandMenu) {
     }
     menu.scroll = menu.scroll.min(count.saturating_sub(rows));
     menu.rows = rows;
-}
-
-fn menu_action_closes(action: MenuAction) -> bool {
-    matches!(
-        action,
-        MenuAction::Outline | MenuAction::SearchPage | MenuAction::SearchBook | MenuAction::Quit
-    )
+    menu.selected = selected;
 }
 
 /// Decide whether the outline actually needs a new bitmap window. The
@@ -2857,37 +3019,42 @@ mod tests {
     }
 
     #[test]
-    fn command_menu_shortcuts_are_unique_and_run_the_right_action() {
+    fn command_catalog_has_distinct_actions() {
         let mut seen = std::collections::HashSet::new();
         for command in COMMANDS {
             assert!(
-                seen.insert(command.key),
-                "duplicate command shortcut {:?}",
-                command.key
+                seen.insert(command.action),
+                "duplicate command action {:?}",
+                command.action
             );
+            assert!(!command.label.is_empty());
         }
+        assert!(!COMMANDS.is_empty());
+    }
 
-        let action = |key| command_index_for_key(key).map(|index| COMMANDS[index].action);
-        assert_eq!(action('n'), Some(MenuAction::NextPage));
-        assert_eq!(action('p'), Some(MenuAction::PrevPage));
-        assert_eq!(action('g'), Some(MenuAction::FirstPage));
-        assert_eq!(action('G'), Some(MenuAction::LastPage));
-        assert_eq!(action('o'), Some(MenuAction::Outline));
-        assert_eq!(action('s'), Some(MenuAction::SearchPage));
-        assert_eq!(action('S'), Some(MenuAction::SearchBook));
-        assert_eq!(action('+'), Some(MenuAction::ZoomIn));
-        assert_eq!(action('-'), Some(MenuAction::ZoomOut));
-        assert_eq!(action('Q'), Some(MenuAction::Quit));
-        assert_eq!(action('q'), None, "q closes the menu");
-        assert_eq!(action('z'), None);
+    #[test]
+    fn modifier_presses_are_not_treated_as_commands() {
+        for name in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::Super,
+            NamedKey::CapsLock,
+        ] {
+            assert!(is_modifier_key(Key::<&str>::Named(name)));
+        }
+        assert!(!is_modifier_key(Key::<&str>::Character("g")));
+        assert!(!is_modifier_key(Key::<&str>::Named(NamedKey::Escape)));
     }
 
     #[test]
     fn command_menu_rows_fit_the_window() {
-        assert_eq!(menu_visible_rows(900), COMMANDS.len());
-        let small = menu_visible_rows(240);
-        assert!(small >= 1 && small < COMMANDS.len());
-        assert_eq!(menu_visible_rows(0), 1);
+        let count = COMMANDS.len();
+        assert_eq!(menu_visible_rows(900, count), count);
+        let small = menu_visible_rows(240, count);
+        assert!(small >= 1 && small < count);
+        assert_eq!(menu_visible_rows(0, count), 1);
+        assert_eq!(menu_visible_rows(900, 3), 3);
     }
 
     #[test]
@@ -2901,11 +3068,11 @@ mod tests {
             bitmap: None,
             revision: 0,
         };
-        scroll_menu_to_selection(&mut menu);
+        scroll_menu_to_selection(&mut menu, 20);
         assert!(menu.scroll <= menu.selected && menu.selected < menu.scroll + menu.rows);
 
         menu.selected = 0;
-        scroll_menu_to_selection(&mut menu);
+        scroll_menu_to_selection(&mut menu, 20);
         assert_eq!(menu.scroll, 0);
     }
 

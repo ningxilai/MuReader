@@ -138,14 +138,18 @@ line-breaking pass for TXT and text files.
 
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
-Press `:` for the command panel. Each action is listed next to its shortcut;
-press the shortcut to run it immediately, or use the arrow keys and `Enter`.
-Repeatable actions (page turns, zoom, rotation, text size) keep the panel open
-and echo the last action at the bottom; `q` or `Esc` closes it. Outline,
-search, and quit close the panel because they change mode. For reflowable
-documents, `C-=` and `C--` change the base text size; the document is reflowed
-and the current reading position is kept. `0` re-fits the page after zooming,
-page turns, or window resizing.
+Press `:` for the command panel. Each action is shown next to its effective
+binding from `[keys]`, including combinations such as `C-s`, `M-s`, `C-=`, and
+`M-w`. Press a complete binding to run it, or use the arrow keys and `Enter`.
+Multi-key sequences wait for the next key and list their continuations, like
+which-key; `Backspace` removes the last key, and `Esc` cancels the pending
+sequence or closes the panel when no sequence is pending. Repeatable actions
+(page turns, zoom, rotation, text size) keep the panel open and echo the last
+action at the bottom; `q` or `Esc` closes it. Outline, search, and quit close
+the panel because they change mode. For reflowable documents, `C-=` and `C--`
+change the base text size; the document is reflowed and the current reading
+position is kept. `0` re-fits the page after zooming, page turns, or window
+resizing.
 
 ## Changelog
 
@@ -153,6 +157,10 @@ page turns, or window resizing.
 
 - Reworked the `:` command menu into a shortcut-driven action panel that keeps
   repeatable actions open and echoes the last action.
+- The `:` panel now reads the effective `[keys]` bindings, displays
+  combinations such as `C-s` and `M-w`, and handles multi-key sequences like
+  which-key: prefixes list their continuations, `Backspace` backs out, and
+  `Esc` cancels the pending sequence.
 - The window now appears after its first frame and shows a loading panel, so
   startup no longer flashes an uninitialized black surface.
 - Outline selection uses a quiet accent rail instead of replacing the row
