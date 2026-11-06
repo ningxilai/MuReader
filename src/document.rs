@@ -244,12 +244,19 @@ pub struct RenderedPage {
     pub reflowable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// One-based page number for an internal destination.
+    Page(usize),
+    /// An external URI, opened by the desktop's default handler.
+    Uri(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderedLink {
     pub bounds: HighlightRect,
-    /// One-based target page for an internal link.
-    pub target_page: Option<usize>,
-    pub uri: String,
+    /// Absent when the document supplies neither a page nor a URI.
+    pub target: Option<LinkTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +637,7 @@ impl RenderEngine {
         row_height: u32,
         start: usize,
         count: usize,
+        selected: Option<usize>,
     ) -> Result<Option<PageBitmap>, String> {
         if self.outline.is_empty() {
             return Ok(None);
@@ -658,7 +666,12 @@ impl RenderEngine {
 
         for (index, entry) in outline[start..start + count].iter().enumerate() {
             let indent = entry.depth.saturating_mul(14).min(width as usize / 2);
-            let (r, g, b) = if entry.depth == 0 {
+            let highlighted = selected == Some(start + index);
+            let (r, g, b) = if highlighted {
+                // Selection is a text treatment, not a row background. The
+                // warm tone also works on the panel's neutral surface.
+                (0xf5, 0xc9, 0x7a)
+            } else if entry.depth == 0 {
                 (0xf2, 0xf2, 0xf2)
             } else {
                 (0xcf, 0xcf, 0xcf)
@@ -669,7 +682,7 @@ impl RenderEngine {
             engine.draw_line(
                 &title,
                 14.0,
-                if entry.depth == 0 {
+                if highlighted || entry.depth == 0 {
                     Weight::BOLD
                 } else {
                     Weight::NORMAL
@@ -904,11 +917,14 @@ impl RenderEngine {
                 links
                     .filter_map(|link| {
                         let bounds = link_rect(&link.bounds, ctm, width, height)?;
-                        Some(RenderedLink {
-                            bounds,
-                            target_page: link.dest.map(|dest| dest.loc.page_number as usize + 1),
-                            uri: link.uri,
-                        })
+                        let target = link
+                            .dest
+                            .and_then(|dest| usize::try_from(dest.loc.page_number).ok())
+                            .map(|page| LinkTarget::Page(page + 1))
+                            .or_else(|| {
+                                (!link.uri.is_empty()).then_some(LinkTarget::Uri(link.uri))
+                            });
+                        Some(RenderedLink { bounds, target })
                     })
                     .collect()
             })
@@ -1618,8 +1634,34 @@ mod tests {
         assert!(
             page.links
                 .iter()
-                .any(|link| link.target_page.is_some_and(|page| page > 1)),
+                .any(|link| matches!(&link.target, Some(LinkTarget::Page(page)) if *page > 1)),
             "internal link did not resolve to a later page: {:?}",
+            page.links
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_links_keep_their_uri() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("external-link");
+        let path = dir.join("sample.html");
+        std::fs::write(
+            &path,
+            r##"<!doctype html><html><body><p><a href="https://example.com/read">Read online</a></p></body></html>"##,
+        )
+        .unwrap();
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(800, 600);
+        let page = engine.render().unwrap();
+        assert!(
+            page.links.iter().any(|link| matches!(
+                &link.target,
+                Some(LinkTarget::Uri(uri)) if uri == "https://example.com/read"
+            )),
+            "external link URI was lost: {:?}",
             page.links
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1688,6 +1730,63 @@ mod tests {
         assert!(titles.contains(&"Chapter One"), "{titles:?}");
         assert!(titles.contains(&"Section A"), "{titles:?}");
         assert!(titles.contains(&"Chapter Two"), "{titles:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outline_selection_highlights_text_not_the_row() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("outline-selection");
+        let path = dir.join("sections.html");
+        let mut html = String::from("<!doctype html><html><body><h1>Chapter One</h1>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("<h1>Chapter Two</h1></body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        let plain = engine.render_outline(320, 28, 0, 4, None).unwrap().unwrap();
+        let selected = engine
+            .render_outline(320, 28, 0, 4, Some(0))
+            .unwrap()
+            .unwrap();
+
+        let width = plain.width as usize;
+        let row_height = 28usize;
+        fn row_block(bitmap: &PageBitmap, row: usize, width: usize, row_height: usize) -> &[u32] {
+            let start = row * row_height * width;
+            &bitmap.pixels[start..start + row_height * width]
+        }
+        let warm_pixels = |row: &[u32]| {
+            row.iter()
+                .filter(|pixel| {
+                    let r = (*pixel >> 16) & 0xff;
+                    let g = (*pixel >> 8) & 0xff;
+                    let b = *pixel & 0xff;
+                    r > 0xd0 && g > 0x90 && b < 0xa0
+                })
+                .count()
+        };
+        assert_eq!(warm_pixels(row_block(&plain, 0, width, row_height)), 0);
+        let selected_row = row_block(&selected, 0, width, row_height);
+        assert!(
+            warm_pixels(selected_row) > 0,
+            "selected outline row was not text-highlighted"
+        );
+        // The last pixel is far from any glyph, so it must keep the panel
+        // background: selection is a text treatment, not a row tint.
+        assert_eq!(
+            row_block(&plain, 0, width, row_height)[row_height * width - 1],
+            selected_row[row_height * width - 1],
+            "selection must not paint the row background"
+        );
+        assert_eq!(selected_row[row_height * width - 1], 0x0020_2020);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

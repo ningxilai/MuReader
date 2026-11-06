@@ -113,6 +113,8 @@ max_documents = 100
 quit = ["q", "Q", "Escape"]
 next_page = "n"
 prev_page = "p"
+back = ["M-Left", "M-h"]
+forward = ["M-Right", "M-l"]
 outline = "o"
 search_page = "C-s"
 search_book = "M-s"
@@ -149,12 +151,28 @@ action at the bottom; `q` or `Esc` closes it. Outline, search, and quit close
 the panel because they change mode. For reflowable documents, `C-=` and `C--`
 change the base text size; the document is reflowed and the current reading
 position is kept. `0` re-fits the page after zooming, page turns, or window
-resizing.
+resizing. Multi-key actions behave like hydra: after a continuation runs, the
+shared prefix stays armed, so pressing another continuation works without
+retyping it. `Esc` or `Backspace` drops the prefix.
+
+Following an internal link or committing an outline entry records the page you
+came from. `Back` and `Forward` move through those destinations, while ordinary
+page turns and scrolling stay out of the history. External `http`, `https`, and
+`mailto` links are opened with the desktop's default handler; other schemes are
+reported in the title instead of being launched. `Back` is bound to `M-Left`
+and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ## Changelog
 
 ### Unreleased
 
+- Unified internal and external link handling: internal links and committed
+  outline entries share one navigation path with Back/Forward history, and
+  external links open in the desktop handler.
+- The command panel now behaves like hydra for multi-key actions, keeping the
+  shared prefix armed so repeated continuations need no retyping.
+- Loading a large document uses a larger, higher-contrast card and starts
+  opening the file before GPU initialization completes.
 - Reworked the `:` command menu into a shortcut-driven action panel that keeps
   repeatable actions open and echoes the last action.
 - The `:` panel now reads the effective `[keys]` bindings, displays
@@ -163,9 +181,9 @@ resizing.
   `Esc` cancels the pending sequence.
 - The window now appears after its first frame and shows a loading panel, so
   startup no longer flashes an uninitialized black surface.
-- Outline selection uses a quiet accent rail instead of replacing the row
-  background, and outline previews are debounced and skipped at large explicit
-  zoom levels to avoid render stalls.
+- Outline selection highlights the selected entry's text instead of replacing
+  the row background, and outline previews are debounced and skipped at large
+  explicit zoom levels to avoid render stalls.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard
   module and reduced it to the copy path.

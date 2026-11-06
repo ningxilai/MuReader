@@ -50,6 +50,7 @@ pub enum Command {
         row_height: u32,
         start: usize,
         count: usize,
+        selected: Option<usize>,
     },
     Quit,
 }
@@ -57,7 +58,11 @@ pub enum Command {
 pub enum Event {
     Page(RenderedPage),
     Outline(Vec<OutlineEntry>),
-    OutlineBitmap { start: usize, bitmap: PageBitmap },
+    OutlineBitmap {
+        start: usize,
+        selected: Option<usize>,
+        bitmap: PageBitmap,
+    },
     Status(String),
     Error(String),
     Fatal(String),
@@ -269,12 +274,14 @@ fn run(
                 row_height,
                 start,
                 count,
+                selected,
             } => {
                 if let Some(engine) = engine.as_mut() {
-                    match engine.render_outline(width, row_height, start, count) {
+                    match engine.render_outline(width, row_height, start, count, selected) {
                         Ok(Some(bitmap)) => {
                             let _ = proxy.send_event(UserEvent::Worker(Event::OutlineBitmap {
                                 start,
+                                selected,
                                 bitmap,
                             }));
                         }

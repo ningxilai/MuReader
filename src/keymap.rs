@@ -34,6 +34,8 @@ pub enum Action {
     RotateRight,
     RotateLeft,
     Copy,
+    Back,
+    Forward,
 }
 
 impl Action {
@@ -64,6 +66,8 @@ impl Action {
             "rotate_right" => Self::RotateRight,
             "rotate_left" => Self::RotateLeft,
             "copy" => Self::Copy,
+            "back" => Self::Back,
+            "forward" => Self::Forward,
             _ => return None,
         })
     }
@@ -479,8 +483,14 @@ impl MenuKeymap {
 
     fn press_chord(&mut self, chord: Chord) -> MenuResolution {
         let mut candidate = std::mem::take(&mut self.pending);
+        let prefix = candidate.clone();
         candidate.push(chord);
         if let Some(action) = self.exact(&candidate) {
+            // Hydra-like behavior: keep the prefix that led to the action, so
+            // another continuation runs immediately without retyping it.
+            if !prefix.is_empty() && self.is_prefix(&prefix) {
+                self.pending = prefix;
+            }
             return MenuResolution::Action(action);
         }
         if self.is_prefix(&candidate) {
@@ -553,6 +563,10 @@ const DEFAULT_BINDINGS: &[(Action, &str)] = &[
     (Action::RotateLeft, "l"),
     (Action::Copy, "M-w"),
     (Action::Copy, "C-w"),
+    (Action::Back, "M-Left"),
+    (Action::Back, "M-h"),
+    (Action::Forward, "M-Right"),
+    (Action::Forward, "M-l"),
 ];
 
 #[cfg(test)]
@@ -742,8 +756,18 @@ mod tests {
             menu.press_chord(Chord::parse("g").unwrap()),
             MenuResolution::Action(Action::NextPage)
         );
-        assert!(!menu.has_pending());
+        assert!(
+            menu.has_pending(),
+            "hydra keeps the prefix after running an action"
+        );
+        assert_eq!(menu.pending_label().as_deref(), Some("M-g"));
+        assert_eq!(
+            menu.press_chord(Chord::parse("G").unwrap()),
+            MenuResolution::Action(Action::PrevPage)
+        );
+        assert!(menu.has_pending());
 
+        menu.reset();
         assert_eq!(
             menu.press_chord(Chord::parse("M-g").unwrap()),
             MenuResolution::Pending
