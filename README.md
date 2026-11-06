@@ -181,9 +181,12 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   `Esc` cancels the pending sequence.
 - The window now appears after its first frame and shows a loading panel, so
   startup no longer flashes an uninitialized black surface.
-- Outline selection highlights the selected entry's text instead of replacing
-  the row background, and outline previews are debounced and skipped at large
-  explicit zoom levels to avoid render stalls.
+- Outline selection highlights the entry's text and keeps a faint row wash
+  with a left rail that follows the page background (white by default, or the
+  effective CSS color for reflowable documents); previews are debounced and
+  skipped at large explicit zoom levels to avoid render stalls.
+- Two-page reading uses a thin central gutter and stays in spread mode when
+  the outline opens, re-fitting both pages instead of collapsing to one.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard
   module and reduced it to the copy path.
