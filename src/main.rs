@@ -82,6 +82,9 @@ const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
 const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
 /// Warm accent used by the command-panel selection and the loading rail.
 const SELECTION_ACCENT: u32 = 0x00d7_a45e;
+/// Very light veil behind the selected outline row. The color is the page's
+/// own background, so the wash stays subtle on any document.
+const OUTLINE_TINT_ALPHA: f32 = 0.06;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -377,6 +380,10 @@ struct App {
     activation: Activation,
     highlights: Vec<HighlightRect>,
     links: Vec<RenderedLink>,
+    /// Rendered page background, used by the outline selection rail and row
+    /// veil. White until the first page arrives; reflowable documents follow
+    /// their effective CSS background.
+    page_background: u32,
     outline: Vec<OutlineEntry>,
     outline_open: bool,
     outline_selected: usize,
@@ -486,6 +493,7 @@ impl App {
             activation: Activation::from_env(),
             highlights: Vec::new(),
             links: Vec::new(),
+            page_background: 0x00ff_ffff,
             outline: Vec::new(),
             outline_open: false,
             outline_selected: 0,
@@ -637,21 +645,13 @@ impl App {
         ((page_w - content_w) / 2.0).max(0.0)
     }
 
-    fn spread_outline_width(&self) -> u32 {
-        if self.outline_open {
-            OUTLINE_WIDTH
-        } else {
-            0
-        }
-    }
-
     fn maybe_enable_spread(&mut self) {
         if self.spread_active || self.spread_blocked || self.pages.len() >= 2 {
             return;
         }
-        // Enabling a spread while the panel is open would make the worker
-        // render a wide strip into a narrower content area, which then
-        // immediately disables the spread again. Leave it for after close.
+        // Do not start a spread in the narrower content area. An already
+        // active pair is kept by update_spread_layout; this path only decides
+        // whether to begin one after the outline is closed.
         if self.outline_open {
             return;
         }
@@ -664,12 +664,9 @@ impl App {
         if self.page_fit != Fit::Page {
             return;
         }
-        // The outline is not opened automatically. It still reserves the
-        // panel width when the user opens it with `o`.
-        let required = page
-            .width
-            .saturating_mul(2)
-            .saturating_add(self.spread_outline_width());
+        // Two gap-free page widths must fit. The gap is purely visual, and
+        // the outline case is handled above by keeping an existing spread.
+        let required = page.width.saturating_mul(2);
         if self.viewport().0 < required {
             return;
         }
@@ -695,13 +692,18 @@ impl App {
             if self.bitmap.is_none() {
                 return;
             }
+            // Opening the outline narrows the worker viewport, but the pair
+            // should stay open: the renderer re-fits both pages to the new
+            // width instead of dropping to a single page. The page widths are
+            // still from the wider layout at this point, so a width check
+            // here would disable the spread before the re-render arrives.
+            if self.outline_open {
+                return;
+            }
             // The visual gap is not part of the fit decision. Using the same
             // gap-free width as maybe_enable_spread also prevents a narrow
-            // window from repeatedly enabling and disabling the spread when
-            // the outline reduces the available width.
-            let required = self
-                .spread_pages_width()
-                .saturating_add(self.spread_outline_width());
+            // window from repeatedly enabling and disabling the spread.
+            let required = self.spread_pages_width();
             if self.viewport().0 < required {
                 self.spread_active = false;
                 self.spread_blocked = true;
@@ -2009,16 +2011,9 @@ impl App {
         self.outline_open = true;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
-        // Opening the panel narrows the content area. Drop the spread in the
-        // same event rather than waiting for the worker's single-page reply,
-        // which would otherwise briefly re-enable it and cause a render loop.
-        if self.spread_active
-            && self.viewport().0 < self.spread_pages_width().saturating_add(OUTLINE_WIDTH)
-        {
-            self.spread_active = false;
-            self.spread_blocked = true;
-            self.send(Command::SetSpread(false));
-        }
+        // Opening the panel narrows the content area, but it must not abandon
+        // an active spread. The worker re-renders the pair at the narrower
+        // width, so both pages stay visible instead of switching to one page.
         self.send_viewport();
         self.ensure_outline_visible();
         self.update_title();
@@ -2218,6 +2213,7 @@ impl App {
         self.highlights = page.highlights;
         self.links = page.links;
         self.text = page.text;
+        self.page_background = page.bitmap.pixels.first().copied().unwrap_or(0x00ff_ffff);
         self.bitmap = Some(page.bitmap);
         self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
@@ -2697,6 +2693,24 @@ impl App {
                     panel_clip,
                 );
             }
+
+            // The selection is a text treatment, but the row keeps the faint
+            // wash and left mark from the original design. Both follow the
+            // page's background color: white for a normal page, the CSS color
+            // for a styled reflowable document.
+            let row_top = self.outline_selected as i32 * OUTLINE_ROW_HEIGHT as i32
+                - self.outline_scroll as i32;
+            let row_height = OUTLINE_ROW_HEIGHT as i32;
+            list.solid(
+                Rect::new(0, row_top, panel_w, row_height),
+                rgb(self.page_background, OUTLINE_TINT_ALPHA),
+                panel_clip,
+            );
+            list.solid(
+                Rect::new(1, row_top, 3, row_height),
+                rgb(self.page_background, 0.95),
+                panel_clip,
+            );
 
             if panel_w > 0 {
                 list.solid(

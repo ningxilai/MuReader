@@ -51,10 +51,10 @@ const PAGE_CACHE_CAPACITY: usize = 4;
 /// Outside a spread only the current page and one neighbor are useful.
 const PAGE_CACHE_SINGLE_CAPACITY: usize = 2;
 
-/// A spread gap is visual, not structural. It scales with the rendered page
-/// width and collapses when the viewport only fits the two page widths.
+/// A spread gap is visual, not structural. Keep it thin so facing pages read
+/// like an open book; it collapses when the viewport only fits the pages.
 pub fn spread_gap(page_width: u32) -> u32 {
-    ((page_width as f32 * 0.018).round() as u32).clamp(6, 24)
+    ((page_width as f32 * 0.004).round() as u32).clamp(1, 6)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -849,6 +849,14 @@ impl RenderEngine {
             .1
             .saturating_sub(MARGIN.saturating_mul(2))
             .max(1) as f32;
+        // A spread fits two pages side by side. Giving each page half the
+        // content width lets the pair shrink to fit instead of clipping one
+        // page when the outline narrows the viewport.
+        let available_w = if self.spread && self.fit != Fit::None {
+            (available_w / 2.0).max(1.0)
+        } else {
+            available_w
+        };
 
         let mut scale = match self.fit {
             Fit::Page => fit_page_scale(rotated_w, rotated_h, available_w, available_h),
@@ -1895,7 +1903,7 @@ mod tests {
         engine.set_viewport(2400, 900);
         let spread = engine.render().unwrap();
         assert_eq!(spread.pages, vec![1, 2, 3, 4]);
-        assert!(spread.gap < 24);
+        assert!(spread.gap <= 6);
         assert!(spread.gap > 0);
         assert!(spread.bitmap.width > single_width);
         assert_eq!(spread.bitmap.height, single_height);
@@ -1904,6 +1912,17 @@ mod tests {
             spread.text.chars.iter().any(|ch| ch.rect.x0 > single_width),
             "second-page text was not shifted into composite coordinates"
         );
+
+        // A narrower viewport, such as when the outline is open, still keeps
+        // both pages: each half is fitted so the pair shrinks instead of one
+        // page being clipped.
+        let narrow_width = single_width + 200;
+        engine.set_viewport(narrow_width, 900);
+        let narrow = engine.render().unwrap();
+        assert_eq!(narrow.pages, vec![1, 2, 3, 4]);
+        assert!(narrow.page_widths[0] < single_width);
+        assert!(narrow.page_widths[0].saturating_mul(2) <= narrow_width);
+        assert_eq!(narrow.gap, 0);
 
         assert!(engine.next_page());
         let next = engine.render().unwrap();
