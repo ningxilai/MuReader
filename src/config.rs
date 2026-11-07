@@ -187,7 +187,7 @@ pub fn load() -> Config {
     }
 }
 
-fn strip_css_comments(css: &str) -> String {
+pub(crate) fn strip_css_comments(css: &str) -> String {
     let mut result = String::with_capacity(css.len());
     let mut rest = css;
     while let Some(start) = rest.find("/*") {
@@ -206,7 +206,7 @@ fn is_css_ident_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') || !ch.is_ascii()
 }
 
-fn strip_font_face_blocks(css: &str) -> String {
+pub(crate) fn strip_font_face_blocks(css: &str) -> String {
     let lower = css.to_ascii_lowercase();
     let mut result = String::with_capacity(css.len());
     let mut copied = 0usize;

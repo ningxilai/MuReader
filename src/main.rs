@@ -26,6 +26,7 @@ mod outline_text;
 mod pretty_text;
 mod progress;
 mod startup;
+mod theme;
 mod worker;
 
 use std::collections::VecDeque;
@@ -40,7 +41,7 @@ use config::Config;
 use document::{
     Fit, HighlightRect, LinkTarget, OutlineEntry, PageBitmap, RenderedLink, RenderedPage,
     SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE, MIN_SCALE,
-    OUTLINE_PANEL_BG, SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
+    SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
@@ -48,6 +49,7 @@ use gpu::{rgb, DrawList, GpuRenderer, Rect};
 use keymap::{Action, Keymap, MenuKeymap, MenuResolution, Resolution};
 use outline_text::{TextEngine, TextTarget};
 use progress::ProgressStore;
+use theme::{rgb8, Theme};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -59,7 +61,6 @@ use winit::window::{Window, WindowId};
 
 use worker::{Command, Event as WorkerEvent, WorkerHandle};
 
-const BACKGROUND: u32 = 0x00181818;
 const TITLE: &str = "MuReader";
 /// The outline takes a bounded share of the window instead of a fixed column.
 const OUTLINE_MIN_WIDTH: u32 = 232;
@@ -79,13 +80,6 @@ const MENU_MAX_ROWS: usize = 10;
 const MENU_PADDING: u32 = 16;
 /// Room for a modifier combination such as `C-=` or `M-w`.
 const MENU_KEY_COLUMN: u32 = 72;
-const MENU_BG: u32 = 0x001b_1c1e;
-const MENU_HEADER_BG: u32 = 0x0020_2124;
-const MENU_FOOTER_BG: u32 = 0x0019_1a1c;
-const MENU_ROW_SELECTED: u32 = 0x0026_2b31;
-const MENU_CHIP_BG: u32 = 0x002a_2b2f;
-const MENU_CHIP_BORDER: u32 = 0x0037_383e;
-const MENU_SEPARATOR: u32 = 0x0028_2a2d;
 /// Wait for the outline selection to settle before previewing it. Without this
 /// debounce, holding an arrow key queues one full page render per row.
 const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
@@ -93,8 +87,6 @@ const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
 /// exceeds this many pixels so outline browsing cannot stall the UI on an
 /// expensive render/upload.
 const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
-/// Warm accent used by the command-panel selection and the loading rail.
-const SELECTION_ACCENT: u32 = 0x00d7_a45e;
 /// Very light veil behind the selected outline row. The color is the page's
 /// own background, so the wash stays subtle on any document.
 const OUTLINE_TINT_ALPHA: f32 = 0.06;
@@ -284,18 +276,6 @@ fn truncate_display(text: &str, max_units: usize) -> String {
     }
     out.push('…');
     out
-}
-
-/// Blend two `0x00RRGGBB` colors. Used for hover washes and muted accents
-/// that must sit on the panel surface without introducing a new hue.
-fn blend_rgb(base: u32, overlay: u32, t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |shift: u32| {
-        let from = ((base >> shift) & 0xff) as f32;
-        let to = ((overlay >> shift) & 0xff) as f32;
-        (from + (to - from) * t).round() as u32
-    };
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -494,6 +474,7 @@ struct App {
     loading_bitmap: Option<PanelBitmap>,
     menu_text: Option<TextEngine>,
     status: Option<String>,
+    theme: Theme,
     fonts: Arc<FontCatalog>,
     keymap: Keymap,
     menu_keys: MenuKeymap,
@@ -536,6 +517,7 @@ impl App {
         fonts: Arc<FontCatalog>,
         keymap: Keymap,
         css: Option<String>,
+        theme: Theme,
         pretty_text: bool,
         page_turn_duration: Duration,
         window_fit_duration: Duration,
@@ -602,6 +584,7 @@ impl App {
             loading_bitmap: None,
             menu_text: None,
             status: None,
+            theme,
             fonts,
             keymap,
             menu_keys,
@@ -960,12 +943,12 @@ impl App {
             start,
             count,
             selected: Some(selected),
-            veil: Some(blend_rgb(
-                OUTLINE_PANEL_BG,
-                request.background,
-                OUTLINE_TINT_ALPHA,
-            )),
+            veil: Some(
+                self.theme
+                    .outline_veil(request.background, OUTLINE_TINT_ALPHA),
+            ),
             rail: Some(request.background),
+            style: self.theme.outline,
         });
     }
 
@@ -1530,8 +1513,9 @@ impl App {
             }
         }
 
-        let mut pixels = vec![0x00202020; panel_w as usize * panel_h as usize];
-        let border = 0x00484848;
+        let theme = self.theme;
+        let mut pixels = vec![theme.prompt; panel_w as usize * panel_h as usize];
+        let border = theme.prompt_border;
         for x in 0..panel_w {
             pixels[x as usize] = border;
             pixels[(panel_h - 1) as usize * panel_w as usize + x as usize] = border;
@@ -1549,7 +1533,7 @@ impl App {
                 16,
                 0,
                 panel_h,
-                (235, 235, 235),
+                rgb8(theme.text),
             );
         }
         let revision = self
@@ -1601,8 +1585,9 @@ impl App {
             }
         }
 
-        let background = 0x002a_2a2a;
-        let border = 0x0050_5050;
+        let theme = self.theme;
+        let background = theme.loading;
+        let border = theme.loading_border;
         let mut pixels = vec![background; panel_w as usize * panel_h as usize];
         for x in 0..panel_w {
             pixels[x as usize] = border;
@@ -1616,7 +1601,7 @@ impl App {
         // dead black surface.
         for y in 0..3 {
             let row = y as usize * panel_w as usize;
-            pixels[row..row + panel_w as usize].fill(SELECTION_ACCENT);
+            pixels[row..row + panel_w as usize].fill(theme.accent);
         }
 
         if self.menu_text.is_none() {
@@ -1633,7 +1618,7 @@ impl App {
                 left,
                 28,
                 28,
-                (238, 238, 238),
+                rgb8(theme.text_title),
             );
             let mut target = TextTarget::new(&mut pixels, panel_w, panel_h, 0, panel_h);
             text.draw_line(
@@ -1644,7 +1629,7 @@ impl App {
                 left,
                 66,
                 24,
-                (188, 188, 188),
+                rgb8(theme.text_muted),
             );
         }
         let revision = self
@@ -1921,6 +1906,7 @@ impl App {
         if !menu.dirty {
             return;
         }
+        let theme = self.theme;
 
         let pending = self.menu_keys.pending_label();
         let view: Vec<(String, &'static str)> = if pending.is_some() {
@@ -1977,7 +1963,7 @@ impl App {
             .clamp(340, max_width)
             .min(viewport.0.max(1));
         let height = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT + MENU_FOOTER_HEIGHT;
-        let mut pixels = vec![MENU_BG; width as usize * height as usize];
+        let mut pixels = vec![theme.panel; width as usize * height as usize];
 
         fill_ui_rect(
             &mut pixels,
@@ -1987,7 +1973,7 @@ impl App {
             0,
             width as i32,
             MENU_HEADER_HEIGHT as i32,
-            MENU_HEADER_BG,
+            theme.panel_raised,
         );
         let footer_top = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT;
         fill_ui_rect(
@@ -1998,7 +1984,7 @@ impl App {
             footer_top as i32,
             width as i32,
             MENU_FOOTER_HEIGHT as i32,
-            MENU_FOOTER_BG,
+            theme.panel_sunken,
         );
         fill_ui_rect(
             &mut pixels,
@@ -2008,7 +1994,7 @@ impl App {
             MENU_HEADER_HEIGHT as i32 - 1,
             width as i32,
             1,
-            MENU_SEPARATOR,
+            theme.separator,
         );
         fill_ui_rect(
             &mut pixels,
@@ -2018,7 +2004,7 @@ impl App {
             footer_top as i32,
             width as i32,
             1,
-            MENU_SEPARATOR,
+            theme.separator,
         );
 
         // Keep the selected row visibly raised, with a slim accent rail that
@@ -2037,7 +2023,7 @@ impl App {
                     top + 2,
                     width as i32 - 16,
                     MENU_ROW_HEIGHT as i32 - 4,
-                    MENU_ROW_SELECTED,
+                    theme.panel_selected,
                 );
                 fill_ui_rect(
                     &mut pixels,
@@ -2047,7 +2033,7 @@ impl App {
                     top + 2,
                     3,
                     MENU_ROW_HEIGHT as i32 - 4,
-                    SELECTION_ACCENT,
+                    theme.accent,
                 );
             }
         }
@@ -2064,7 +2050,7 @@ impl App {
                 ((MENU_HEADER_HEIGHT - 18) / 2) as i32,
                 3,
                 18,
-                SELECTION_ACCENT,
+                theme.accent,
             );
             let mut target = TextTarget::new(&mut pixels, width, height, 0, MENU_HEADER_HEIGHT);
             text.draw_line(
@@ -2075,7 +2061,7 @@ impl App {
                 MENU_PADDING as i32 + 12,
                 0,
                 MENU_HEADER_HEIGHT,
-                (236, 236, 240),
+                rgb8(theme.text_title),
             );
 
             // The right side of the header shows the pending prefix or the
@@ -2096,7 +2082,7 @@ impl App {
                 hint_x,
                 0,
                 MENU_HEADER_HEIGHT,
-                (142, 143, 148),
+                rgb8(theme.text_faint),
             );
 
             let cell_gap = 12i32;
@@ -2114,7 +2100,7 @@ impl App {
                         top + MENU_ROW_HEIGHT as i32 - 1,
                         width as i32 - 2 * MENU_PADDING as i32,
                         1,
-                        MENU_SEPARATOR,
+                        theme.separator,
                     );
                 }
                 for col in 0..columns {
@@ -2130,14 +2116,14 @@ impl App {
                     let chip_h = 20;
                     let chip_y = top + (MENU_ROW_HEIGHT as i32 - chip_h) / 2;
                     let chip_fill = if selected_row {
-                        blend_rgb(MENU_CHIP_BG, SELECTION_ACCENT, 0.22)
+                        theme.chip_selected
                     } else {
-                        MENU_CHIP_BG
+                        theme.chip
                     };
                     let chip_border = if selected_row {
-                        blend_rgb(MENU_CHIP_BORDER, SELECTION_ACCENT, 0.65)
+                        theme.chip_border_selected
                     } else {
-                        MENU_CHIP_BORDER
+                        theme.chip_border
                     };
                     fill_ui_rect(
                         &mut pixels,
@@ -2190,11 +2176,11 @@ impl App {
                         chip_border,
                     );
 
-                    let key_color = if selected_row {
-                        (244, 201, 146)
+                    let key_color = rgb8(if selected_row {
+                        theme.key_text_selected
                     } else {
-                        (176, 177, 184)
-                    };
+                        theme.key_text
+                    });
                     let mut target =
                         TextTarget::new(&mut pixels, width, height, top, MENU_ROW_HEIGHT);
                     text.draw_line(
@@ -2213,9 +2199,9 @@ impl App {
                     let max_units = ((label_right - label_x).max(24) / 7) as usize;
                     let label = truncate_display(label, max_units.max(4));
                     let (color, weight) = if selected_row {
-                        ((255, 255, 255), Weight::BOLD)
+                        (rgb8(theme.text_selected), Weight::BOLD)
                     } else {
-                        ((214, 214, 219), Weight::NORMAL)
+                        (rgb8(theme.text_secondary), Weight::NORMAL)
                     };
                     let mut target =
                         TextTarget::new(&mut pixels, width, height, top, MENU_ROW_HEIGHT);
@@ -2244,7 +2230,7 @@ impl App {
                     track_y,
                     3,
                     track_h,
-                    blend_rgb(MENU_BG, MENU_SEPARATOR, 0.8),
+                    theme.scrollbar_track,
                 );
                 let thumb_h = ((rows as f32 / total_rows as f32) * track_h as f32)
                     .max(20.0)
@@ -2259,7 +2245,7 @@ impl App {
                     thumb_y,
                     3,
                     thumb_h,
-                    blend_rgb(MENU_BG, SELECTION_ACCENT, 0.55),
+                    theme.scrollbar_thumb,
                 );
             }
 
@@ -2284,11 +2270,11 @@ impl App {
                     |echo| format!("→ {echo}"),
                 )
             };
-            let footer_color = if pending.is_none() && echo.is_some() {
-                (235, 215, 175)
+            let footer_color = rgb8(if pending.is_none() && echo.is_some() {
+                theme.footer_echo
             } else {
-                (160, 161, 166)
-            };
+                theme.footer_text
+            });
             let mut target = TextTarget::new(
                 &mut pixels,
                 width,
@@ -2310,7 +2296,7 @@ impl App {
 
         // A single-pixel frame keeps the panel readable over a white page
         // without the heavy double border of the old design.
-        let border = 0x003d_3f45;
+        let border = theme.panel_border;
         for x in 0..width {
             pixels[x as usize] = border;
             pixels[(height - 1) as usize * width as usize + x as usize] = border;
@@ -3021,7 +3007,7 @@ impl App {
                         (scaled(highlight.x1) - scaled(highlight.x0)).max(1),
                         (scaled(highlight.y1) - scaled(highlight.y0)).max(1),
                     ),
-                    rgb(0x00ff_e61e, 0.45),
+                    rgb(self.theme.search_highlight, self.theme.search_alpha),
                     clip,
                 );
             }
@@ -3038,7 +3024,7 @@ impl App {
                                 (scaled(ch.rect.x1) - scaled(ch.rect.x0)).max(1),
                                 (scaled(ch.rect.y1) - scaled(ch.rect.y0)).max(1),
                             ),
-                            rgb(0x0050_78d2, 0.38),
+                            rgb(self.theme.selection_highlight, self.theme.selection_alpha),
                             clip,
                         );
                     }
@@ -3064,7 +3050,7 @@ impl App {
         if self.outline_open && !self.outline.is_empty() {
             let panel_w = (self.outline_width() as i32).min(vw);
             let panel_clip = Rect::new(0, 0, panel_w, vh);
-            list.solid(panel_clip, rgb(OUTLINE_PANEL_BG, 1.0), full);
+            list.solid(panel_clip, rgb(self.theme.outline.panel, 1.0), full);
 
             if let Some(panel) = self.outline_bitmap.as_ref() {
                 let row_height = OUTLINE_ROW_HEIGHT as i32;
@@ -3080,7 +3066,7 @@ impl App {
             if panel_w > 0 {
                 list.solid(
                     Rect::new(panel_w - 1, 0, 1, vh),
-                    rgb(0x003c_3c3c, 1.0),
+                    rgb(self.theme.outline_border, 1.0),
                     full,
                 );
             }
@@ -3132,7 +3118,7 @@ impl App {
         }
 
         window.pre_present_notify();
-        match gpu.render(rgb(BACKGROUND, 1.0), &list) {
+        match gpu.render(rgb(self.theme.window, 1.0), &list) {
             Ok(true) => self.show_window(),
             Ok(false) => {
                 // A hidden window can miss a frame on some compositors. Ask
@@ -3212,6 +3198,7 @@ impl ApplicationHandler<UserEvent> for App {
             css: self.css.clone(),
             pretty: self.pretty_text,
             page: self.resume_page,
+            background: self.theme.window,
         });
         self.worker = Some(worker);
 
@@ -3564,6 +3551,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     mupdf::set_font_loader(EpubFontLoader::new(fonts.clone()));
     let keymap = Keymap::new(&config.keys);
     let css = config.reflowable_css();
+    let theme = Theme::from_css(css.as_deref());
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -3573,6 +3561,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         fonts,
         keymap,
         css,
+        theme,
         config.reflowable.pretty,
         Duration::from_millis(config.animation.page_turn_ms),
         Duration::from_millis(config.animation.window_fit_ms),

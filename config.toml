@@ -21,7 +21,32 @@ window_fit_ms = 120
 # and other UI text. Missing glyphs (CJK, emoji, symbols) share the same
 # fallback chain, so there is no separate [fonts] section.
 #
+# The same CSS drives every non-reading color: the outline, command panel,
+# prompts, loading card, borders, and selection highlights. The effective
+# background/background-color and color on body, html, or :root set the base
+# surface and text, and all panel shades are derived from them. Optional
+# custom properties override individual parts:
+#
+#   --mureader-background     window behind the page
+#   --mureader-surface        outline, command panel, and prompt surface
+#   --mureader-text           primary UI text
+#   --mureader-muted          secondary UI text
+#   --mureader-accent         selection rails and accent text
+#   --mureader-border         panel borders
+#   --mureader-search         search-highlight color
+#   --mureader-selection      text-selection color
+#   --mureader-selected-text  selected outline/menu text
+#
+# Without CSS colors the built-in dark palette is used, so CSS that only sets
+# a font changes nothing else.
+#
 # css = """
+# :root {
+#     --mureader-background: #1b1b1b;
+#     --mureader-surface: #242424;
+#     --mureader-text: #e8e2d8;
+#     --mureader-accent: #d7a45e;
+# }
 # body {
 #     font-family: "Noto Serif", "Droid Sans Fallback Full", sans-serif;
 # }

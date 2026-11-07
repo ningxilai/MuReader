@@ -18,6 +18,7 @@ use crate::document::{
     ZOOM_OUT_FACTOR,
 };
 use crate::fonts::FontCatalog;
+use crate::theme::OutlineStyle;
 use crate::UserEvent;
 
 pub enum Command {
@@ -29,6 +30,7 @@ pub enum Command {
         css: Option<String>,
         pretty: bool,
         page: Option<usize>,
+        background: u32,
     },
     NextPage,
     PrevPage,
@@ -53,6 +55,7 @@ pub enum Command {
         selected: Option<usize>,
         veil: Option<u32>,
         rail: Option<u32>,
+        style: OutlineStyle,
     },
     Quit,
 }
@@ -136,6 +139,7 @@ fn run(
                 css,
                 pretty,
                 page,
+                background,
             } => {
                 let mut opened = match RenderEngine::open(&path, fonts, css, pretty) {
                     Ok(engine) => engine,
@@ -144,6 +148,7 @@ fn run(
                         break;
                     }
                 };
+                opened.set_background(background);
                 opened.set_viewport(viewport.0, viewport.1);
                 if let Some(page) = page {
                     opened.goto_page(page);
@@ -279,11 +284,12 @@ fn run(
                 selected,
                 veil,
                 rail,
+                style,
             } => {
                 if let Some(engine) = engine.as_mut() {
-                    match engine
-                        .render_outline(width, row_height, start, count, selected, veil, rail)
-                    {
+                    match engine.render_outline(
+                        width, row_height, start, count, selected, veil, rail, style,
+                    ) {
                         Ok(Some(bitmap)) => {
                             let _ = proxy.send_event(UserEvent::Worker(Event::OutlineBitmap {
                                 start,

@@ -140,6 +140,32 @@ declared there is also used by the outline, command menu, and other UI text;
 CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
 line-breaking pass for TXT and text files.
 
+The same CSS supplies one theme for every non-reading surface: the outline,
+command panel, prompts, loading card, borders, and search/selection highlights.
+The effective `background`/`background-color` and `color` on `body`, `html`, or
+`:root` set the base surface and text, and panel shades, muted labels, chips,
+and separators are derived from them. Optional `--mureader-*` custom
+properties override individual parts:
+
+```css
+:root {
+    --mureader-background: #1b1b1b;
+    --mureader-surface: #242424;
+    --mureader-text: #e8e2d8;
+    --mureader-muted: #b8b0a4;
+    --mureader-accent: #d7a45e;
+    --mureader-border: #3d3f45;
+    --mureader-search: #ffe61e;
+    --mureader-selection: #5078d2;
+    --mureader-selected-text: #ffffff;
+}
+```
+
+If the CSS contains no colors, the built-in dark palette is used, so a CSS file
+that only sets `font-family` changes nothing else. A light background
+automatically derives dark text and a darker selected-text color, keeping
+outline and menu selections readable without adding a hue.
+
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
 Press `:` for the command panel. Each action is shown next to its effective
@@ -168,6 +194,10 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- The outline, command panel, prompts, loading card, and search/selection
+  highlights now share one CSS-derived theme. `body`/`html`/`:root` background
+  and color supply the base, with `--mureader-*` custom properties for
+  per-surface overrides; the built-in dark palette remains the fallback.
 - Unified internal and external link handling: internal links and committed
   outline entries share one navigation path with Back/Forward history, and
   external links open in the desktop handler.

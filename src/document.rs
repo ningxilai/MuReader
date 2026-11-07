@@ -23,6 +23,7 @@ use mupdf::{
 
 use crate::fonts::FontCatalog;
 use crate::outline_text::{TextEngine, TextTarget};
+use crate::theme::{rgb8, OutlineStyle, DEFAULT_WINDOW};
 
 /// No letterboxing around page content. The initial view fits the whole page
 /// into the viewport, which is normally height-constrained but switches to
@@ -60,10 +61,6 @@ pub fn spread_gap(page_width: u32) -> u32 {
     ((page_width as f32 * SPREAD_GAP_RATIO).floor() as u32).max(1)
 }
 
-/// Background of the outline panel. The selected row is tinted towards the
-/// page background while its text is drawn on top, so the text never sits
-/// under the selection wash.
-pub const OUTLINE_PANEL_BG: u32 = 0x0020_2020;
 /// Left padding for outline titles. It also keeps the selection rail clear of
 /// the first glyph.
 const OUTLINE_TEXT_PADDING: usize = 12;
@@ -306,6 +303,8 @@ pub struct RenderEngine {
     pretty_text: bool,
     /// Base text size in points for reflowable documents.
     font_size: f32,
+    /// Window color behind a spread gutter. The UI supplies the CSS theme.
+    background: u32,
     /// Recently rendered pages for the spread strip. Consecutive page turns
     /// overlap three of the four pages, so reusing them avoids rasterizing
     /// the whole strip on every turn. Each entry records the scale it was
@@ -387,6 +386,7 @@ impl RenderEngine {
             source_path: path.to_path_buf(),
             pretty_text,
             font_size: LAYOUT_EM,
+            background: DEFAULT_WINDOW,
             page_cache: Vec::new(),
             #[cfg(test)]
             page_renders: 0,
@@ -631,6 +631,11 @@ impl RenderEngine {
         })
     }
 
+    /// Set the window color used behind the spread gutter.
+    pub fn set_background(&mut self, background: u32) {
+        self.background = background;
+    }
+
     pub fn clear_search(&mut self) {
         self.search_query = None;
     }
@@ -653,6 +658,7 @@ impl RenderEngine {
         selected: Option<usize>,
         veil: Option<u32>,
         rail: Option<u32>,
+        style: OutlineStyle,
     ) -> Result<Option<PageBitmap>, String> {
         if self.outline.is_empty() {
             return Ok(None);
@@ -668,7 +674,7 @@ impl RenderEngine {
             return Ok(None);
         }
         let height = row_height * count as u32;
-        let mut pixels = vec![OUTLINE_PANEL_BG; width as usize * height as usize];
+        let mut pixels = vec![style.panel; width as usize * height as usize];
 
         if self.outline_text.is_none() {
             self.outline_text = Some(TextEngine::new(self.fonts.clone())?);
@@ -711,14 +717,14 @@ impl RenderEngine {
                     );
                 }
             }
-            let (r, g, b) = if highlighted {
+            let (r, g, b) = rgb8(if highlighted {
                 // Selection is brightness, not a hue change.
-                (0xff, 0xff, 0xff)
+                style.selected_text
             } else if entry.depth == 0 {
-                (0xe6, 0xe6, 0xe6)
+                style.text
             } else {
-                (0xb8, 0xb8, 0xb8)
-            };
+                style.muted
+            });
             let title = truncate_outline_title(&entry.title, width, indent + OUTLINE_TEXT_PADDING);
             let row_top = row_top as i32;
             let mut target = TextTarget::new(&mut pixels, width, height, row_top, row_height);
@@ -1112,7 +1118,7 @@ impl RenderEngine {
         } else {
             0
         };
-        let bitmap = compose_pages(&rendered, gap);
+        let bitmap = compose_pages(&rendered, gap, self.background);
 
         Ok(RenderedPage {
             bitmap: bitmap.bitmap,
@@ -1191,7 +1197,7 @@ fn fill_bitmap_rect(
     }
 }
 
-fn compose_pages(pages: &[&PageRender], gap: u32) -> PageRender {
+fn compose_pages(pages: &[&PageRender], gap: u32, background: u32) -> PageRender {
     let width = pages
         .iter()
         .map(|page| page.bitmap.width)
@@ -1202,7 +1208,7 @@ fn compose_pages(pages: &[&PageRender], gap: u32) -> PageRender {
         .map(|page| page.bitmap.height)
         .max()
         .unwrap_or(0);
-    let mut pixels = vec![0x00181818u32; width as usize * height as usize];
+    let mut pixels = vec![background; width as usize * height as usize];
 
     let mut highlights = Vec::new();
     let mut links = Vec::new();
@@ -1822,12 +1828,13 @@ mod tests {
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         let veil = 0x0040_4448;
         let rail = 0x0012_3456;
+        let style = OutlineStyle::default();
         let plain = engine
-            .render_outline(320, 28, 0, 4, None, None, None)
+            .render_outline(320, 28, 0, 4, None, None, None, style)
             .unwrap()
             .unwrap();
         let selected = engine
-            .render_outline(320, 28, 0, 4, Some(0), Some(veil), Some(rail))
+            .render_outline(320, 28, 0, 4, Some(0), Some(veil), Some(rail), style)
             .unwrap()
             .unwrap();
 
@@ -1840,10 +1847,7 @@ mod tests {
         let last = row_height * width - 1;
 
         // Selection bakes a faint row veil into the bitmap.
-        assert_eq!(
-            row_block(&plain, 0, width, row_height)[last],
-            OUTLINE_PANEL_BG
-        );
+        assert_eq!(row_block(&plain, 0, width, row_height)[last], style.panel);
         let selected_row = row_block(&selected, 0, width, row_height);
         assert_eq!(selected_row[last], veil);
         // The rail stays in the left padding, clear of the title glyphs.
@@ -2010,6 +2014,15 @@ mod tests {
             spread.text.chars.iter().any(|ch| ch.rect.x0 > single_width),
             "second-page text was not shifted into composite coordinates"
         );
+
+        // The gutter follows the UI theme's window color instead of a
+        // document-owned constant.
+        let gap_pixel = spread.page_widths[0] as usize;
+        assert_eq!(spread.bitmap.pixels[gap_pixel], DEFAULT_WINDOW);
+        engine.set_background(0x0012_3456);
+        let themed = engine.render().unwrap();
+        assert_eq!(themed.bitmap.pixels[gap_pixel], 0x0012_3456);
+        engine.set_background(DEFAULT_WINDOW);
 
         // A narrower viewport still keeps both pages: each half is fitted so
         // the pair shrinks instead of one page being clipped.
