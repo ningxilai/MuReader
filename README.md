@@ -49,6 +49,8 @@ wgpu.
 Navigation uses the table of contents MuPDF provides for PDF, EPUB, HTML,
 FB2, and other structured documents. Documents without a table of contents,
 including styleless plain-text sources, use a page-number outline.
+The outline panel takes a bounded share of the window (about 15%, clamped to
+232–360 px) so it stays usable on narrow and wide windows alike.
 Moving in the outline previews the highlighted page; Enter keeps it, and
 Escape restores the page that was visible before the outline opened.
 
@@ -181,12 +183,18 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   `Esc` cancels the pending sequence.
 - The window now appears after its first frame and shows a loading panel, so
   startup no longer flashes an uninitialized black surface.
-- Outline selection highlights the entry's text and keeps a faint row wash
-  with a left rail that follows the page background (white by default, or the
-  effective CSS color for reflowable documents); previews are debounced and
-  skipped at large explicit zoom levels to avoid render stalls.
-- Two-page reading uses a thin central gutter and stays in spread mode when
-  the outline opens, re-fitting both pages instead of collapsing to one.
+- The `:` panel is a compact shortcut palette: key chips, an accent rail on
+  the selected action, a scroll indicator, and a two-column grid while a
+  multi-key prefix is pending.
+- Outline selection brightens the selected title to white and bakes a faint
+  page-tinted veil plus a left rail into the panel bitmap; the text padding
+  keeps the rail clear of the glyphs, and the tint follows the page background
+  for CSS-styled documents. Previews stay debounced and are skipped for
+  oversized zoomed pages.
+- Two-page reading keeps a proportional central gutter that never collapses,
+  and falls back to a single page once each spread page would be too narrow.
+  The outline overlays the page at full-window layout scale, so opening or
+  closing it no longer triggers a page re-render or layout hitch.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard
   module and reduced it to the copy path.

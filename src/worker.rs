@@ -51,6 +51,8 @@ pub enum Command {
         start: usize,
         count: usize,
         selected: Option<usize>,
+        veil: Option<u32>,
+        rail: Option<u32>,
     },
     Quit,
 }
@@ -275,9 +277,13 @@ fn run(
                 start,
                 count,
                 selected,
+                veil,
+                rail,
             } => {
                 if let Some(engine) = engine.as_mut() {
-                    match engine.render_outline(width, row_height, start, count, selected) {
+                    match engine
+                        .render_outline(width, row_height, start, count, selected, veil, rail)
+                    {
                         Ok(Some(bitmap)) => {
                             let _ = proxy.send_event(UserEvent::Worker(Event::OutlineBitmap {
                                 start,

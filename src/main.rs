@@ -40,7 +40,7 @@ use config::Config;
 use document::{
     Fit, HighlightRect, LinkTarget, OutlineEntry, PageBitmap, RenderedLink, RenderedPage,
     SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE, MIN_SCALE,
-    ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
+    OUTLINE_PANEL_BG, SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
@@ -61,18 +61,31 @@ use worker::{Command, Event as WorkerEvent, WorkerHandle};
 
 const BACKGROUND: u32 = 0x00181818;
 const TITLE: &str = "MuReader";
-const OUTLINE_WIDTH: u32 = 320;
+/// The outline takes a bounded share of the window instead of a fixed column.
+const OUTLINE_MIN_WIDTH: u32 = 232;
+const OUTLINE_MAX_WIDTH: u32 = 360;
+const OUTLINE_MIN_CONTENT: u32 = 240;
 const OUTLINE_ROW_HEIGHT: u32 = 28;
+/// Below this fraction of a height-fitted single page, a spread page is too
+/// narrow to read and the reader falls back to one page.
+const MIN_SPREAD_PAGE_FRACTION: f32 = 0.7;
 /// Rows requested at once when the outline needs a new bitmap window. A tall
 /// window also gets enough margin to cover the viewport in a single request.
 const OUTLINE_WINDOW_MIN_ROWS: usize = 256;
-const MENU_HEADER_HEIGHT: u32 = 36;
-const MENU_ROW_HEIGHT: u32 = 30;
-const MENU_FOOTER_HEIGHT: u32 = 34;
+const MENU_HEADER_HEIGHT: u32 = 40;
+const MENU_ROW_HEIGHT: u32 = 32;
+const MENU_FOOTER_HEIGHT: u32 = 36;
 const MENU_MAX_ROWS: usize = 10;
 const MENU_PADDING: u32 = 16;
 /// Room for a modifier combination such as `C-=` or `M-w`.
-const MENU_KEY_COLUMN: u32 = 76;
+const MENU_KEY_COLUMN: u32 = 72;
+const MENU_BG: u32 = 0x001b_1c1e;
+const MENU_HEADER_BG: u32 = 0x0020_2124;
+const MENU_FOOTER_BG: u32 = 0x0019_1a1c;
+const MENU_ROW_SELECTED: u32 = 0x0026_2b31;
+const MENU_CHIP_BG: u32 = 0x002a_2b2f;
+const MENU_CHIP_BORDER: u32 = 0x0037_383e;
+const MENU_SEPARATOR: u32 = 0x0028_2a2d;
 /// Wait for the outline selection to settle before previewing it. Without this
 /// debounce, holding an arrow key queues one full page render per row.
 const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
@@ -273,6 +286,56 @@ fn truncate_display(text: &str, max_units: usize) -> String {
     out
 }
 
+/// Blend two `0x00RRGGBB` colors. Used for hover washes and muted accents
+/// that must sit on the panel surface without introducing a new hue.
+fn blend_rgb(base: u32, overlay: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |shift: u32| {
+        let from = ((base >> shift) & 0xff) as f32;
+        let to = ((overlay >> shift) & 0xff) as f32;
+        (from + (to - from) * t).round() as u32
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_ui_rect(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: u32,
+) {
+    let x0 = x.max(0).min(width as i32) as u32;
+    let y0 = y.max(0).min(height as i32) as u32;
+    let x1 = x.saturating_add(w).clamp(0, width as i32) as u32;
+    let y1 = y.saturating_add(h).clamp(0, height as i32) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    for row in y0..y1 {
+        let start = row as usize * width as usize + x0 as usize;
+        pixels[start..start + (x1 - x0) as usize].fill(color);
+    }
+}
+
+/// The pending shortcut view is a which-key grid: candidates are short, so a
+/// second column makes the panel wider rather than taller.
+fn menu_pending_columns(viewport_w: u32, count: usize) -> usize {
+    if count > 8 && viewport_w >= 720 {
+        2
+    } else {
+        1
+    }
+}
+
+fn menu_row_count(count: usize, columns: usize) -> usize {
+    count.div_ceil(columns.max(1)).max(1)
+}
+
 /// How many command rows fit in the panel without hiding it under the window
 /// edge. The panel still scrolls when the window is short.
 fn menu_visible_rows(viewport_h: u32, count: usize) -> usize {
@@ -285,11 +348,20 @@ struct CommandMenu {
     selected: usize,
     scroll: usize,
     rows: usize,
+    columns: usize,
     /// Last action, echoed in the panel footer and the window title.
     echo: Option<String>,
     dirty: bool,
     bitmap: Option<PageBitmap>,
     revision: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OutlineRequest {
+    width: u32,
+    start: usize,
+    selected: usize,
+    background: u32,
 }
 
 struct PanelBitmap {
@@ -389,11 +461,13 @@ struct App {
     outline_selected: usize,
     outline_bitmap: Option<PageBitmap>,
     outline_bitmap_start: usize,
-    /// Selection baked into the current outline bitmap.
+    /// Width and page background baked into the current outline bitmap.
+    outline_bitmap_width: u32,
     outline_bitmap_selected: Option<usize>,
+    outline_bitmap_background: u32,
     outline_revision: u64,
-    /// The (start, selected) pair of the in-flight outline bitmap request.
-    outline_requested: Option<(usize, usize)>,
+    /// The exact outline bitmap request currently in flight.
+    outline_requested: Option<OutlineRequest>,
     outline_scroll: f32,
     /// Pending, debounced preview of the outline selection.
     outline_preview: Option<PendingOutlinePreview>,
@@ -499,7 +573,9 @@ impl App {
             outline_selected: 0,
             outline_bitmap: None,
             outline_bitmap_start: 0,
+            outline_bitmap_width: 0,
             outline_bitmap_selected: None,
+            outline_bitmap_background: 0x00ff_ffff,
             outline_revision: 0,
             outline_requested: None,
             outline_scroll: 0.0,
@@ -575,29 +651,61 @@ impl App {
 
     fn min_scroll_y(&self) -> f32 {
         let (_, viewport_h) = self.viewport();
-        let page_h = self.bitmap.as_ref().map(|b| b.height as f32).unwrap_or(0.0);
-        ((page_h + MARGIN as f32 * 2.0 - viewport_h as f32) / 2.0).min(0.0)
+        let scale = self.display_scale();
+        let page_h = self.bitmap.as_ref().map(|b| b.height as f32).unwrap_or(0.0) * scale;
+        ((page_h + MARGIN as f32 * 2.0 - viewport_h as f32) / 2.0 / scale).min(0.0)
     }
 
     fn max_scroll_y(&self) -> f32 {
         let (_, viewport_h) = self.viewport();
-        let page_h = self.bitmap.as_ref().map(|b| b.height as f32).unwrap_or(0.0);
-        (page_h + MARGIN as f32 * 2.0 - viewport_h as f32).max(0.0)
+        let scale = self.display_scale();
+        let page_h = self.bitmap.as_ref().map(|b| b.height as f32).unwrap_or(0.0) * scale;
+        (page_h + MARGIN as f32 * 2.0 - viewport_h as f32).max(0.0) / scale
     }
 
     fn page_fits_height(&self) -> bool {
         let (_, viewport_h) = self.viewport();
-        self.bitmap
-            .as_ref()
-            .is_some_and(|page| page.height <= viewport_h.saturating_add(1))
+        let scale = self.display_scale();
+        self.bitmap.as_ref().is_some_and(|page| {
+            (page.height as f32 * scale).round() as u32 <= viewport_h.saturating_add(1)
+        })
     }
 
     fn content_left(&self) -> i32 {
         if self.outline_open {
-            (OUTLINE_WIDTH as i32).min(self.viewport().0 as i32)
+            (self.outline_width() as i32).min(self.viewport().0 as i32)
         } else {
             0
         }
+    }
+
+    /// The outline widens with the window, but never enough to crowd out the
+    /// page. This makes opening it on a small window much gentler than the old
+    /// fixed 320px column.
+    fn outline_width(&self) -> u32 {
+        let (viewport_w, _) = self.viewport();
+        let preferred = (viewport_w as f32 * 0.15).round() as u32;
+        let max_by_content = viewport_w.saturating_sub(OUTLINE_MIN_CONTENT).max(160);
+        preferred
+            .clamp(OUTLINE_MIN_WIDTH, OUTLINE_MAX_WIDTH)
+            .min(max_by_content)
+    }
+
+    /// Scale applied to the already-rendered page when the outline covers part
+    /// of the window. Rendering stays at the full-window size, so opening and
+    /// closing the outline only changes this scale instead of waiting for a
+    /// worker re-render.
+    fn display_scale(&self) -> f32 {
+        if !self.outline_open || self.page_fit != Fit::Page {
+            return 1.0;
+        }
+        let natural = self.visible_width() as f32;
+        if natural <= 1.0 {
+            return 1.0;
+        }
+        let (viewport_w, _) = self.viewport();
+        let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
+        (content_w / natural).clamp(0.1, 1.0)
     }
 
     fn visible_page_count(&self) -> usize {
@@ -641,33 +749,37 @@ impl App {
     fn max_scroll_x(&self) -> f32 {
         let (viewport_w, _) = self.viewport();
         let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
-        let page_w = self.visible_width() as f32;
-        ((page_w - content_w) / 2.0).max(0.0)
+        let scale = self.display_scale();
+        let page_w = self.visible_width() as f32 * scale;
+        ((page_w - content_w) / 2.0 / scale).max(0.0)
     }
 
     fn maybe_enable_spread(&mut self) {
         if self.spread_active || self.spread_blocked || self.pages.len() >= 2 {
             return;
         }
-        // Do not start a spread in the narrower content area. An already
-        // active pair is kept by update_spread_layout; this path only decides
-        // whether to begin one after the outline is closed.
+        // Do not start a spread while the outline is open: the overlay makes
+        // the visible content narrower, and a pair that looked comfortable in
+        // the full window can become cramped. An already active pair is kept
+        // and display-scaled instead, so opening the outline never collapses it.
         if self.outline_open {
             return;
         }
         if self.page_count.unwrap_or(0) < 2 {
             return;
         }
-        let Some(page) = self.bitmap.as_ref() else {
-            return;
-        };
         if self.page_fit != Fit::Page {
             return;
         }
-        // Two gap-free page widths must fit. The gap is purely visual, and
-        // the outline case is handled above by keeping an existing spread.
-        let required = page.width.saturating_mul(2);
-        if self.viewport().0 < required {
+        // A spread may shrink both pages to fit, so do not require two
+        // height-fitted pages to fit at full size. Instead, reject the spread
+        // when the resulting page would be too narrow to read. This is the
+        // same threshold that disables an already active spread.
+        let Some(single) = self.single_page_width() else {
+            return;
+        };
+        let prospective = self.viewport().0 as f32 / (2.0 + SPREAD_GAP_RATIO);
+        if prospective < single * MIN_SPREAD_PAGE_FRACTION {
             return;
         }
 
@@ -692,19 +804,20 @@ impl App {
             if self.bitmap.is_none() {
                 return;
             }
-            // Opening the outline narrows the worker viewport, but the pair
-            // should stay open: the renderer re-fits both pages to the new
-            // width instead of dropping to a single page. The page widths are
-            // still from the wider layout at this point, so a width check
-            // here would disable the spread before the re-render arrives.
-            if self.outline_open {
-                return;
-            }
-            // The visual gap is not part of the fit decision. Using the same
-            // gap-free width as maybe_enable_spread also prevents a narrow
-            // window from repeatedly enabling and disabling the spread.
-            let required = self.spread_pages_width();
-            if self.viewport().0 < required {
+            // Tiling another window can squeeze the pair below a comfortable
+            // reading width. Compare each spread page with the width a
+            // height-fitted single page would have, and return to one page
+            // instead of shrinking indefinitely. Opening the outline no longer
+            // triggers this path because the worker viewport is unchanged.
+            let page_width = self
+                .page_widths
+                .get(self.window_index)
+                .copied()
+                .unwrap_or(0) as f32;
+            let single_width = self.single_page_width();
+            let too_narrow =
+                single_width.is_some_and(|single| page_width < single * MIN_SPREAD_PAGE_FRACTION);
+            if too_narrow {
                 self.spread_active = false;
                 self.spread_blocked = true;
                 self.send(Command::SetSpread(false));
@@ -714,17 +827,29 @@ impl App {
         }
     }
 
+    /// Width of a height-fitted single page at the current window size. The
+    /// current page's aspect ratio is preserved, including rotation.
+    fn single_page_width(&self) -> Option<f32> {
+        let page = self.bitmap.as_ref()?;
+        let page_width = *self.page_widths.get(self.window_index)? as f32;
+        let page_height = page.height as f32;
+        if page_width <= 0.0 || page_height <= 0.0 {
+            return None;
+        }
+        let (viewport_w, viewport_h) = self.viewport();
+        let aspect = page_width / page_height;
+        Some((viewport_h as f32 * aspect).min(viewport_w as f32))
+    }
+
     fn send_viewport(&mut self) {
         self.pending_viewport = None;
         let (width, height) = self.viewport();
         if width == 0 || height == 0 {
             return;
         }
-        let width = if self.outline_open {
-            width.saturating_sub(OUTLINE_WIDTH).max(1)
-        } else {
-            width
-        };
+        // The worker always lays out for the full window. The outline is a
+        // display overlay, so opening it never triggers a page re-render and
+        // its width change cannot cause a delayed layout hitch.
         let target = (width, height);
         let unchanged = self.last_viewport_sent == Some(target);
         self.last_viewport_sent = Some(target);
@@ -756,13 +881,13 @@ impl App {
     }
 
     fn scroll_vertical(&mut self, delta: f32) {
-        self.scroll_y += delta;
+        self.scroll_y += delta / self.display_scale();
         self.clamp_scroll();
         self.request_redraw();
     }
 
     fn scroll_horizontal(&mut self, delta: f32) {
-        self.scroll_x += delta;
+        self.scroll_x += delta / self.display_scale();
         self.clamp_scroll();
         self.request_redraw();
     }
@@ -819,16 +944,28 @@ impl App {
         let start = start.min(self.outline.len() - 1);
         let count = count.clamp(1, self.outline.len() - start);
         let selected = self.outline_selected.min(self.outline.len() - 1);
-        if self.outline_requested == Some((start, selected)) {
+        let request = OutlineRequest {
+            width: self.outline_width(),
+            start,
+            selected,
+            background: self.page_background,
+        };
+        if self.outline_requested == Some(request) {
             return;
         }
-        self.outline_requested = Some((start, selected));
+        self.outline_requested = Some(request);
         self.send(Command::RenderOutline {
-            width: OUTLINE_WIDTH,
+            width: request.width,
             row_height: OUTLINE_ROW_HEIGHT,
             start,
             count,
             selected: Some(selected),
+            veil: Some(blend_rgb(
+                OUTLINE_PANEL_BG,
+                request.background,
+                OUTLINE_TINT_ALPHA,
+            )),
+            rail: Some(request.background),
         });
     }
 
@@ -850,11 +987,14 @@ impl App {
             self.outline_bitmap_start,
             current_rows,
         );
+        let stale = (self.outline_bitmap.is_some()
+            && self.outline_bitmap_width != self.outline_width())
+            || self.outline_bitmap_background != self.page_background;
         let (start, count) = match window {
             Some(window) => window,
-            // The visible window is already cached, but the selection changed:
-            // re-render the same rows so the warm selection moves with it.
-            None if self.outline_bitmap_selected != Some(self.outline_selected) => {
+            // The visible window is already cached, but the selection, panel
+            // width, or page background changed: re-render the same rows.
+            None if stale || self.outline_bitmap_selected != Some(self.outline_selected) => {
                 let start = self.outline_bitmap_start.min(self.outline.len() - 1);
                 (start, current_rows.max(1))
             }
@@ -1207,14 +1347,17 @@ impl App {
         if width == 0 || page.height == 0 {
             return None;
         }
+        let scale = self.display_scale();
+        let display_w = width as f32 * scale;
+        let display_h = page.height as f32 * scale;
         // The screen coordinate must be relative to the visible window, not
         // the whole rendered strip. `page_origin()` points at the strip start
         // and therefore still includes `spread_offset`.
-        let window_left = self.page_left_offset(width) as f32 - self.scroll_x;
-        let window_top = self.page_vertical_offset(page.height) as f32 - self.scroll_y;
+        let window_left = self.page_left_offset(width) as f32 - self.scroll_x * scale;
+        let window_top = self.page_vertical_offset(page.height) as f32 - self.scroll_y * scale;
         Some((
-            (screen.0 - window_left) / width as f32,
-            (screen.1 - window_top) / page.height as f32,
+            (screen.0 - window_left) / display_w,
+            (screen.1 - window_top) / display_h,
         ))
     }
 
@@ -1224,15 +1367,14 @@ impl App {
         let Some(page) = self.bitmap.as_ref() else {
             return;
         };
-        let (scroll_x, scroll_y) = scroll_for_page_point_at_screen(
-            self.viewport(),
-            self.content_left(),
-            (self.visible_width(), page.height),
-            point,
-            screen,
-        );
-        self.scroll_x = scroll_x;
-        self.scroll_y = scroll_y;
+        let scale = self.display_scale();
+        let width = self.visible_width();
+        let display_w = width as f32 * scale;
+        let display_h = page.height as f32 * scale;
+        let left = self.page_left_offset(width) as f32;
+        let top = self.page_vertical_offset(page.height) as f32;
+        self.scroll_x = (left + point.0 * display_w - screen.0) / scale;
+        self.scroll_y = (top + point.1 * display_h - screen.1) / scale;
         self.clamp_scroll();
     }
 
@@ -1535,6 +1677,7 @@ impl App {
             selected: 0,
             scroll: 0,
             rows: MENU_MAX_ROWS.min(self.menu_entries.len()),
+            columns: 1,
             echo: None,
             dirty: true,
             bitmap: None,
@@ -1572,11 +1715,12 @@ impl App {
     }
 
     fn scroll_menu_candidates(&mut self, delta: isize) {
-        let count = self.menu_keys.candidates().len();
+        let candidates = self.menu_keys.candidates().len();
         let Some(menu) = self.command_menu.as_mut() else {
             return;
         };
-        let max_scroll = count.saturating_sub(menu.rows.max(1)) as isize;
+        let total_rows = menu_row_count(candidates, menu.columns.max(1));
+        let max_scroll = total_rows.saturating_sub(menu.rows.max(1)) as isize;
         menu.scroll = (menu.scroll as isize + delta).clamp(0, max_scroll) as usize;
         menu.dirty = true;
         self.request_redraw();
@@ -1800,56 +1944,111 @@ impl App {
         };
 
         let count = view.len();
-        let rows = menu_visible_rows(viewport.1, count);
+        let columns = if pending.is_some() {
+            menu_pending_columns(viewport.0, count)
+        } else {
+            1
+        };
+        let total_rows = menu_row_count(count, columns);
+        let rows = menu_visible_rows(viewport.1, total_rows);
         let selected = if pending.is_some() {
             0
         } else {
             menu.selected.min(self.menu_entries.len().saturating_sub(1))
         };
         let echo = menu.echo.clone();
+        let max_scroll = total_rows.saturating_sub(rows);
         let scroll = if pending.is_some() {
-            menu.scroll.min(count.saturating_sub(rows))
+            menu.scroll.min(max_scroll)
         } else {
-            let mut scroll = menu.scroll.min(count.saturating_sub(rows));
+            let mut scroll = menu.scroll.min(max_scroll);
             if selected < scroll {
                 scroll = selected;
             } else if selected >= scroll + rows {
                 scroll = selected + 1 - rows;
             }
-            scroll.min(count.saturating_sub(rows))
+            scroll.min(max_scroll)
         };
+        // A pending grid needs room for two key chips plus their labels.
+        let max_width = if columns == 2 { 760 } else { 560 };
         let width = viewport
             .0
-            .saturating_sub(80)
-            .clamp(320, 560)
+            .saturating_sub(72)
+            .clamp(340, max_width)
             .min(viewport.0.max(1));
-        let height = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT + MENU_FOOTER_HEIGHT + 8;
-        let mut pixels = vec![0x001c1c1c; width as usize * height as usize];
+        let height = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT + MENU_FOOTER_HEIGHT;
+        let mut pixels = vec![MENU_BG; width as usize * height as usize];
 
-        for y in 0..MENU_HEADER_HEIGHT.min(height) {
-            let row = y as usize * width as usize;
-            pixels[row..row + width as usize].fill(0x00242424);
-        }
+        fill_ui_rect(
+            &mut pixels,
+            width,
+            height,
+            0,
+            0,
+            width as i32,
+            MENU_HEADER_HEIGHT as i32,
+            MENU_HEADER_BG,
+        );
         let footer_top = MENU_HEADER_HEIGHT + rows as u32 * MENU_ROW_HEIGHT;
-        for y in footer_top..(footer_top + MENU_FOOTER_HEIGHT).min(height) {
-            let row = y as usize * width as usize;
-            pixels[row..row + width as usize].fill(0x00222222);
-        }
+        fill_ui_rect(
+            &mut pixels,
+            width,
+            height,
+            0,
+            footer_top as i32,
+            width as i32,
+            MENU_FOOTER_HEIGHT as i32,
+            MENU_FOOTER_BG,
+        );
+        fill_ui_rect(
+            &mut pixels,
+            width,
+            height,
+            0,
+            MENU_HEADER_HEIGHT as i32 - 1,
+            width as i32,
+            1,
+            MENU_SEPARATOR,
+        );
+        fill_ui_rect(
+            &mut pixels,
+            width,
+            height,
+            0,
+            footer_top as i32,
+            width as i32,
+            1,
+            MENU_SEPARATOR,
+        );
 
+        // Keep the selected row visibly raised, with a slim accent rail that
+        // stops short of the panel edge so it reads as a marker, not a border.
         if pending.is_none() {
             for row in 0..rows {
-                let index = scroll + row;
-                if index != selected {
+                if scroll + row != selected {
                     continue;
                 }
-                let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
-                for y in top..(top + MENU_ROW_HEIGHT).min(height) {
-                    let start = y as usize * width as usize;
-                    pixels[start..start + width as usize].fill(0x002a2e34);
-                    if width >= 4 {
-                        pixels[start + 1..start + 4].fill(SELECTION_ACCENT);
-                    }
-                }
+                let top = MENU_HEADER_HEIGHT as i32 + row as i32 * MENU_ROW_HEIGHT as i32;
+                fill_ui_rect(
+                    &mut pixels,
+                    width,
+                    height,
+                    8,
+                    top + 2,
+                    width as i32 - 16,
+                    MENU_ROW_HEIGHT as i32 - 4,
+                    MENU_ROW_SELECTED,
+                );
+                fill_ui_rect(
+                    &mut pixels,
+                    width,
+                    height,
+                    8,
+                    top + 2,
+                    3,
+                    MENU_ROW_HEIGHT as i32 - 4,
+                    SELECTION_ACCENT,
+                );
             }
         }
 
@@ -1857,86 +2056,238 @@ impl App {
             self.menu_text = TextEngine::new(self.fonts.clone()).ok();
         }
         if let Some(text) = self.menu_text.as_mut() {
-            let header = match pending.as_deref() {
-                Some(prefix) => format!("Commands  {prefix} …"),
-                None => format!("Commands  {}/{}   q/Esc closes", selected + 1, count.max(1)),
-            };
+            fill_ui_rect(
+                &mut pixels,
+                width,
+                height,
+                MENU_PADDING as i32,
+                ((MENU_HEADER_HEIGHT - 18) / 2) as i32,
+                3,
+                18,
+                SELECTION_ACCENT,
+            );
             let mut target = TextTarget::new(&mut pixels, width, height, 0, MENU_HEADER_HEIGHT);
             text.draw_line(
-                &header,
+                "Commands",
                 15.0,
-                Weight::NORMAL,
+                Weight::BOLD,
                 &mut target,
-                MENU_PADDING as i32,
+                MENU_PADDING as i32 + 12,
                 0,
                 MENU_HEADER_HEIGHT,
-                (230, 230, 230),
+                (236, 236, 240),
             );
 
+            // The right side of the header shows the pending prefix or the
+            // selected index, depending on the mode.
+            let hint = match pending.as_deref() {
+                Some(prefix) => format!("{prefix}…"),
+                None => format!("{} / {}", selected + 1, count.max(1)),
+            };
+            let hint_units = hint.chars().map(display_units).sum::<usize>().max(1) as i32;
+            let hint_x =
+                (width as i32 - MENU_PADDING as i32 - hint_units * 7).max(MENU_PADDING as i32);
+            let mut target = TextTarget::new(&mut pixels, width, height, 0, MENU_HEADER_HEIGHT);
+            text.draw_line(
+                &hint,
+                12.5,
+                Weight::NORMAL,
+                &mut target,
+                hint_x,
+                0,
+                MENU_HEADER_HEIGHT,
+                (142, 143, 148),
+            );
+
+            let cell_gap = 12i32;
+            let cell_w = (width as i32 - 2 * MENU_PADDING as i32 - (columns as i32 - 1) * cell_gap)
+                / columns as i32;
             for row in 0..rows {
-                let Some((key_label, label)) = view.get(scroll + row) else {
-                    continue;
-                };
-                let top = MENU_HEADER_HEIGHT + row as u32 * MENU_ROW_HEIGHT;
+                let top = MENU_HEADER_HEIGHT as i32 + row as i32 * MENU_ROW_HEIGHT as i32;
                 let selected_row = pending.is_none() && scroll + row == selected;
-                let key_color = if selected_row {
-                    (240, 200, 140)
-                } else {
-                    (150, 150, 150)
-                };
-                let mut target =
-                    TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
-                text.draw_line(
-                    key_label,
-                    14.0,
-                    Weight::BOLD,
-                    &mut target,
-                    MENU_PADDING as i32,
-                    top as i32,
-                    MENU_ROW_HEIGHT,
-                    key_color,
+                if !selected_row {
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        MENU_PADDING as i32,
+                        top + MENU_ROW_HEIGHT as i32 - 1,
+                        width as i32 - 2 * MENU_PADDING as i32,
+                        1,
+                        MENU_SEPARATOR,
+                    );
+                }
+                for col in 0..columns {
+                    // Fill the grid column by column so each column reads as a
+                    // contiguous slice of the action list, like which-key.
+                    let index = col * total_rows + scroll + row;
+                    let Some((key_label, label)) = view.get(index) else {
+                        continue;
+                    };
+                    let cell_x = MENU_PADDING as i32 + col as i32 * (cell_w + cell_gap);
+                    let chip_x = cell_x + 8;
+                    let chip_w = MENU_KEY_COLUMN as i32;
+                    let chip_h = 20;
+                    let chip_y = top + (MENU_ROW_HEIGHT as i32 - chip_h) / 2;
+                    let chip_fill = if selected_row {
+                        blend_rgb(MENU_CHIP_BG, SELECTION_ACCENT, 0.22)
+                    } else {
+                        MENU_CHIP_BG
+                    };
+                    let chip_border = if selected_row {
+                        blend_rgb(MENU_CHIP_BORDER, SELECTION_ACCENT, 0.65)
+                    } else {
+                        MENU_CHIP_BORDER
+                    };
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        chip_x,
+                        chip_y,
+                        chip_w,
+                        chip_h,
+                        chip_fill,
+                    );
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        chip_x,
+                        chip_y,
+                        chip_w,
+                        1,
+                        chip_border,
+                    );
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        chip_x,
+                        chip_y + chip_h - 1,
+                        chip_w,
+                        1,
+                        chip_border,
+                    );
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        chip_x,
+                        chip_y,
+                        1,
+                        chip_h,
+                        chip_border,
+                    );
+                    fill_ui_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        chip_x + chip_w - 1,
+                        chip_y,
+                        1,
+                        chip_h,
+                        chip_border,
+                    );
+
+                    let key_color = if selected_row {
+                        (244, 201, 146)
+                    } else {
+                        (176, 177, 184)
+                    };
+                    let mut target =
+                        TextTarget::new(&mut pixels, width, height, top, MENU_ROW_HEIGHT);
+                    text.draw_line(
+                        key_label,
+                        12.5,
+                        Weight::BOLD,
+                        &mut target,
+                        chip_x + 9,
+                        top,
+                        MENU_ROW_HEIGHT,
+                        key_color,
+                    );
+
+                    let label_x = chip_x + chip_w + 14;
+                    let label_right = cell_x + cell_w - 4;
+                    let max_units = ((label_right - label_x).max(24) / 7) as usize;
+                    let label = truncate_display(label, max_units.max(4));
+                    let (color, weight) = if selected_row {
+                        ((255, 255, 255), Weight::BOLD)
+                    } else {
+                        ((214, 214, 219), Weight::NORMAL)
+                    };
+                    let mut target =
+                        TextTarget::new(&mut pixels, width, height, top, MENU_ROW_HEIGHT);
+                    text.draw_line(
+                        &label,
+                        14.0,
+                        weight,
+                        &mut target,
+                        label_x,
+                        top,
+                        MENU_ROW_HEIGHT,
+                        color,
+                    );
+                }
+            }
+
+            if total_rows > rows {
+                let track_x = width as i32 - 7;
+                let track_y = MENU_HEADER_HEIGHT as i32 + 6;
+                let track_h = (rows as i32 * MENU_ROW_HEIGHT as i32 - 12).max(1);
+                fill_ui_rect(
+                    &mut pixels,
+                    width,
+                    height,
+                    track_x,
+                    track_y,
+                    3,
+                    track_h,
+                    blend_rgb(MENU_BG, MENU_SEPARATOR, 0.8),
                 );
-                let color = if selected_row {
-                    (255, 255, 255)
-                } else {
-                    (215, 215, 215)
-                };
-                let mut target =
-                    TextTarget::new(&mut pixels, width, height, top as i32, MENU_ROW_HEIGHT);
-                text.draw_line(
-                    label,
-                    14.0,
-                    Weight::NORMAL,
-                    &mut target,
-                    MENU_PADDING as i32 + MENU_KEY_COLUMN as i32,
-                    top as i32,
-                    MENU_ROW_HEIGHT,
-                    color,
+                let thumb_h = ((rows as f32 / total_rows as f32) * track_h as f32)
+                    .max(20.0)
+                    .min(track_h as f32) as i32;
+                let frac = scroll as f32 / total_rows.saturating_sub(rows).max(1) as f32;
+                let thumb_y = track_y + ((track_h - thumb_h) as f32 * frac) as i32;
+                fill_ui_rect(
+                    &mut pixels,
+                    width,
+                    height,
+                    track_x,
+                    thumb_y,
+                    3,
+                    thumb_h,
+                    blend_rgb(MENU_BG, SELECTION_ACCENT, 0.55),
                 );
             }
 
-            let footer = if let Some(prefix) = pending.as_deref() {
+            let footer = if pending.is_some() {
                 match echo.as_ref() {
-                    Some(echo) => format!("→ {echo} · {prefix}… Esc cancels"),
+                    Some(echo) => format!("→ {echo} · Backspace · Esc cancel"),
                     None => {
-                        let hidden = count.saturating_sub(rows);
+                        let hidden = total_rows.saturating_sub(rows);
                         if hidden > 0 {
-                            format!("Esc cancels · Backspace deletes · {hidden} more")
+                            format!(
+                                "Backspace · Esc cancel · {} matches · {hidden} more rows",
+                                count
+                            )
                         } else {
-                            "Esc cancels · Backspace deletes".to_string()
+                            format!("Backspace · Esc cancel · {} matches", count)
                         }
                     }
                 }
             } else {
                 echo.as_ref().map_or_else(
-                    || "Type a shortcut, or ↑↓ then Enter".to_string(),
+                    || "Type a shortcut · ↑↓ move · Enter run".to_string(),
                     |echo| format!("→ {echo}"),
                 )
             };
             let footer_color = if pending.is_none() && echo.is_some() {
                 (235, 215, 175)
             } else {
-                (150, 150, 150)
+                (160, 161, 166)
             };
             let mut target = TextTarget::new(
                 &mut pixels,
@@ -1947,7 +2298,7 @@ impl App {
             );
             text.draw_line(
                 &footer,
-                13.0,
+                12.5,
                 Weight::NORMAL,
                 &mut target,
                 MENU_PADDING as i32,
@@ -1957,7 +2308,9 @@ impl App {
             );
         }
 
-        let border = 0x00484848;
+        // A single-pixel frame keeps the panel readable over a white page
+        // without the heavy double border of the old design.
+        let border = 0x003d_3f45;
         for x in 0..width {
             pixels[x as usize] = border;
             pixels[(height - 1) as usize * width as usize + x as usize] = border;
@@ -1972,6 +2325,7 @@ impl App {
         };
         menu.rows = rows;
         menu.scroll = scroll;
+        menu.columns = columns;
         menu.revision = menu.revision.wrapping_add(1);
         menu.bitmap = Some(PageBitmap {
             width,
@@ -2011,9 +2365,9 @@ impl App {
         self.outline_open = true;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
-        // Opening the panel narrows the content area, but it must not abandon
-        // an active spread. The worker re-renders the pair at the narrower
-        // width, so both pages stay visible instead of switching to one page.
+        // Opening the panel narrows only the displayed content; the worker
+        // keeps the full-window viewport, so an active spread stays active and
+        // no page re-render is queued.
         self.send_viewport();
         self.ensure_outline_visible();
         self.update_title();
@@ -2235,6 +2589,12 @@ impl App {
             Some(format!("{} match(es)", self.highlights.len()))
         };
         self.clamp_scroll();
+        // A previewed page may change the effective background (for example a
+        // CSS-styled chapter). Refresh the baked outline tint so the rail and
+        // veil keep following the page.
+        if self.outline_open {
+            self.ensure_outline_window();
+        }
         self.update_spread_layout();
         // Outline entries are previews until Enter keeps them, so only a
         // settled page belongs in the progress file.
@@ -2358,9 +2718,17 @@ impl App {
                 let Some(selected) = selected else {
                     return;
                 };
-                if self.outline_requested != Some((start, selected)) {
+                let expected = OutlineRequest {
+                    width: self.outline_width(),
+                    start,
+                    selected,
+                    background: self.page_background,
+                };
+                if self.outline_requested != Some(expected) {
                     return;
                 }
+                self.outline_bitmap_width = expected.width;
+                self.outline_bitmap_background = expected.background;
                 self.outline_bitmap = Some(bitmap);
                 self.outline_revision = self.outline_revision.wrapping_add(1);
                 self.outline_bitmap_start = start;
@@ -2395,22 +2763,25 @@ impl App {
 
     fn page_vertical_offset(&self, page_height: u32) -> i32 {
         let (_, viewport_h) = self.viewport();
-        ((viewport_h as i32 - page_height as i32) / 2).max(0)
+        let height = (page_height as f32 * self.display_scale()).round() as i32;
+        ((viewport_h as i32 - height) / 2).max(0)
     }
 
     fn page_origin(&self) -> Option<(i32, i32)> {
         let bitmap = self.bitmap.as_ref()?;
+        let scale = self.display_scale();
         let visible = self.visible_width();
         Some((
             self.page_left_offset(visible)
-                - self.spread_offset.round() as i32
-                - self.scroll_x.round() as i32,
-            self.page_vertical_offset(bitmap.height) - self.scroll_y.round() as i32,
+                - (self.spread_offset * scale).round() as i32
+                - (self.scroll_x * scale).round() as i32,
+            self.page_vertical_offset(bitmap.height) - (self.scroll_y * scale).round() as i32,
         ))
     }
 
     fn page_left_offset(&self, page_width: u32) -> i32 {
-        page_left_offset(self.viewport(), self.content_left(), page_width)
+        let width = (page_width as f32 * self.display_scale()).round().max(1.0) as u32;
+        page_left_offset(self.viewport(), self.content_left(), width)
     }
 
     fn page_coords(&self, position: PhysicalPosition<f64>) -> Option<(f32, f32)> {
@@ -2418,9 +2789,10 @@ impl App {
             return None;
         }
         let page = self.bitmap.as_ref()?;
+        let scale = self.display_scale();
         let (x0, y0) = self.page_origin()?;
-        let x = position.x as f32 - x0 as f32;
-        let y = position.y as f32 - y0 as f32;
+        let x = (position.x as f32 - x0 as f32) / scale;
+        let y = (position.y as f32 - y0 as f32) / scale;
         let left = self.spread_offset;
         let right = left + self.visible_width() as f32;
         if x < left || x >= right || y < 0.0 || y >= page.height as f32 {
@@ -2610,33 +2982,44 @@ impl App {
 
         if self.resize_preview {
             if let Some(page) = self.bitmap.as_ref() {
-                let scale = (vw as f32 / page.width as f32).min(vh as f32 / page.height as f32);
+                let visible = self.visible_width().max(1) as f32;
+                let content_w = (vw - content_left).max(1) as f32;
+                let scale = (content_w / visible).min(vh as f32 / page.height.max(1) as f32);
                 let target_w = (page.width as f32 * scale).round().max(1.0) as i32;
                 let target_h = (page.height as f32 * scale).round().max(1.0) as i32;
-                let target_w = target_w.min(vw);
-                let target_h = target_h.min(vh);
-                let left = (vw - target_w) / 2;
-                let top = (vh - target_h) / 2;
-                list.texture(PAGE_TEXTURE, Rect::new(left, top, target_w, target_h), full);
+                let visible_w = (visible * scale).round().max(1.0) as i32;
+                let window_left = page_left_offset(viewport, content_left, visible_w as u32);
+                let origin_x = window_left - (self.spread_offset * scale).round() as i32;
+                let y0 = ((vh - target_h) / 2).max(0);
+                let clip = Rect::new(window_left, 0, visible_w.min(vw), vh);
+                list.texture(
+                    PAGE_TEXTURE,
+                    Rect::new(origin_x, y0, target_w, target_h),
+                    clip,
+                );
             }
         } else if let Some(page) = self.bitmap.as_ref() {
-            let bw = page.width as i32;
-            let bh = page.height as i32;
+            let scale = self.display_scale();
+            let bw = (page.width as f32 * scale).round().max(1.0) as i32;
+            let bh = (page.height as f32 * scale).round().max(1.0) as i32;
             let visible_width = self.visible_width() as i32;
-            let window_left = page_left_offset(viewport, content_left, visible_width.max(1) as u32)
-                - self.scroll_x.round() as i32;
-            let origin_x = window_left - self.spread_offset.round() as i32;
-            let y0 = self.page_vertical_offset(page.height) - self.scroll_y.round() as i32;
-            let clip = Rect::new(window_left, 0, visible_width, vh);
+            let display_width = (visible_width as f32 * scale).round().max(1.0) as i32;
+            let window_left = page_left_offset(viewport, content_left, display_width as u32)
+                - (self.scroll_x * scale).round() as i32;
+            let origin_x = window_left - (self.spread_offset * scale).round() as i32;
+            let y0 =
+                self.page_vertical_offset(page.height) - (self.scroll_y * scale).round() as i32;
+            let clip = Rect::new(window_left, 0, display_width, vh);
             list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
 
+            let scaled = |value: u32| (value as f32 * scale).round() as i32;
             for highlight in &self.highlights {
                 list.solid(
                     Rect::new(
-                        origin_x + highlight.x0 as i32,
-                        y0 + highlight.y0 as i32,
-                        (highlight.x1 - highlight.x0) as i32,
-                        (highlight.y1 - highlight.y0) as i32,
+                        origin_x + scaled(highlight.x0),
+                        y0 + scaled(highlight.y0),
+                        (scaled(highlight.x1) - scaled(highlight.x0)).max(1),
+                        (scaled(highlight.y1) - scaled(highlight.y0)).max(1),
                     ),
                     rgb(0x00ff_e61e, 0.45),
                     clip,
@@ -2650,10 +3033,10 @@ impl App {
                     for ch in &self.text.chars[start..=end] {
                         list.solid(
                             Rect::new(
-                                origin_x + ch.rect.x0 as i32,
-                                y0 + ch.rect.y0 as i32,
-                                (ch.rect.x1 - ch.rect.x0) as i32,
-                                (ch.rect.y1 - ch.rect.y0) as i32,
+                                origin_x + scaled(ch.rect.x0),
+                                y0 + scaled(ch.rect.y0),
+                                (scaled(ch.rect.x1) - scaled(ch.rect.x0)).max(1),
+                                (scaled(ch.rect.y1) - scaled(ch.rect.y0)).max(1),
                             ),
                             rgb(0x0050_78d2, 0.38),
                             clip,
@@ -2679,9 +3062,9 @@ impl App {
         }
 
         if self.outline_open && !self.outline.is_empty() {
-            let panel_w = (OUTLINE_WIDTH as i32).min(vw);
+            let panel_w = (self.outline_width() as i32).min(vw);
             let panel_clip = Rect::new(0, 0, panel_w, vh);
-            list.solid(panel_clip, rgb(0x0020_2020, 1.0), full);
+            list.solid(panel_clip, rgb(OUTLINE_PANEL_BG, 1.0), full);
 
             if let Some(panel) = self.outline_bitmap.as_ref() {
                 let row_height = OUTLINE_ROW_HEIGHT as i32;
@@ -2693,24 +3076,6 @@ impl App {
                     panel_clip,
                 );
             }
-
-            // The selection is a text treatment, but the row keeps the faint
-            // wash and left mark from the original design. Both follow the
-            // page's background color: white for a normal page, the CSS color
-            // for a styled reflowable document.
-            let row_top = self.outline_selected as i32 * OUTLINE_ROW_HEIGHT as i32
-                - self.outline_scroll as i32;
-            let row_height = OUTLINE_ROW_HEIGHT as i32;
-            list.solid(
-                Rect::new(0, row_top, panel_w, row_height),
-                rgb(self.page_background, OUTLINE_TINT_ALPHA),
-                panel_clip,
-            );
-            list.solid(
-                Rect::new(1, row_top, 3, row_height),
-                rgb(self.page_background, 0.95),
-                panel_clip,
-            );
 
             if panel_w > 0 {
                 list.solid(
@@ -2838,11 +3203,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        let content_w = if self.outline_open {
-            viewport_w.saturating_sub(OUTLINE_WIDTH).max(1)
-        } else {
-            viewport_w
-        };
+        let content_w = viewport_w;
         worker.send(Command::Viewport(content_w, viewport_h));
         self.last_viewport_sent = Some((content_w, viewport_h));
         worker.send(Command::Open {
@@ -2959,6 +3320,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.last_requested_scale = self.scale;
                     self.schedule_viewport();
                     self.clamp_scroll();
+                    // The outline width follows the window, so re-lay out its
+                    // rows while the resize is already being debounced.
+                    if self.outline_open {
+                        self.ensure_outline_window();
+                    }
                     self.request_redraw();
                 }
             }
@@ -3168,6 +3534,7 @@ fn scroll_for_page_point(
     )
 }
 
+#[cfg(test)]
 fn scroll_for_page_point_at_screen(
     viewport: (u32, u32),
     content_left: i32,
@@ -3323,6 +3690,7 @@ mod tests {
             selected: 12,
             scroll: 0,
             rows: 5,
+            columns: 1,
             echo: None,
             dirty: false,
             bitmap: None,

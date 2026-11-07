@@ -51,11 +51,23 @@ const PAGE_CACHE_CAPACITY: usize = 4;
 /// Outside a spread only the current page and one neighbor are useful.
 const PAGE_CACHE_SINGLE_CAPACITY: usize = 2;
 
-/// A spread gap is visual, not structural. Keep it thin so facing pages read
-/// like an open book; it collapses when the viewport only fits the pages.
+/// The gutter is part of the spread geometry, not a decoration that vanishes
+/// when space is tight. Its width follows the rendered page width linearly, so
+/// it scales with every fit change and is always at least one pixel.
+pub const SPREAD_GAP_RATIO: f32 = 0.004;
+
 pub fn spread_gap(page_width: u32) -> u32 {
-    ((page_width as f32 * 0.004).round() as u32).clamp(1, 6)
+    ((page_width as f32 * SPREAD_GAP_RATIO).floor() as u32).max(1)
 }
+
+/// Background of the outline panel. The selected row is tinted towards the
+/// page background while its text is drawn on top, so the text never sits
+/// under the selection wash.
+pub const OUTLINE_PANEL_BG: u32 = 0x0020_2020;
+/// Left padding for outline titles. It also keeps the selection rail clear of
+/// the first glyph.
+const OUTLINE_TEXT_PADDING: usize = 12;
+const OUTLINE_RAIL_WIDTH: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
@@ -631,6 +643,7 @@ impl RenderEngine {
     /// by native HarfBuzz with `fontdb` fallback and rasterized with `ab_glyph`;
     /// no document or HTML engine is involved, so row metrics stay independent
     /// of the format.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_outline(
         &mut self,
         width: u32,
@@ -638,6 +651,8 @@ impl RenderEngine {
         start: usize,
         count: usize,
         selected: Option<usize>,
+        veil: Option<u32>,
+        rail: Option<u32>,
     ) -> Result<Option<PageBitmap>, String> {
         if self.outline.is_empty() {
             return Ok(None);
@@ -653,7 +668,7 @@ impl RenderEngine {
             return Ok(None);
         }
         let height = row_height * count as u32;
-        let mut pixels = vec![0x00202020u32; width as usize * height as usize];
+        let mut pixels = vec![OUTLINE_PANEL_BG; width as usize * height as usize];
 
         if self.outline_text.is_none() {
             self.outline_text = Some(TextEngine::new(self.fonts.clone())?);
@@ -667,17 +682,45 @@ impl RenderEngine {
         for (index, entry) in outline[start..start + count].iter().enumerate() {
             let indent = entry.depth.saturating_mul(14).min(width as usize / 2);
             let highlighted = selected == Some(start + index);
+            let row_top = (index * row_height as usize) as u32;
+            // Paint the selection wash before the text so the glyphs keep
+            // their own color and only become brighter.
+            if highlighted {
+                if let Some(veil) = veil {
+                    fill_bitmap_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        0,
+                        row_top,
+                        width,
+                        row_height,
+                        veil,
+                    );
+                }
+                if let Some(rail) = rail {
+                    fill_bitmap_rect(
+                        &mut pixels,
+                        width,
+                        height,
+                        1,
+                        row_top,
+                        OUTLINE_RAIL_WIDTH,
+                        row_height,
+                        rail,
+                    );
+                }
+            }
             let (r, g, b) = if highlighted {
-                // Selection is a text treatment, not a row background. The
-                // warm tone also works on the panel's neutral surface.
-                (0xf5, 0xc9, 0x7a)
+                // Selection is brightness, not a hue change.
+                (0xff, 0xff, 0xff)
             } else if entry.depth == 0 {
-                (0xf2, 0xf2, 0xf2)
+                (0xe6, 0xe6, 0xe6)
             } else {
-                (0xcf, 0xcf, 0xcf)
+                (0xb8, 0xb8, 0xb8)
             };
-            let title = truncate_outline_title(&entry.title, width, indent);
-            let row_top = (index * row_height as usize) as i32;
+            let title = truncate_outline_title(&entry.title, width, indent + OUTLINE_TEXT_PADDING);
+            let row_top = row_top as i32;
             let mut target = TextTarget::new(&mut pixels, width, height, row_top, row_height);
             engine.draw_line(
                 &title,
@@ -688,7 +731,7 @@ impl RenderEngine {
                     Weight::NORMAL
                 },
                 &mut target,
-                indent as i32,
+                (indent + OUTLINE_TEXT_PADDING) as i32,
                 row_top,
                 row_height,
                 (r, g, b),
@@ -849,11 +892,11 @@ impl RenderEngine {
             .1
             .saturating_sub(MARGIN.saturating_mul(2))
             .max(1) as f32;
-        // A spread fits two pages side by side. Giving each page half the
-        // content width lets the pair shrink to fit instead of clipping one
-        // page when the outline narrows the viewport.
+        // A spread fits two pages and the gutter between them. Reserving a
+        // proportional slice for the gap keeps the gutter visible at every
+        // scale instead of letting it collapse once the pages fill the width.
         let available_w = if self.spread && self.fit != Fit::None {
-            (available_w / 2.0).max(1.0)
+            (available_w / (2.0 + SPREAD_GAP_RATIO)).max(1.0)
         } else {
             available_w
         };
@@ -1065,9 +1108,7 @@ impl RenderEngine {
             .position(|&page| page == self.page + 1)
             .unwrap_or(0);
         let gap = if page_widths.len() > 1 {
-            let visible = page_widths[focus_index]
-                .saturating_add(page_widths.get(focus_index + 1).copied().unwrap_or(0));
-            spread_gap(page_widths[focus_index]).min(self.viewport.0.saturating_sub(visible))
+            spread_gap(page_widths[focus_index])
         } else {
             0
         };
@@ -1127,6 +1168,26 @@ impl RenderEngine {
         if let Some(index) = victim {
             self.page_cache.remove(index);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_bitmap_rect(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: u32,
+) {
+    let x1 = x.saturating_add(w).min(width);
+    let y1 = y.saturating_add(h).min(height);
+    for row in y..y1 {
+        let start = row as usize * width as usize + x.min(width) as usize;
+        let end = row as usize * width as usize + x1 as usize;
+        pixels[start..end].fill(color);
     }
 }
 
@@ -1743,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_selection_highlights_text_not_the_row() {
+    fn outline_selection_brightens_text_and_keeps_a_clear_rail() {
         let _guard = doc_test_guard();
         let dir = test_dir("outline-selection");
         let path = dir.join("sections.html");
@@ -1759,9 +1820,14 @@ mod tests {
         let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
-        let plain = engine.render_outline(320, 28, 0, 4, None).unwrap().unwrap();
+        let veil = 0x0040_4448;
+        let rail = 0x0012_3456;
+        let plain = engine
+            .render_outline(320, 28, 0, 4, None, None, None)
+            .unwrap()
+            .unwrap();
         let selected = engine
-            .render_outline(320, 28, 0, 4, Some(0))
+            .render_outline(320, 28, 0, 4, Some(0), Some(veil), Some(rail))
             .unwrap()
             .unwrap();
 
@@ -1771,32 +1837,58 @@ mod tests {
             let start = row * row_height * width;
             &bitmap.pixels[start..start + row_height * width]
         }
-        let warm_pixels = |row: &[u32]| {
-            row.iter()
+        let last = row_height * width - 1;
+
+        // Selection bakes a faint row veil into the bitmap.
+        assert_eq!(
+            row_block(&plain, 0, width, row_height)[last],
+            OUTLINE_PANEL_BG
+        );
+        let selected_row = row_block(&selected, 0, width, row_height);
+        assert_eq!(selected_row[last], veil);
+        // The rail stays in the left padding, clear of the title glyphs.
+        assert_eq!(selected_row[1], rail);
+        assert_eq!(selected_row[4], veil);
+        assert!(
+            !selected_row[4..OUTLINE_TEXT_PADDING + 1].contains(&rail),
+            "rail must not reach the text padding"
+        );
+
+        // Selected text is pure white; unselected text is only near-white, so
+        // the selection brightens without adding a warm hue.
+        let bright = |row: &[u32], from: usize| {
+            row[from..]
+                .iter()
                 .filter(|pixel| {
                     let r = (*pixel >> 16) & 0xff;
                     let g = (*pixel >> 8) & 0xff;
                     let b = *pixel & 0xff;
-                    r > 0xd0 && g > 0x90 && b < 0xa0
+                    r == 0xff && g == 0xff && b == 0xff
                 })
                 .count()
         };
-        assert_eq!(warm_pixels(row_block(&plain, 0, width, row_height)), 0);
-        let selected_row = row_block(&selected, 0, width, row_height);
-        assert!(
-            warm_pixels(selected_row) > 0,
-            "selected outline row was not text-highlighted"
-        );
-        // The last pixel is far from any glyph, so it must keep the panel
-        // background: selection is a text treatment, not a row tint.
         assert_eq!(
-            row_block(&plain, 0, width, row_height)[row_height * width - 1],
-            selected_row[row_height * width - 1],
-            "selection must not paint the row background"
+            bright(
+                row_block(&plain, 0, width, row_height),
+                OUTLINE_TEXT_PADDING
+            ),
+            0
         );
-        assert_eq!(selected_row[row_height * width - 1], 0x0020_2020);
+        assert!(
+            bright(selected_row, OUTLINE_TEXT_PADDING) > 0,
+            "selected title should be drawn in white"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spread_gap_scales_linearly_with_page_width() {
+        assert_eq!(spread_gap(0), 1, "the gutter is never absent");
+        assert_eq!(spread_gap(250), 1);
+        assert_eq!(spread_gap(1000), 4);
+        assert_eq!(spread_gap(2000), 8);
+        assert!(spread_gap(800) > spread_gap(400));
     }
 
     #[test]
@@ -1894,16 +1986,22 @@ mod tests {
         engine.set_viewport(single_width * 2, 900);
         let tight = engine.render().unwrap();
         assert_eq!(tight.pages, vec![1, 2, 3, 4]);
-        assert_eq!(tight.page_widths[0], single_width);
+        assert!(tight.page_widths[0] <= single_width);
         assert_eq!(
-            tight.gap, 0,
-            "the visual gap must collapse when only two page widths fit"
+            tight.gap,
+            spread_gap(tight.page_widths[0]),
+            "the gutter is part of the fit geometry"
+        );
+        assert!(tight.gap > 0, "the gutter never collapses");
+        assert!(
+            tight.page_widths[0] * 2 + tight.gap <= single_width * 2,
+            "the pair and its gutter must fit the viewport"
         );
 
         engine.set_viewport(2400, 900);
         let spread = engine.render().unwrap();
         assert_eq!(spread.pages, vec![1, 2, 3, 4]);
-        assert!(spread.gap <= 6);
+        assert_eq!(spread.gap, spread_gap(spread.page_widths[0]));
         assert!(spread.gap > 0);
         assert!(spread.bitmap.width > single_width);
         assert_eq!(spread.bitmap.height, single_height);
@@ -1913,16 +2011,16 @@ mod tests {
             "second-page text was not shifted into composite coordinates"
         );
 
-        // A narrower viewport, such as when the outline is open, still keeps
-        // both pages: each half is fitted so the pair shrinks instead of one
-        // page being clipped.
+        // A narrower viewport still keeps both pages: each half is fitted so
+        // the pair shrinks instead of one page being clipped.
         let narrow_width = single_width + 200;
         engine.set_viewport(narrow_width, 900);
         let narrow = engine.render().unwrap();
         assert_eq!(narrow.pages, vec![1, 2, 3, 4]);
         assert!(narrow.page_widths[0] < single_width);
         assert!(narrow.page_widths[0].saturating_mul(2) <= narrow_width);
-        assert_eq!(narrow.gap, 0);
+        assert_eq!(narrow.gap, spread_gap(narrow.page_widths[0]));
+        assert!(narrow.gap > 0);
 
         assert!(engine.next_page());
         let next = engine.render().unwrap();
