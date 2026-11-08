@@ -7,6 +7,10 @@
 //! become the base. Panel shades, borders, muted labels, chips, selection
 //! washes, and text colors are then derived from that base so the outline,
 //! command panel, prompts, and loading card always agree with each other.
+//!
+//! When the CSS names no colors at all, the palette follows the document
+//! instead: it starts from the HTML default canvas (a white page with dark
+//! text) and is re-derived from the rendered page background as pages arrive.
 
 use std::collections::BTreeMap;
 
@@ -86,23 +90,54 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark()
+        Self::html_default()
     }
 }
 
 impl Theme {
-    /// Parse a theme from the combined reflowable CSS. With no usable colors,
-    /// this is exactly the built-in dark palette.
+    /// Parse a theme from the combined reflowable CSS. Without any color
+    /// declarations this starts from the HTML default canvas; the app then
+    /// follows the rendered page background when it becomes available.
     pub fn from_css(css: Option<&str>) -> Self {
         match css {
-            Some(css) if !css.trim().is_empty() => Self::from_overrides(parse_overrides(css)),
-            _ => Self::dark(),
+            Some(css) if !css.trim().is_empty() => {
+                let overrides = parse_overrides(css);
+                if overrides.any() {
+                    Self::from_overrides(overrides)
+                } else {
+                    Self::html_default()
+                }
+            }
+            _ => Self::html_default(),
         }
     }
 
-    /// The built-in dark palette. It intentionally keeps the colors the UI
-    /// used before CSS theming so a CSS file that only sets `font-family`
-    /// changes nothing else.
+    /// Whether the CSS chooses any UI color. When it does not, the app keeps
+    /// the theme in sync with the rendered document background.
+    pub fn has_css_colors(css: Option<&str>) -> bool {
+        match css {
+            Some(css) if !css.trim().is_empty() => parse_overrides(css).any(),
+            _ => false,
+        }
+    }
+
+    /// The HTML default canvas: a white page with dark text.
+    pub fn html_default() -> Self {
+        Self::from_document(0x00ff_ffff)
+    }
+
+    /// Derive the whole palette from a rendered document background. Used when
+    /// the CSS names no colors, so the UI matches the page instead of forcing
+    /// the built-in dark shell.
+    pub fn from_document(background: u32) -> Self {
+        Self::from_overrides(Overrides {
+            window: Some(background),
+            ..Overrides::default()
+        })
+    }
+
+    /// The built-in dark palette, kept for partial token overrides such as a
+    /// lone `--mureader-accent`.
     pub fn dark() -> Self {
         let accent = DEFAULT_ACCENT;
         let panel = 0x001b_1c1e;
@@ -152,8 +187,8 @@ impl Theme {
     }
 
     fn from_overrides(overrides: Overrides) -> Self {
-        // A CSS file that only names a font (or only overrides an accent)
-        // should keep the exact built-in dark palette.
+        // A CSS file that only overrides an accent, a border, or a highlight
+        // keeps the exact built-in dark palette as its base.
         let has_base =
             overrides.window.is_some() || overrides.text.is_some() || overrides.surface.is_some();
         if !has_base {
@@ -342,6 +377,20 @@ struct Overrides {
     search: Option<u32>,
     selection: Option<u32>,
     selected_text: Option<u32>,
+}
+
+impl Overrides {
+    fn any(&self) -> bool {
+        self.window.is_some()
+            || self.surface.is_some()
+            || self.text.is_some()
+            || self.muted.is_some()
+            || self.accent.is_some()
+            || self.border.is_some()
+            || self.search.is_some()
+            || self.selection.is_some()
+            || self.selected_text.is_some()
+    }
 }
 
 fn parse_overrides(css: &str) -> Overrides {
@@ -959,14 +1008,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn font_only_css_keeps_the_original_dark_palette() {
-        let theme = Theme::from_css(Some(r#"body { font-family: "FangSongCode"; }"#));
-        let dark = Theme::dark();
-        assert_eq!(theme, dark);
-        assert_eq!(theme.window, 0x0018_1818);
-        assert_eq!(theme.panel, 0x001b_1c1e);
-        assert_eq!(theme.outline.panel, 0x0020_2020);
-        assert_eq!(theme.accent, DEFAULT_ACCENT);
+    fn font_only_css_has_no_colors_and_follows_the_html_default() {
+        let css = Some(r#"body { font-family: "FangSongCode"; }"#);
+        assert!(!Theme::has_css_colors(css));
+        let theme = Theme::from_css(css);
+        assert_eq!(theme, Theme::html_default());
+        assert_eq!(theme, Theme::from_document(0x00ff_ffff));
+        assert!(!theme.dark);
+        assert_eq!(theme.window, 0x00ff_ffff);
+        assert_eq!(theme.panel, 0x00f5_f5f5);
+        assert_eq!(theme.text, 0x0011_1111);
+        assert_eq!(theme.outline.panel, theme.panel);
     }
 
     #[test]
@@ -977,7 +1029,28 @@ mod tests {
             h1 { background-color: #ff0000; }
             ::selection { background: #0000ff; }
         "#;
-        assert_eq!(Theme::from_css(Some(css)), Theme::dark());
+        assert!(!Theme::has_css_colors(Some(css)));
+        assert_eq!(Theme::from_css(Some(css)), Theme::html_default());
+    }
+
+    #[test]
+    fn document_theme_tracks_light_and_dark_pages() {
+        let light = Theme::from_document(0x00ff_ffff);
+        assert!(!light.dark);
+        assert_eq!(light.window, 0x00ff_ffff);
+        assert_eq!(light.outline.panel, light.panel);
+
+        let dark = Theme::from_document(0x0010_1010);
+        assert!(dark.dark);
+        assert_eq!(dark.window, 0x0010_1010);
+        assert_eq!(dark.outline.selected_text, 0x00ff_ffff);
+    }
+
+    #[test]
+    fn explicit_css_colors_pin_the_theme() {
+        let css = Some("body { background: #f5e6c8; color: #33291f; }");
+        assert!(Theme::has_css_colors(css));
+        assert_eq!(Theme::from_css(css).window, 0x00f5_e6c8);
     }
 
     #[test]
@@ -1079,7 +1152,9 @@ mod tests {
 
     #[test]
     fn accent_only_override_keeps_the_dark_palette() {
-        let theme = Theme::from_css(Some(":root { --mureader-accent: #66aaff; }"));
+        let css = Some(":root { --mureader-accent: #66aaff; }");
+        assert!(Theme::has_css_colors(css));
+        let theme = Theme::from_css(css);
         assert_eq!(theme.window, 0x0018_1818);
         assert_eq!(theme.panel, 0x001b_1c1e);
         assert_eq!(theme.accent, 0x0066_aaff);

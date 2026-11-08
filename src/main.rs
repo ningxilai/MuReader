@@ -475,6 +475,9 @@ struct App {
     menu_text: Option<TextEngine>,
     status: Option<String>,
     theme: Theme,
+    /// True when the CSS names no colors, so the UI keeps following the
+    /// rendered page background instead of pinning a palette.
+    follow_document_theme: bool,
     fonts: Arc<FontCatalog>,
     keymap: Keymap,
     menu_keys: MenuKeymap,
@@ -531,6 +534,7 @@ impl App {
             .copied()
             .filter(|entry| menu_keys.has_binding(entry.action))
             .collect();
+        let follow_document_theme = !Theme::has_css_colors(css.as_deref());
         Self {
             path,
             proxy,
@@ -585,6 +589,7 @@ impl App {
             menu_text: None,
             status: None,
             theme,
+            follow_document_theme,
             fonts,
             keymap,
             menu_keys,
@@ -624,6 +629,20 @@ impl App {
         if let Some(worker) = self.worker.as_ref() {
             worker.send(command);
         }
+    }
+
+    /// Theme colors are baked into the cached panels and into the worker-side
+    /// spread gutter, so drop the caches and repaint with the new palette.
+    fn invalidate_theme(&mut self) {
+        self.prompt_bitmap = None;
+        self.loading_bitmap = None;
+        self.outline_bitmap = None;
+        self.outline_requested = None;
+        self.outline_bitmap_selected = None;
+        if let Some(menu) = self.command_menu.as_mut() {
+            menu.dirty = true;
+        }
+        self.send(Command::SetBackground(self.theme.window));
     }
 
     fn request_redraw(&self) {
@@ -2553,7 +2572,12 @@ impl App {
         self.highlights = page.highlights;
         self.links = page.links;
         self.text = page.text;
-        self.page_background = page.bitmap.pixels.first().copied().unwrap_or(0x00ff_ffff);
+        let page_background = page.bitmap.pixels.first().copied().unwrap_or(0x00ff_ffff);
+        // A color-free CSS lets the page decide the theme. Chapters with a
+        // different background update the whole UI instead of leaving the
+        // built-in dark shell in place.
+        let theme_changed = self.follow_document_theme && self.theme.window != page_background;
+        self.page_background = page_background;
         self.bitmap = Some(page.bitmap);
         self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
@@ -2575,6 +2599,10 @@ impl App {
             Some(format!("{} match(es)", self.highlights.len()))
         };
         self.clamp_scroll();
+        if theme_changed {
+            self.theme = Theme::from_document(page_background);
+            self.invalidate_theme();
+        }
         // A previewed page may change the effective background (for example a
         // CSS-styled chapter). Refresh the baked outline tint so the rail and
         // veil keep following the page.

@@ -24,6 +24,7 @@ use crate::UserEvent;
 pub enum Command {
     Viewport(u32, u32),
     SetSpread(bool),
+    SetBackground(u32),
     Open {
         path: PathBuf,
         fonts: Arc<FontCatalog>,
@@ -130,6 +131,12 @@ fn run(
             Command::SetSpread(spread) => {
                 if let Some(engine) = engine.as_mut() {
                     engine.set_spread(spread);
+                    render_and_send(engine, &proxy);
+                }
+            }
+            Command::SetBackground(background) => {
+                if let Some(engine) = engine.as_mut() {
+                    engine.set_background(background);
                     render_and_send(engine, &proxy);
                 }
             }

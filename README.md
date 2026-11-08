@@ -161,10 +161,12 @@ properties override individual parts:
 }
 ```
 
-If the CSS contains no colors, the built-in dark palette is used, so a CSS file
-that only sets `font-family` changes nothing else. A light background
-automatically derives dark text and a darker selected-text color, keeping
-outline and menu selections readable without adding a hue.
+If the CSS contains no colors, the UI follows the document: it starts from the
+HTML default canvas (a white page with dark text) and is re-derived from the
+rendered page background as pages arrive. A CSS file that only sets
+`font-family` therefore matches the book instead of forcing a dark shell. A
+light background automatically derives dark text and a darker selected-text
+color, keeping outline and menu selections readable without adding a hue.
 
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
@@ -197,7 +199,8 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 - The outline, command panel, prompts, loading card, and search/selection
   highlights now share one CSS-derived theme. `body`/`html`/`:root` background
   and color supply the base, with `--mureader-*` custom properties for
-  per-surface overrides; the built-in dark palette remains the fallback.
+  per-surface overrides; when the CSS names no colors the theme follows the
+  rendered page, starting from the HTML default white canvas.
 - Unified internal and external link handling: internal links and committed
   outline entries share one navigation path with Back/Forward history, and
   external links open in the desktop handler.

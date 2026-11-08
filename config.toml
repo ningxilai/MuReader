@@ -37,8 +37,10 @@ window_fit_ms = 120
 #   --mureader-selection      text-selection color
 #   --mureader-selected-text  selected outline/menu text
 #
-# Without CSS colors the built-in dark palette is used, so CSS that only sets
-# a font changes nothing else.
+# Without CSS colors the UI follows the document: it starts from the HTML
+# default white canvas and dark text, then tracks the rendered page background
+# as pages arrive. CSS that only sets a font therefore changes nothing about
+# the palette.
 #
 # css = """
 # :root {
