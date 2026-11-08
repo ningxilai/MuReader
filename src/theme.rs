@@ -221,10 +221,16 @@ impl Theme {
         let text = overrides
             .text
             .unwrap_or(if dark { 0x00e6_e6e6 } else { 0x0011_1111 });
-        let accent = overrides.accent.unwrap_or(DEFAULT_ACCENT);
         let surface = overrides
             .surface
             .unwrap_or_else(|| shade(window, if dark { 0.05 } else { -0.04 }));
+        // Without an explicit accent, derive a neutral tone from the base
+        // palette. A custom or document theme must never inherit the built-in
+        // warm amber, or the loading rail and which-key chips stand out as a
+        // color the rest of the theme does not contain.
+        let accent = overrides
+            .accent
+            .unwrap_or_else(|| blend(text, surface, 0.20));
         let raised = shade(surface, if dark { 0.025 } else { 0.03 });
         let sunken = shade(surface, -0.02);
         let selected = blend(surface, accent, if dark { 0.12 } else { 0.10 });
@@ -1044,6 +1050,24 @@ mod tests {
         assert!(dark.dark);
         assert_eq!(dark.window, 0x0010_1010);
         assert_eq!(dark.outline.selected_text, 0x00ff_ffff);
+    }
+
+    #[test]
+    fn base_theme_without_accent_avoids_the_builtin_amber() {
+        let themes = [
+            Theme::from_document(0x00ff_ffff),
+            Theme::from_css(Some("body { background: #f5e6c8; color: #33291f; }")),
+        ];
+        for theme in themes {
+            assert_ne!(theme.accent, DEFAULT_ACCENT);
+            assert_eq!(theme.accent, blend(theme.text, theme.panel, 0.20));
+        }
+        let document = Theme::from_document(0x00ff_ffff);
+        assert_eq!(
+            document.accent >> 16 & 0xff,
+            document.accent & 0xff,
+            "the document-derived accent must stay neutral"
+        );
     }
 
     #[test]
