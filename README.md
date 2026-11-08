@@ -108,6 +108,15 @@ css = ""
 css_file = ""
 pretty = true
 
+[perfect_palette]
+enable = false
+colors = 9
+step = 4
+hue_start = 0.58
+saturation = 45
+lightness = 65
+hpluv = true
+
 [progress]
 max_documents = 100
 
@@ -145,6 +154,18 @@ back to one page automatically.
 declared there is also used by the outline, command menu, and other UI text;
 CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
 line-breaking pass for TXT and text files.
+
+`[perfect_palette]` is an optional eye-comfort palette ported from the HPLuv
+`perfect-palette` helper in the author's Emacs configuration. It generates
+`colors` hues starting at `hue_start` with a `step / colors`-turn spacing,
+keeps `saturation` and `lightness` fixed, and injects the result as ordinary
+reflowable CSS before your own CSS. The first hue also tints the page paper
+and ink; the palette drives the accent, search, and selection colors, so the
+outline and command panel stay in the same family as the page. Set
+`lightness` below 50 for a dark reading surface. Every generated color is also
+available to custom CSS as `--mureader-palette-0` through
+`--mureader-palette-(colors-1)`. User CSS comes later, so it can override any
+part of the generated palette.
 
 The same CSS supplies one theme for every non-reading surface: the outline,
 command panel, prompts, loading card, borders, and search/selection highlights.
@@ -207,6 +228,10 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   and color supply the base, with `--mureader-*` custom properties for
   per-surface overrides; when the CSS names no colors the theme follows the
   rendered page, starting from the HTML default white canvas.
+- Added an optional HPLuv `perfect-palette` eye-comfort theme. It injects a
+  generated paper, ink, accent, search, and selection palette into the
+  reflowable CSS, and the UI follows it. Every parameter is configurable and
+  the feature is off by default.
 - Unified internal and external link handling: internal links and committed
   outline entries share one navigation path with Back/Forward history, and
   external links open in the desktop handler.

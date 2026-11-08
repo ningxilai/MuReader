@@ -1170,6 +1170,23 @@ mod tests {
     }
 
     #[test]
+    fn perfect_palette_css_drives_the_ui_theme() {
+        let options = crate::palette::Options::default();
+        let palette = crate::palette::build(options);
+        let theme = Theme::from_css(Some(&crate::palette::css(options)));
+        assert_eq!(theme.window, palette.background);
+        assert_eq!(theme.text, palette.text);
+        assert_eq!(theme.accent, palette.accent);
+        assert_eq!(theme.search_highlight, palette.search);
+        assert_eq!(theme.selection_highlight, palette.selection);
+        assert_eq!(
+            theme.dark,
+            relative_luminance(palette.background) < DARK_TEXT_THRESHOLD
+        );
+        assert_eq!(theme.outline.panel, theme.panel);
+    }
+
+    #[test]
     fn accent_only_override_keeps_the_dark_palette() {
         let css = Some(":root { --mureader-accent: #66aaff; }");
         assert!(Theme::has_css_colors(css));

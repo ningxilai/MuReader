@@ -63,6 +63,21 @@ css_file = ""
 # handler are not opened.
 pretty = true
 
+[perfect_palette]
+# Optional eye-comfort palette ported from the HPLuv helper in the Emacs
+# configuration. It tints reflowable pages and colors the UI accent, search,
+# and selection through the same [reflowable] CSS. User CSS below wins.
+enable = false
+# Number of colors, hue step, and starting hue fraction (p, q, hue-start).
+colors = 9
+step = 4
+hue_start = 0.58
+# Saturation and lightness in percent. Lightness below 50 picks a dark page.
+saturation = 45
+lightness = 65
+# Use HPLuv (true) or ordinary HSL (false).
+hpluv = true
+
 [progress]
 # Number of documents whose last-read page is remembered. New entries
 # replace the oldest one. Set to 0 to disable reading progress.

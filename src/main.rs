@@ -23,6 +23,7 @@ mod fonts;
 mod gpu;
 mod keymap;
 mod outline_text;
+mod palette;
 mod pretty_text;
 mod progress;
 mod startup;

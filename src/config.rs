@@ -20,6 +20,7 @@ const DEFAULT_CONFIG: &str = include_str!("../config.toml");
 pub struct Config {
     pub animation: AnimationConfig,
     pub reflowable: ReflowableConfig,
+    pub perfect_palette: PerfectPaletteConfig,
     pub progress: ProgressConfig,
     pub keys: BTreeMap<String, KeySpec>,
     #[serde(skip)]
@@ -65,6 +66,55 @@ impl Default for ReflowableConfig {
     }
 }
 
+/// Optional eye-comfort palette ported from the `perfect-palette` helper in
+/// the user's Emacs configuration. It is rendered as ordinary reflowable CSS,
+/// so later user CSS declarations still take precedence.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PerfectPaletteConfig {
+    pub enable: bool,
+    /// Number of colors to generate (`p`).
+    pub colors: usize,
+    /// Hue step (`q`); the actual step is `q / colors` turns.
+    pub step: usize,
+    /// Starting hue as a fraction of a turn.
+    pub hue_start: f32,
+    /// Saturation in percent.
+    pub saturation: f32,
+    /// Lightness in percent. Values below 50 select a dark reading surface.
+    pub lightness: f32,
+    /// Use HPLuv (`true`) or ordinary HSL (`false`).
+    pub hpluv: bool,
+}
+
+impl Default for PerfectPaletteConfig {
+    fn default() -> Self {
+        let options = crate::palette::Options::default();
+        Self {
+            enable: false,
+            colors: options.colors,
+            step: options.step,
+            hue_start: options.hue_start,
+            saturation: options.saturation,
+            lightness: options.lightness,
+            hpluv: options.hpluv,
+        }
+    }
+}
+
+impl PerfectPaletteConfig {
+    fn options(&self) -> crate::palette::Options {
+        crate::palette::Options {
+            colors: self.colors,
+            step: self.step,
+            hue_start: self.hue_start,
+            saturation: self.saturation,
+            lightness: self.lightness,
+            hpluv: self.hpluv,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ProgressConfig {
@@ -101,6 +151,9 @@ impl Config {
     /// resolved against the config file's directory.
     pub fn reflowable_css(&self) -> Option<String> {
         let mut parts = Vec::new();
+        if self.perfect_palette.enable {
+            parts.push(crate::palette::css(self.perfect_palette.options()));
+        }
         if let Some(css) = self.reflowable.css() {
             parts.push(css.to_string());
         }
@@ -351,6 +404,13 @@ next_page = "n"
         assert_eq!(config.reflowable.css_file(), None);
         assert!(config.reflowable.pretty);
         assert_eq!(config.progress.max_documents, 100);
+        assert!(!config.perfect_palette.enable);
+        assert_eq!(config.perfect_palette.colors, 9);
+        assert_eq!(config.perfect_palette.step, 4);
+        assert_eq!(config.perfect_palette.hue_start, 0.58);
+        assert_eq!(config.perfect_palette.saturation, 45.0);
+        assert_eq!(config.perfect_palette.lightness, 65.0);
+        assert!(config.perfect_palette.hpluv);
         assert!(config.keys.contains_key("quit"));
         assert!(config.keys.contains_key("outline"));
         assert_eq!(config.keys["toggle_spread"].entries(), vec!["s"]);
@@ -401,6 +461,56 @@ max_documents = 0
         )
         .unwrap();
         assert_eq!(config.progress.max_documents, 0);
+    }
+
+    #[test]
+    fn perfect_palette_css_precedes_user_css_when_enabled() {
+        let mut config = Config::default();
+        assert!(config.reflowable_css().is_none());
+
+        config.perfect_palette.enable = true;
+        config.reflowable.css = Some("body { color: red; }".to_string());
+        let css = config.reflowable_css().unwrap();
+        let palette = css.find("--mureader-palette-0").unwrap();
+        let user = css.find("body { color: red; }").unwrap();
+        assert!(
+            palette < user,
+            "user CSS must be able to override the palette"
+        );
+
+        config.perfect_palette.enable = false;
+        assert_eq!(
+            config.reflowable_css().as_deref(),
+            Some("body { color: red; }")
+        );
+    }
+
+    #[test]
+    fn perfect_palette_parameters_are_configurable() {
+        let config: Config = toml::from_str(
+            r#"
+[perfect_palette]
+enable = true
+colors = 5
+step = 2
+hue_start = 0.1
+saturation = 80
+lightness = 30
+hpluv = false
+"#,
+        )
+        .unwrap();
+        assert!(config.perfect_palette.enable);
+        assert_eq!(config.perfect_palette.colors, 5);
+        assert_eq!(config.perfect_palette.step, 2);
+        assert_eq!(config.perfect_palette.hue_start, 0.1);
+        assert_eq!(config.perfect_palette.saturation, 80.0);
+        assert_eq!(config.perfect_palette.lightness, 30.0);
+        assert!(!config.perfect_palette.hpluv);
+        assert!(config
+            .reflowable_css()
+            .unwrap()
+            .contains("--mureader-palette-4"));
     }
 
     #[test]
