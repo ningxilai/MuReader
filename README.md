@@ -156,16 +156,18 @@ CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
 line-breaking pass for TXT and text files.
 
 `[perfect_palette]` is an optional eye-comfort palette ported from the HPLuv
-`perfect-palette` helper in the author's Emacs configuration. It generates
-`colors` hues starting at `hue_start` with a `step / colors`-turn spacing,
-keeps `saturation` and `lightness` fixed, and injects the result as ordinary
-reflowable CSS before your own CSS. The first hue also tints the page paper
-and ink; the palette drives the accent, search, and selection colors, so the
-outline and command panel stay in the same family as the page. Set
-`lightness` below 50 for a dark reading surface. Every generated color is also
-available to custom CSS as `--mureader-palette-0` through
-`--mureader-palette-(colors-1)`. User CSS comes later, so it can override any
-part of the generated palette.
+`perfect-palette` helper in the author's Emacs configuration. Instead of
+imposing an unrelated theme, it reads the window, text, and accent hue from
+your `[reflowable]` CSS (or from the HTML default when no colors are named),
+then regenerates the page paper and ink plus the UI accent, search, and
+selection colors around that hue family. `hue_start` is only the fallback for
+a fully neutral theme. The palette walks `colors` hues with a
+`step / colors`-turn spacing at fixed `saturation` and `lightness`; every
+generated color is available as `--mureader-palette-0` through
+`--mureader-palette-(colors-1)`. The tuned stylesheet is appended after your
+CSS, so it transforms the resulting palette, and when `enable = false` the
+original CSS and colors are left exactly untouched. Light and dark themes keep
+their character; `lightness` only controls the generated palette colors.
 
 The same CSS supplies one theme for every non-reading surface: the outline,
 command panel, prompts, loading card, borders, and search/selection highlights.
@@ -228,10 +230,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   and color supply the base, with `--mureader-*` custom properties for
   per-surface overrides; when the CSS names no colors the theme follows the
   rendered page, starting from the HTML default white canvas.
-- Added an optional HPLuv `perfect-palette` eye-comfort theme. It injects a
-  generated paper, ink, accent, search, and selection palette into the
-  reflowable CSS, and the UI follows it. Every parameter is configurable and
-  the feature is off by default.
+- Added an optional HPLuv `perfect-palette` eye-comfort theme. It derives the
+  page paper, ink, accent, search, and selection colors from the existing
+  window, text, and accent hue family, and the UI follows the tuned theme.
+  Every parameter is configurable, the feature is off by default, and when
+  disabled the original CSS and colors are left untouched.
 - Unified internal and external link handling: internal links and committed
   outline entries share one navigation path with Back/Forward history, and
   external links open in the desktop handler.

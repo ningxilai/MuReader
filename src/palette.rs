@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! An optional HPLuv/HSLuv palette, ported from the `perfect-palette`
+//! An optional HPLuv/HSL palette, ported from the `perfect-palette`
 //! helper in the user's Emacs configuration.
 //!
 //! The palette walks the hue circle while keeping saturation and lightness
 //! fixed, which produces a set of colors that feel equally bright. MuReader
-//! uses it for an eye-comfort reading surface: the first hue tints the paper
-//! and ink, while the palette supplies the UI accent, search, and selection
-//! colors. The generated CSS is the same reflowable stylesheet users already
-//! customize, so explicit user colors still win by coming later.
+//! uses it to soften the reader's own theme: the hue family comes from the
+//! existing window, text, and accent colors, then the paper, ink, accent,
+//! search, and selection tones are regenerated around it.
+//!
+//! This module never decides whether the feature is enabled. The caller only
+//! appends [`css`] to the user's stylesheet when the option is on, so a
+//! disabled palette leaves the original CSS and theme exactly untouched.
 
 use std::f64::consts::PI;
+
+use crate::theme::Theme;
 
 /// Keep the generated stylesheet bounded even if the config asks for a huge
 /// palette.
@@ -21,11 +26,15 @@ pub struct Options {
     pub colors: usize,
     /// Hue step (`q`); the actual step is `q / colors` turns.
     pub step: usize,
-    /// Starting hue as a fraction of a turn.
+    /// Hue used when the existing theme is fully neutral, as a fraction of a
+    /// turn. The window, accent, or text hue anchors the palette whenever one
+    /// of them has any tint.
     pub hue_start: f32,
-    /// Saturation in percent.
+    /// Saturation in percent for the generated palette colors.
     pub saturation: f32,
-    /// Lightness in percent. Values below 50 select a dark reading surface.
+    /// Lightness in percent for the generated palette colors. The reading
+    /// surface itself follows the existing theme, so light and dark themes
+    /// keep their character.
     pub lightness: f32,
     /// Use HPLuv (`true`) or ordinary HSL (`false`).
     pub hpluv: bool,
@@ -69,46 +78,74 @@ pub struct Palette {
     pub selection: u32,
 }
 
-/// Generate the palette and the matching paper/ink/accent colors.
-pub fn build(options: Options) -> Palette {
+/// Generate an eye-comfort palette from the theme's own background, text, and
+/// accent hues. A tinted theme keeps its hue family; `hue_start` is only the
+/// fallback for a neutral theme such as plain white and black CSS.
+pub fn tune(theme: Theme, options: Options) -> Palette {
     let options = options.normalized();
-    let hues: Vec<f32> = (0..options.colors)
-        .map(|index| {
-            normalize_hue(
-                options.hue_start + index as f32 * options.step as f32 / options.colors as f32,
-            )
-        })
-        .collect();
+    let (accent_hue, accent_saturation, _) = source_color(theme.accent, options.hpluv);
+    let (window_hue, window_saturation, window_lightness) =
+        source_color(theme.window, options.hpluv);
+    let (text_hue, text_saturation, text_lightness) = source_color(theme.text, options.hpluv);
+    let fallback_hue = options.hue_start * 360.0;
+    let base_hue = if accent_saturation >= 5.0 {
+        accent_hue
+    } else if window_saturation >= 2.0 {
+        window_hue
+    } else if text_saturation >= 5.0 {
+        text_hue
+    } else {
+        fallback_hue
+    };
+    let dark = theme.dark;
+
+    let hues = palette_hues(base_hue, &options);
     let colors: Vec<u32> = hues
         .iter()
-        .map(|hue| {
-            convert(
-                *hue * 360.0,
-                options.saturation,
-                options.lightness,
-                options.hpluv,
-            )
-        })
+        .map(|hue| convert(*hue, options.saturation, options.lightness, options.hpluv))
         .collect();
 
-    let base_hue = options.hue_start * 360.0;
-    let dark = options.lightness < 50.0;
-    let paper_saturation = (options.saturation * 0.20).clamp(1.5, 10.0);
-    let ink_saturation = (options.saturation * 0.30).clamp(2.0, 16.0);
-    let background = convert(
-        base_hue,
-        paper_saturation,
-        if dark { 12.0 } else { 96.0 },
-        options.hpluv,
-    );
-    let text = convert(
-        base_hue,
-        ink_saturation,
-        if dark { 92.0 } else { 18.0 },
-        options.hpluv,
-    );
+    let paper_hue = if window_saturation >= 2.0 {
+        window_hue
+    } else {
+        base_hue
+    };
+    let paper_saturation = if window_saturation >= 2.0 {
+        (window_saturation * 0.9).clamp(1.5, 100.0)
+    } else {
+        (options.saturation * 0.20).clamp(1.5, 10.0)
+    };
+    let paper_lightness = if dark {
+        window_lightness.clamp(10.0, 16.0)
+    } else {
+        window_lightness.clamp(90.0, 96.5)
+    };
+    let background = convert(paper_hue, paper_saturation, paper_lightness, options.hpluv);
+
+    let ink_hue = if text_saturation >= 5.0 {
+        text_hue
+    } else {
+        base_hue
+    };
+    let ink_saturation = if text_saturation >= 2.0 {
+        (text_saturation * 0.9).clamp(1.5, 100.0)
+    } else {
+        (options.saturation * 0.20).clamp(2.0, 16.0)
+    };
+    let ink_lightness = if dark {
+        text_lightness.clamp(84.0, 92.0)
+    } else {
+        text_lightness.clamp(16.0, 26.0)
+    };
+    let text = convert(ink_hue, ink_saturation, ink_lightness, options.hpluv);
+
+    let accent_hue = if accent_saturation >= 5.0 {
+        accent_hue
+    } else {
+        base_hue
+    };
     let accent = convert(
-        base_hue,
+        accent_hue,
         options.saturation,
         if dark { 72.0 } else { 45.0 },
         options.hpluv,
@@ -127,11 +164,108 @@ pub fn build(options: Options) -> Palette {
     }
 }
 
-/// Build the CSS block appended before the user's reflowable CSS. The user's
-/// later background, text, or `--mureader-*` declarations therefore override
-/// any part of this palette without extra configuration.
-pub fn css(options: Options) -> String {
-    let palette = build(options);
+/// Read a color in the space the palette renders in, so hue, saturation, and
+/// lightness keep their meaning across the transformation.
+fn source_color(color: u32, hpluv: bool) -> (f32, f32, f32) {
+    if hpluv {
+        rgb_to_hpluv(color)
+    } else {
+        rgb_to_hsl(color)
+    }
+}
+
+fn palette_hues(base_hue: f32, options: &Options) -> Vec<f32> {
+    (0..options.colors)
+        .map(|index| {
+            (base_hue + index as f32 * options.step as f32 / options.colors as f32 * 360.0)
+                .rem_euclid(360.0)
+        })
+        .collect()
+}
+
+fn rgb_to_hsl(color: u32) -> (f32, f32, f32) {
+    let r = ((color >> 16) & 0xff) as f32 / 255.0;
+    let g = ((color >> 8) & 0xff) as f32 / 255.0;
+    let b = (color & 0xff) as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return (0.0, 0.0, lightness * 100.0);
+    }
+    let saturation = if lightness > 0.5 {
+        delta / (2.0 - max - min)
+    } else {
+        delta / (max + min)
+    };
+    let hue = if max == r {
+        ((g - b) / delta + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if max == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    (hue * 360.0, saturation * 100.0, lightness * 100.0)
+}
+
+/// Convert an sRGB color to HPLuv: hue in degrees, saturation in percent, and
+/// lightness in percent. This is the inverse of [`hpluv_to_rgb`] without
+/// rounding through 8-bit channels.
+fn rgb_to_hpluv(color: u32) -> (f32, f32, f32) {
+    let (hue, chroma, lightness) = rgb_to_lch(color);
+    if lightness <= 1.0e-9 {
+        return (0.0, 0.0, 0.0);
+    }
+    let max = max_safe_chroma_for_l(lightness);
+    let saturation = if max > 1.0e-9 {
+        (chroma / max * 100.0) as f32
+    } else {
+        0.0
+    };
+    (hue as f32, saturation, lightness as f32)
+}
+
+fn rgb_to_lch(color: u32) -> (f64, f64, f64) {
+    let channel = |shift: u32| {
+        let value = ((color >> shift) & 0xff) as f64 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let r = channel(16);
+    let g = channel(8);
+    let b = channel(0);
+    let x = TO_XYZ[0][0] * r + TO_XYZ[0][1] * g + TO_XYZ[0][2] * b;
+    let y = TO_XYZ[1][0] * r + TO_XYZ[1][1] * g + TO_XYZ[1][2] * b;
+    let z = TO_XYZ[2][0] * r + TO_XYZ[2][1] * g + TO_XYZ[2][2] * b;
+    let lightness = if y > EPSILON {
+        116.0 * y.cbrt() - 16.0
+    } else {
+        KAPPA * y
+    };
+    let denominator = x + 15.0 * y + 3.0 * z;
+    if denominator.abs() <= 1.0e-12 || lightness <= 1.0e-9 {
+        return (0.0, 0.0, lightness);
+    }
+    let var_u = 4.0 * x / denominator;
+    let var_v = 9.0 * y / denominator;
+    let u = 13.0 * lightness * (var_u - REF_U);
+    let v = 13.0 * lightness * (var_v - REF_V);
+    let chroma = (u * u + v * v).sqrt();
+    let mut hue = v.atan2(u) * 180.0 / PI;
+    if hue < 0.0 {
+        hue += 360.0;
+    }
+    (hue, chroma, lightness)
+}
+
+/// Render the tuned palette as CSS appended after the user's reflowable CSS.
+/// The declarations reuse the same selectors and tokens, so they transform the
+/// existing theme instead of imposing an unrelated palette.
+pub fn css(palette: &Palette) -> String {
     let mut css = String::new();
     css.push_str(":root {\n");
     for (index, color) in palette.colors.iter().enumerate() {
@@ -339,6 +473,25 @@ const M: [[f64; 3]; 3] = [
     ],
 ];
 
+/// Linear sRGB to CIE XYZ (D65), the inverse of [`M`].
+const TO_XYZ: [[f64; 3]; 3] = [
+    [
+        0.412_390_799_265_959,
+        0.357_584_339_383_878,
+        0.180_480_788_401_834,
+    ],
+    [
+        0.212_639_005_871_510,
+        0.715_168_678_767_756,
+        0.072_192_315_360_734,
+    ],
+    [
+        0.019_330_818_715_592,
+        0.119_194_779_794_626,
+        0.950_532_152_249_661,
+    ],
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,35 +514,100 @@ mod tests {
     }
 
     #[test]
-    fn perfect_palette_uses_the_emacs_defaults() {
-        let options = Options::default();
-        let palette = build(options);
+    fn neutral_theme_falls_back_to_hue_start() {
+        let palette = tune(Theme::html_default(), Options::default());
         assert_eq!(palette.colors.len(), 9);
-        assert_eq!(palette.colors[0], 0x007d_a4ad);
-        assert_eq!(palette.background, hpluv_to_rgb(208.8, 9.0, 96.0));
-        assert_eq!(palette.text, hpluv_to_rgb(208.8, 13.5, 18.0));
+        assert_eq!(palette.colors[0], hpluv_to_rgb(208.8, 45.0, 65.0));
+        assert_eq!(palette.background, hpluv_to_rgb(208.8, 9.0, 96.5));
+        assert_eq!(palette.text, hpluv_to_rgb(208.8, 9.0, 16.0));
         assert_eq!(palette.accent, hpluv_to_rgb(208.8, 45.0, 45.0));
     }
 
     #[test]
-    fn palette_css_names_every_color_and_lets_user_css_follow() {
-        let css = css(Options::default());
-        assert!(css.contains("--mureader-palette-0: #7da4ad;"));
-        assert!(css.contains("--mureader-palette-8:"));
-        assert!(css.contains("--mureader-accent:"));
-        assert!(css.contains("background-color:"));
-        assert!(css.contains("color:"));
-        assert!(css.contains("html, body"));
+    fn tinted_theme_keeps_its_hue_family() {
+        let theme = Theme::from_css(Some(
+            "body { background: #f2e8d5; color: #3a2e24; }
+             :root { --mureader-accent: #b5762f; }",
+        ));
+        let palette = tune(theme, Options::default());
+        let (accent_hue, _, _) = rgb_to_hpluv(theme.accent);
+        let (window_hue, window_saturation, window_lightness) = rgb_to_hpluv(theme.window);
+        assert_eq!(palette.colors[0], hpluv_to_rgb(accent_hue, 45.0, 65.0));
+        assert_eq!(
+            palette.background,
+            hpluv_to_rgb(
+                window_hue,
+                (window_saturation * 0.9).clamp(1.5, 100.0),
+                window_lightness.clamp(90.0, 96.5)
+            )
+        );
+        assert_ne!(palette.colors[0], hpluv_to_rgb(208.8, 45.0, 65.0));
     }
 
     #[test]
-    fn dark_lightness_flips_the_reading_surface() {
+    fn hsl_mode_uses_hsl_hues() {
+        let theme = Theme::from_css(Some(
+            "body { background: #f2e8d5; color: #3a2e24; }
+             :root { --mureader-accent: #b5762f; }",
+        ));
         let options = Options {
-            lightness: 30.0,
+            hpluv: false,
             ..Options::default()
         };
-        let palette = build(options);
+        let palette = tune(theme, options);
+        let (accent_hue, _, _) = rgb_to_hsl(theme.accent);
+        assert_eq!(palette.colors[0], hsl_to_rgb(accent_hue, 45.0, 65.0));
+    }
+
+    #[test]
+    fn hpluv_roundtrips_through_the_inverse_conversion() {
+        for (color, hue, saturation, lightness) in [
+            (0x007d_a4ad, 210.407, 45.007, 64.905),
+            (0x001f_8390, 208.316, 99.823, 50.141),
+            (0x00ba_949b, 359.517, 44.798, 64.952),
+        ] {
+            let (actual_hue, actual_saturation, actual_lightness) = rgb_to_hpluv(color);
+            assert!(close(actual_hue, hue, 0.1), "{actual_hue} != {hue}");
+            assert!(
+                close(actual_saturation, saturation, 0.1),
+                "{actual_saturation} != {saturation}"
+            );
+            assert!(
+                close(actual_lightness, lightness, 0.1),
+                "{actual_lightness} != {lightness}"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_css_names_every_color_and_token() {
+        let palette = tune(Theme::html_default(), Options::default());
+        let css = css(&palette);
+        assert!(css.contains("--mureader-palette-0: #7da4ad;"));
+        assert!(css.contains(&format!(
+            "--mureader-palette-8: {};",
+            hex(palette.colors[8])
+        )));
+        assert!(css.contains(&format!("--mureader-accent: {};", hex(palette.accent))));
+        assert!(css.contains(&format!("--mureader-search: {};", hex(palette.search))));
+        assert!(css.contains(&format!(
+            "--mureader-selection: {};",
+            hex(palette.selection)
+        )));
+        assert!(css.contains(&format!("background-color: {};", hex(palette.background))));
+        assert!(css.contains(&format!("color: {};", hex(palette.text))));
+    }
+
+    #[test]
+    fn dark_theme_tunes_the_dark_reading_surface() {
+        let theme = Theme::from_css(Some("body { background: #101010; color: #d0d0d0; }"));
+        assert!(theme.dark);
+        let palette = tune(theme, Options::default());
         assert!(relative(palette.background) < relative(palette.text));
+    }
+
+    fn close(a: f32, b: f32, tolerance: f32) -> bool {
+        (a - b).abs() <= tolerance
     }
 
     fn relative(color: u32) -> f32 {

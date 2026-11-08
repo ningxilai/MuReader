@@ -3612,6 +3612,24 @@ fn scroll_for_page_point_at_screen(
     )
 }
 
+/// Compose the stylesheet the reader actually applies. The eye-comfort palette
+/// is a transformation of the theme implied by the user's CSS, so its rules
+/// come after that CSS. When disabled, both values stay exactly untouched.
+fn configured_styles(config: &Config) -> (Option<String>, Theme) {
+    let mut css = config.reflowable_css();
+    let mut theme = Theme::from_css(css.as_deref());
+    if config.perfect_palette.enable {
+        let palette = palette::tune(theme, config.perfect_palette.options());
+        let tuned = palette::css(&palette);
+        css = Some(match css {
+            Some(user) => format!("{user}\n{tuned}"),
+            None => tuned,
+        });
+        theme = Theme::from_css(css.as_deref());
+    }
+    (css, theme)
+}
+
 fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let config: Config = config::load();
     let path = match path {
@@ -3626,8 +3644,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
     let fonts = Arc::new(FontCatalog::new(config.font_family().as_deref())?);
     mupdf::set_font_loader(EpubFontLoader::new(fonts.clone()));
     let keymap = Keymap::new(&config.keys);
-    let css = config.reflowable_css();
-    let theme = Theme::from_css(css.as_deref());
+    let (css, theme) = configured_styles(&config);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -3697,6 +3714,39 @@ mod tests {
         assert!(open_external("javascript:alert(1)").is_err());
         assert!(open_external("file:///etc/passwd").is_err());
         assert!(open_external("not-a-uri").is_err());
+    }
+
+    #[test]
+    fn disabled_palette_leaves_css_and_theme_untouched() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
+        let (css, theme) = configured_styles(&config);
+        assert_eq!(css, config.reflowable_css());
+        assert_eq!(theme, Theme::from_css(css.as_deref()));
+    }
+
+    #[test]
+    fn enabled_palette_appends_a_tuned_stylesheet() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
+        config.perfect_palette.enable = true;
+        let (css, theme) = configured_styles(&config);
+        let css = css.unwrap();
+        let user = css.find("body { background").unwrap();
+        let tuned = css.find("--mureader-palette-0").unwrap();
+        assert!(user < tuned, "the tuned palette must follow the user CSS");
+        assert!(
+            !config
+                .reflowable_css()
+                .unwrap()
+                .contains("--mureader-palette"),
+            "config CSS stays exactly the user's stylesheet"
+        );
+        assert_ne!(
+            theme,
+            Theme::from_css(config.reflowable_css().as_deref()),
+            "the UI theme follows the tuned palette"
+        );
     }
 
     #[test]

@@ -1172,8 +1172,8 @@ mod tests {
     #[test]
     fn perfect_palette_css_drives_the_ui_theme() {
         let options = crate::palette::Options::default();
-        let palette = crate::palette::build(options);
-        let theme = Theme::from_css(Some(&crate::palette::css(options)));
+        let palette = crate::palette::tune(Theme::html_default(), options);
+        let theme = Theme::from_css(Some(&crate::palette::css(&palette)));
         assert_eq!(theme.window, palette.background);
         assert_eq!(theme.text, palette.text);
         assert_eq!(theme.accent, palette.accent);

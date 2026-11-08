@@ -65,14 +65,17 @@ pretty = true
 
 [perfect_palette]
 # Optional eye-comfort palette ported from the HPLuv helper in the Emacs
-# configuration. It tints reflowable pages and colors the UI accent, search,
-# and selection through the same [reflowable] CSS. User CSS below wins.
+# configuration. It softens the theme already implied by your [reflowable] CSS,
+# keeping its hue family, and recolors the page, UI accent, search, and
+# selection. When disabled, the CSS and colors are left exactly untouched.
 enable = false
-# Number of colors, hue step, and starting hue fraction (p, q, hue-start).
+# Number of colors and hue step (p, q).
 colors = 9
 step = 4
+# Hue fraction used only when the existing theme is neutral (hue-start).
+# A tinted accent, window, or text color anchors the palette instead.
 hue_start = 0.58
-# Saturation and lightness in percent. Lightness below 50 picks a dark page.
+# Saturation and lightness in percent for the generated palette colors.
 saturation = 45
 lightness = 65
 # Use HPLuv (true) or ordinary HSL (false).

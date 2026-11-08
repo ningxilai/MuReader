@@ -67,8 +67,8 @@ impl Default for ReflowableConfig {
 }
 
 /// Optional eye-comfort palette ported from the `perfect-palette` helper in
-/// the user's Emacs configuration. It is rendered as ordinary reflowable CSS,
-/// so later user CSS declarations still take precedence.
+/// the user's Emacs configuration. It tunes the existing theme instead of
+/// replacing it, and only contributes CSS while `enable` is true.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PerfectPaletteConfig {
@@ -77,11 +77,12 @@ pub struct PerfectPaletteConfig {
     pub colors: usize,
     /// Hue step (`q`); the actual step is `q / colors` turns.
     pub step: usize,
-    /// Starting hue as a fraction of a turn.
+    /// Hue used when the existing theme is neutral, as a fraction of a turn.
+    /// A tinted accent, window, or text color anchors the palette instead.
     pub hue_start: f32,
-    /// Saturation in percent.
+    /// Saturation in percent for the generated palette colors.
     pub saturation: f32,
-    /// Lightness in percent. Values below 50 select a dark reading surface.
+    /// Lightness in percent for the generated palette colors.
     pub lightness: f32,
     /// Use HPLuv (`true`) or ordinary HSL (`false`).
     pub hpluv: bool,
@@ -103,7 +104,7 @@ impl Default for PerfectPaletteConfig {
 }
 
 impl PerfectPaletteConfig {
-    fn options(&self) -> crate::palette::Options {
+    pub(crate) fn options(&self) -> crate::palette::Options {
         crate::palette::Options {
             colors: self.colors,
             step: self.step,
@@ -148,12 +149,10 @@ impl Config {
     }
 
     /// Combine inline CSS and an optional CSS file. A relative file path is
-    /// resolved against the config file's directory.
+    /// resolved against the config file's directory. The returned stylesheet is
+    /// exactly the user's CSS; the optional palette is composed by the caller.
     pub fn reflowable_css(&self) -> Option<String> {
         let mut parts = Vec::new();
-        if self.perfect_palette.enable {
-            parts.push(crate::palette::css(self.perfect_palette.options()));
-        }
         if let Some(css) = self.reflowable.css() {
             parts.push(css.to_string());
         }
@@ -464,24 +463,19 @@ max_documents = 0
     }
 
     #[test]
-    fn perfect_palette_css_precedes_user_css_when_enabled() {
+    fn perfect_palette_does_not_alter_the_user_stylesheet() {
         let mut config = Config::default();
-        assert!(config.reflowable_css().is_none());
-
-        config.perfect_palette.enable = true;
         config.reflowable.css = Some("body { color: red; }".to_string());
-        let css = config.reflowable_css().unwrap();
-        let palette = css.find("--mureader-palette-0").unwrap();
-        let user = css.find("body { color: red; }").unwrap();
-        assert!(
-            palette < user,
-            "user CSS must be able to override the palette"
-        );
-
-        config.perfect_palette.enable = false;
         assert_eq!(
             config.reflowable_css().as_deref(),
             Some("body { color: red; }")
+        );
+
+        config.perfect_palette.enable = true;
+        assert_eq!(
+            config.reflowable_css().as_deref(),
+            Some("body { color: red; }"),
+            "the palette is composed after the user's CSS, not inside it"
         );
     }
 
@@ -507,10 +501,14 @@ hpluv = false
         assert_eq!(config.perfect_palette.saturation, 80.0);
         assert_eq!(config.perfect_palette.lightness, 30.0);
         assert!(!config.perfect_palette.hpluv);
-        assert!(config
-            .reflowable_css()
-            .unwrap()
-            .contains("--mureader-palette-4"));
+        let options = config.perfect_palette.options();
+        assert_eq!(options.colors, 5);
+        assert_eq!(options.step, 2);
+        assert_eq!(options.hue_start, 0.1);
+        assert_eq!(options.saturation, 80.0);
+        assert_eq!(options.lightness, 30.0);
+        assert!(!options.hpluv);
+        assert!(config.reflowable_css().is_none());
     }
 
     #[test]
