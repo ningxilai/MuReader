@@ -36,6 +36,7 @@ pub enum Action {
     Copy,
     Back,
     Forward,
+    ToggleSpread,
 }
 
 impl Action {
@@ -68,6 +69,7 @@ impl Action {
             "copy" => Self::Copy,
             "back" => Self::Back,
             "forward" => Self::Forward,
+            "toggle_spread" => Self::ToggleSpread,
             _ => return None,
         })
     }
@@ -561,6 +563,7 @@ const DEFAULT_BINDINGS: &[(Action, &str)] = &[
     (Action::ResetView, "0"),
     (Action::RotateRight, "r"),
     (Action::RotateLeft, "l"),
+    (Action::ToggleSpread, "s"),
     (Action::Copy, "M-w"),
     (Action::Copy, "C-w"),
     (Action::Back, "M-Left"),
@@ -618,6 +621,33 @@ mod tests {
         let keymap = Keymap::new(&BTreeMap::new());
         let key = Chord::parse("o").unwrap();
         assert_eq!(keymap.exact(&[key]), Some(Action::Outline));
+    }
+
+    #[test]
+    fn toggle_spread_is_bound_to_s() {
+        assert_eq!(
+            Action::from_name("toggle_spread"),
+            Some(Action::ToggleSpread)
+        );
+        assert_eq!(
+            Action::from_name("toggle-spread"),
+            Some(Action::ToggleSpread)
+        );
+
+        let keymap = Keymap::new(&BTreeMap::new());
+        let key = Chord::parse("s").unwrap();
+        assert_eq!(keymap.exact(&[key]), Some(Action::ToggleSpread));
+    }
+
+    #[test]
+    fn toggle_spread_override_replaces_the_default() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("toggle_spread".to_string(), KeySpec::One("S-s".to_string()));
+        let keymap = Keymap::new(&overrides);
+
+        let key = Chord::parse("S-s").unwrap();
+        assert_eq!(keymap.exact(&[key]), Some(Action::ToggleSpread));
+        assert_eq!(keymap.exact(&parse_sequence("s").unwrap()), None);
     }
 
     #[test]

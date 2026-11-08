@@ -168,6 +168,10 @@ const COMMANDS: &[CommandEntry] = &[
         action: Action::ResetView,
     },
     CommandEntry {
+        label: "Toggle single page",
+        action: Action::ToggleSpread,
+    },
+    CommandEntry {
         label: "Rotate right",
         action: Action::RotateRight,
     },
@@ -493,6 +497,10 @@ struct App {
     /// prevents the worker's replacement single-page bitmap from immediately
     /// enabling the spread again and creating a render loop.
     spread_blocked: bool,
+    /// User preference for the two-page spread. It starts enabled so the
+    /// default reading mode is a spread, and a manual toggle turns the
+    /// automatic enabling off until the user asks for it again.
+    spread_enabled: bool,
     pending_turn: Option<TurnDirection>,
     animation: Option<SpreadAnimation>,
     progress: ProgressStore,
@@ -602,6 +610,7 @@ impl App {
             last_viewport_sent: None,
             spread_active: false,
             spread_blocked: false,
+            spread_enabled: true,
             pending_turn: None,
             animation: None,
             progress,
@@ -753,8 +762,26 @@ impl App {
         ((page_w - content_w) / 2.0 / scale).max(0.0)
     }
 
+    /// Whether the current document and window can support a comfortable
+    /// two-page spread. A spread may shrink both pages to fit, so this is not
+    /// "two full-size pages fit"; instead it rejects a spread whose pages
+    /// would be too narrow to read.
+    fn spread_can_fit(&self) -> bool {
+        if self.page_count.unwrap_or(0) < 2 || self.page_fit != Fit::Page {
+            return false;
+        }
+        let Some(single) = self.single_page_width() else {
+            return false;
+        };
+        let prospective = self.viewport().0 as f32 / (2.0 + SPREAD_GAP_RATIO);
+        prospective >= single * MIN_SPREAD_PAGE_FRACTION
+    }
+
     fn maybe_enable_spread(&mut self) {
         if self.spread_active || self.spread_blocked || self.pages.len() >= 2 {
+            return;
+        }
+        if !self.spread_enabled {
             return;
         }
         // Do not start a spread while the outline is open: the overlay makes
@@ -764,27 +791,43 @@ impl App {
         if self.outline_open {
             return;
         }
-        if self.page_count.unwrap_or(0) < 2 {
-            return;
-        }
-        if self.page_fit != Fit::Page {
-            return;
-        }
-        // A spread may shrink both pages to fit, so do not require two
-        // height-fitted pages to fit at full size. Instead, reject the spread
-        // when the resulting page would be too narrow to read. This is the
-        // same threshold that disables an already active spread.
-        let Some(single) = self.single_page_width() else {
-            return;
-        };
-        let prospective = self.viewport().0 as f32 / (2.0 + SPREAD_GAP_RATIO);
-        if prospective < single * MIN_SPREAD_PAGE_FRACTION {
+        if !self.spread_can_fit() {
             return;
         }
 
         self.spread_active = true;
         self.send(Command::SetSpread(true));
         self.update_title();
+    }
+
+    /// Switch between the default two-page spread and a centered single page.
+    /// The choice is a user preference, so single page stays single even after
+    /// the next page arrives. Turning the spread back on clears an automatic
+    /// narrow-window block and asks the worker to re-render a pair.
+    fn toggle_spread(&mut self) {
+        self.finish_animation();
+        self.spread_enabled = !self.spread_enabled;
+        self.spread_blocked = false;
+        if !self.spread_enabled {
+            self.spread_active = false;
+            self.send(Command::SetSpread(false));
+            self.status = Some("single page".to_string());
+        } else if self.page_fit != Fit::Page {
+            // A spread is a fit-to-page layout. Return to fit first; the next
+            // page event can then start the spread through the normal path.
+            self.spread_active = false;
+            self.reset_view();
+            self.status = Some("two-page spread".to_string());
+        } else if self.spread_can_fit() {
+            self.spread_active = true;
+            self.send(Command::SetSpread(true));
+            self.status = Some("two-page spread".to_string());
+        } else {
+            self.spread_active = false;
+            self.status = Some("single page".to_string());
+        }
+        self.update_title();
+        self.request_redraw();
     }
 
     fn update_spread_layout(&mut self) {
@@ -2537,6 +2580,7 @@ impl App {
             Action::ResetView => self.reset_view(),
             Action::RotateRight => self.rotate(true),
             Action::RotateLeft => self.rotate(false),
+            Action::ToggleSpread => self.toggle_spread(),
             Action::Copy => self.copy_selection(),
             Action::Back => self.go_back(),
             Action::Forward => self.go_forward(),

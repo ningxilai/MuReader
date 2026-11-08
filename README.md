@@ -125,6 +125,7 @@ zoom_out = "-"
 font_increase = "C-="
 font_decrease = "C--"
 reset_view = "0"
+toggle_spread = "s"
 rotate_right = "r"
 rotate_left = "l"
 copy = ["M-w", "C-w"]
@@ -134,6 +135,11 @@ copy = ["M-w", "C-w"]
 re-layout after a window resize: the existing page is scaled to fit the new
 window immediately, then re-rendered after the delay. Set it to `0` for the
 fastest response (one frame).
+
+The reader starts in a two-page spread whenever the window fits a comfortable
+pair. `toggle_spread` switches between that spread and a centered single page;
+the choice lasts until it is toggled again, while a narrow window still falls
+back to one page automatically.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -226,8 +232,9 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   oversized zoomed pages.
 - Two-page reading keeps a proportional central gutter that never collapses,
   and falls back to a single page once each spread page would be too narrow.
-  The outline overlays the page at full-window layout scale, so opening or
-  closing it no longer triggers a page re-render or layout hitch.
+  Press `s` (configurable as `toggle_spread`) to switch to a centered single
+  page and back. The outline overlays the page at full-window layout scale, so
+  opening or closing it no longer triggers a page re-render or layout hitch.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard
   module and reduced it to the copy path.

@@ -353,6 +353,7 @@ next_page = "n"
         assert_eq!(config.progress.max_documents, 100);
         assert!(config.keys.contains_key("quit"));
         assert!(config.keys.contains_key("outline"));
+        assert_eq!(config.keys["toggle_spread"].entries(), vec!["s"]);
     }
 
     #[test]
