@@ -1691,6 +1691,13 @@ impl App {
     fn close_command_menu(&mut self) {
         self.command_menu = None;
         self.menu_keys.reset();
+        // The outline is the mode underneath the command panel. Re-assert its
+        // selection frame so closing which-key always returns focus there.
+        if self.outline_open {
+            self.outline_requested = None;
+            self.outline_bitmap_selected = None;
+            self.ensure_outline_visible();
+        }
         self.update_title();
         self.request_redraw();
     }
