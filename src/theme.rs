@@ -181,11 +181,6 @@ impl Theme {
         }
     }
 
-    /// A subtle wash of the page background over the outline panel.
-    pub fn outline_veil(&self, page_background: u32, alpha: f32) -> u32 {
-        blend(self.outline.panel, page_background, alpha)
-    }
-
     fn from_overrides(overrides: Overrides) -> Self {
         // A CSS file that only overrides an accent, a border, or a highlight
         // keeps the exact built-in dark palette as its base.

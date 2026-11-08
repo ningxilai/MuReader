@@ -87,9 +87,6 @@ const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
 /// exceeds this many pixels so outline browsing cannot stall the UI on an
 /// expensive render/upload.
 const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
-/// Very light veil behind the selected outline row. The color is the page's
-/// own background, so the wash stays subtle on any document.
-const OUTLINE_TINT_ALPHA: f32 = 0.06;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -962,11 +959,10 @@ impl App {
             start,
             count,
             selected: Some(selected),
-            veil: Some(
-                self.theme
-                    .outline_veil(request.background, OUTLINE_TINT_ALPHA),
-            ),
-            rail: Some(request.background),
+            // Match the command panel: a selected row uses the raised surface
+            // and a slim accent rail instead of a wash of the page background.
+            veil: Some(self.theme.panel_selected),
+            rail: Some(self.theme.accent),
             style: self.theme.outline,
         });
     }
