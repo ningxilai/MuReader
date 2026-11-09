@@ -152,6 +152,8 @@ window that cannot fit a comfortable pair uses continuous scroll automatically.
 Page numbers are the shared coordinate: switching modes and following outline,
 search, or link destinations lands at the start of that page, and while
 scrolling the title and progress report the page at the top of the viewport.
+Continuous scroll works for fixed-layout documents such as PDFs as well as
+reflowable ones.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -194,11 +196,13 @@ properties override individual parts:
 ```
 
 If the CSS contains no colors, the UI follows the document: it starts from the
-HTML default canvas (a white page with dark text) and is re-derived from the
-rendered page background as pages arrive. A CSS file that only sets
-`font-family` therefore matches the book instead of forcing a dark shell. A
-light background automatically derives dark text and a darker selected-text
-color, keeping outline and menu selections readable without adding a hue.
+HTML default canvas (a white page with dark text) and derives one palette from
+the first rendered page's background. That palette is kept for the whole book,
+so a cover, an embedded image, or a PDF page with different colors cannot flip
+the shell while reading. A CSS file that only sets `font-family` therefore
+matches the book instead of forcing a dark shell. A light background
+automatically derives dark text and a darker selected-text color, keeping
+outline and menu selections readable without adding a hue.
 
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
@@ -231,8 +235,9 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 - The outline, command panel, prompts, loading card, and search/selection
   highlights now share one CSS-derived theme. `body`/`html`/`:root` background
   and color supply the base, with `--mureader-*` custom properties for
-  per-surface overrides; when the CSS names no colors the theme follows the
-  rendered page, starting from the HTML default white canvas.
+  per-surface overrides; when the CSS names no colors the theme is derived once
+  from the first rendered page, starting from the HTML default white canvas, so
+  embedded images and PDFs keep a single palette for the whole book.
 - Added an optional HPLuv `perfect-palette` eye-comfort theme. It derives the
   page paper, ink, accent, search, and selection colors from the existing
   window, text, and accent hue family, and the UI follows the tuned theme.
@@ -258,9 +263,9 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   multi-key prefix is pending.
 - Outline selection brightens the selected title to white and bakes a faint
   page-tinted veil plus a left rail into the panel bitmap; the text padding
-  keeps the rail clear of the glyphs, and the tint follows the page background
-  for CSS-styled documents. Previews stay debounced and are skipped for
-  oversized zoomed pages.
+  keeps the rail clear of the glyphs, and the tint follows the book's sampled
+  background. Previews stay debounced and are skipped for oversized zoomed
+  pages.
 - Two-page reading keeps a proportional central gutter that never collapses,
   and falls back to single-column continuous scroll once each spread page would
   be too narrow. Press `s` (configurable as `toggle_spread`) to switch between

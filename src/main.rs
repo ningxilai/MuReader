@@ -30,7 +30,7 @@ mod startup;
 mod theme;
 mod worker;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -434,10 +434,10 @@ struct App {
     activation: Activation,
     highlights: Vec<HighlightRect>,
     links: Vec<RenderedLink>,
-    /// Rendered page background, used by the outline selection rail and row
-    /// veil. White until the first page arrives; reflowable documents follow
-    /// their effective CSS background.
-    page_background: u32,
+    /// Background sampled once from the first rendered page. The whole book
+    /// keeps this single canvas so embedded images and per-page backgrounds
+    /// cannot flip the outline tint, gutter, or UI palette mid-book.
+    book_background: Option<u32>,
     outline: Vec<OutlineEntry>,
     outline_open: bool,
     outline_selected: usize,
@@ -575,7 +575,7 @@ impl App {
             activation: Activation::from_env(),
             highlights: Vec::new(),
             links: Vec::new(),
-            page_background: 0x00ff_ffff,
+            book_background: None,
             outline: Vec::new(),
             outline_open: false,
             outline_selected: 0,
@@ -654,6 +654,12 @@ impl App {
                 (size.width, size.height)
             })
             .unwrap_or((0, 0))
+    }
+
+    /// The single canvas color shared by the whole book. Falls back to the
+    /// HTML default white until the first page has been sampled.
+    fn document_background(&self) -> u32 {
+        self.book_background.unwrap_or(0x00ff_ffff)
     }
 
     fn send(&self, command: Command) {
@@ -1151,7 +1157,7 @@ impl App {
             width: self.outline_width(),
             start,
             selected,
-            background: self.page_background,
+            background: self.document_background(),
         };
         if self.outline_requested == Some(request) {
             return;
@@ -1191,7 +1197,7 @@ impl App {
         );
         let stale = (self.outline_bitmap.is_some()
             && self.outline_bitmap_width != self.outline_width())
-            || self.outline_bitmap_background != self.page_background;
+            || self.outline_bitmap_background != self.document_background();
         let (start, count) = match window {
             Some(window) => window,
             // The visible window is already cached, but the selection, panel
@@ -2909,12 +2915,16 @@ impl App {
         self.highlights = page.highlights;
         self.links = page.links;
         self.text = page.text;
-        let page_background = page.bitmap.pixels.first().copied().unwrap_or(0x00ff_ffff);
-        // A color-free CSS lets the page decide the theme. Chapters with a
-        // different background update the whole UI instead of leaving the
-        // built-in dark shell in place.
+        // Sample the canvas once, from the first page, and keep it for the whole
+        // book. Re-deriving the theme from every page makes embedded images and
+        // PDF pages flip the shell color abruptly while scrolling.
+        if self.book_background.is_none() {
+            self.book_background = Some(sample_page_background(&page.bitmap));
+        }
+        let page_background = self.document_background();
+        // A color-free CSS lets the document decide the theme. Apply that one
+        // palette when the first page reveals the book's canvas.
         let theme_changed = self.follow_document_theme && self.theme.window != page_background;
-        self.page_background = page_background;
         self.bitmap = Some(page.bitmap);
         self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
@@ -2989,9 +2999,8 @@ impl App {
             self.theme = Theme::from_document(page_background);
             self.invalidate_theme();
         }
-        // A previewed page may change the effective background (for example a
-        // CSS-styled chapter). Refresh the baked outline tint so the rail and
-        // veil keep following the page.
+        // The first page fixes the book's canvas. Refresh the baked outline
+        // tint once so the rail and veil agree with that canvas.
         if self.outline_open {
             self.ensure_outline_window();
         }
@@ -3125,7 +3134,7 @@ impl App {
                     width: self.outline_width(),
                     start,
                     selected,
-                    background: self.page_background,
+                    background: self.document_background(),
                 };
                 if self.outline_requested != Some(expected) {
                     return;
@@ -4045,6 +4054,45 @@ fn scroll_for_page_point_at_screen(
     )
 }
 
+/// Pick a representative canvas color from the first rendered page. The
+/// top-left pixel can belong to a cover or an embedded image, so sample the
+/// border instead: a text page's margins are its background, and even a
+/// full-bleed illustration gives a stable color for the whole book.
+fn sample_page_background(bitmap: &PageBitmap) -> u32 {
+    let width = bitmap.width as usize;
+    let height = bitmap.height as usize;
+    if width == 0 || height == 0 || bitmap.pixels.len() < width * height {
+        return bitmap.pixels.first().copied().unwrap_or(0x00ff_ffff);
+    }
+    // Thin margin band, independent of the page size. Sampling the outer few
+    // rows and columns avoids text and most illustrations.
+    let edge = (width.min(height) / 40).clamp(1, 8);
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut sample = |x: usize, y: usize| {
+        let color = bitmap.pixels[y * width + x];
+        *counts.entry(color).or_insert(0) += 1;
+    };
+    for y in 0..height {
+        if y < edge || y + edge >= height {
+            for x in 0..width {
+                sample(x, y);
+            }
+        } else {
+            for x in 0..edge {
+                sample(x, y);
+            }
+            for x in width.saturating_sub(edge)..width {
+                sample(x, y);
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(color, count)| (count, std::cmp::Reverse(color)))
+        .map(|(color, _)| color)
+        .unwrap_or(0x00ff_ffff)
+}
+
 /// Compose the stylesheet the reader actually applies. The eye-comfort palette
 /// is a transformation of the theme implied by the user's CSS, so its rules
 /// come after that CSS. When disabled, both values stay exactly untouched.
@@ -4372,6 +4420,40 @@ mod tests {
         assert!(outline_preview_allowed(Fit::None, Some(&small)));
         assert!(!outline_preview_allowed(Fit::None, Some(&large)));
         assert!(!outline_preview_allowed(Fit::None, None));
+    }
+
+    #[test]
+    fn page_background_ignores_an_embedded_image_in_the_first_pixel() {
+        let mut pixels = vec![0x00ff_ffff; 100 * 100];
+        // A cover image occupies the top-left corner and would win a naive
+        // first-pixel sample.
+        for y in 0..10 {
+            for x in 0..10 {
+                pixels[y * 100 + x] = 0x00cc_0000;
+            }
+        }
+        // A few dark text strokes in the middle must not beat the margins.
+        for y in 40..60 {
+            for x in 40..60 {
+                pixels[y * 100 + x] = 0x0000_0000;
+            }
+        }
+        let bitmap = PageBitmap {
+            width: 100,
+            height: 100,
+            pixels,
+        };
+        assert_eq!(sample_page_background(&bitmap), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn page_background_falls_back_for_an_empty_bitmap() {
+        let empty = PageBitmap {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+        assert_eq!(sample_page_background(&empty), 0x00ff_ffff);
     }
 
     #[test]
