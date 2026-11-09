@@ -197,9 +197,11 @@ properties override individual parts:
 
 If the CSS contains no colors, the UI follows the document: it starts from the
 HTML default canvas (a white page with dark text) and derives one palette from
-the first rendered page's background. That palette is kept for the whole book,
-so a cover, an embedded image, or a PDF page with different colors cannot flip
-the shell while reading. A CSS file that only sets `font-family` therefore
+the whole book. Pages spread evenly through the document are sampled at a
+small preview size, their canvas colors are reduced to one color with a
+Lagrange interpolation over page position, and the result is kept for the whole
+book. A cover, an embedded image, or a PDF page with different colors therefore
+cannot flip the shell while reading. A CSS file that only sets `font-family`
 matches the book instead of forcing a dark shell. A light background
 automatically derives dark text and a darker selected-text color, keeping
 outline and menu selections readable without adding a hue.
@@ -236,8 +238,9 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   highlights now share one CSS-derived theme. `body`/`html`/`:root` background
   and color supply the base, with `--mureader-*` custom properties for
   per-surface overrides; when the CSS names no colors the theme is derived once
-  from the first rendered page, starting from the HTML default white canvas, so
-  embedded images and PDFs keep a single palette for the whole book.
+  from pages sampled across the whole book and Lagrange-interpolated in page
+  order, starting from the HTML default white canvas, so embedded images and
+  PDFs keep a single palette for the whole book.
 - Added an optional HPLuv `perfect-palette` eye-comfort theme. It derives the
   page paper, ink, accent, search, and selection colors from the existing
   window, text, and accent hue family, and the UI follows the tuned theme.

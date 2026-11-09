@@ -10,8 +10,8 @@
 //!
 //! When the CSS names no colors at all, the palette follows the document
 //! instead: it starts from the HTML default canvas (a white page with dark
-//! text) and is derived once from the first rendered page's background, so the
-//! whole book keeps a single palette even when later pages contain images.
+//! text) and is derived once from a background sampled across the whole book,
+//! so the book keeps a single palette even when some pages contain images.
 
 use std::collections::BTreeMap;
 
@@ -114,7 +114,7 @@ impl Theme {
     }
 
     /// Whether the CSS chooses any UI color. When it does not, the app derives
-    /// one theme from the first rendered page and keeps it for the whole book.
+    /// one theme from a whole-book background sample and keeps it for the book.
     pub fn has_css_colors(css: Option<&str>) -> bool {
         match css {
             Some(css) if !css.trim().is_empty() => parse_overrides(css).any(),
