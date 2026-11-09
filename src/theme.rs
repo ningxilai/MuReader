@@ -12,6 +12,9 @@
 //! instead: it starts from the HTML default canvas (a white page with dark
 //! text) and is derived once from a background sampled across the whole book,
 //! so the book keeps a single palette even when some pages contain images.
+//! The sampling and interpolation live in `book_color`, which is independent
+//! of this theme and of the optional eye-comfort palette; this module only
+//! consumes the resulting color to derive the UI palette.
 
 use std::collections::BTreeMap;
 
@@ -114,7 +117,8 @@ impl Theme {
     }
 
     /// Whether the CSS chooses any UI color. When it does not, the app derives
-    /// one theme from a whole-book background sample and keeps it for the book.
+    /// one theme from an isolated `book_color` whole-book sample and keeps it
+    /// for the book; the optional palette may later consume the same color.
     pub fn has_css_colors(css: Option<&str>) -> bool {
         match css {
             Some(css) if !css.trim().is_empty() => parse_overrides(css).any(),

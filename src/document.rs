@@ -22,6 +22,7 @@ use mupdf::{
     TextPage, TextPageFlags,
 };
 
+use crate::book_color;
 use crate::fonts::FontCatalog;
 use crate::outline_text::{TextEngine, TextTarget};
 use crate::theme::{rgb8, OutlineStyle, DEFAULT_WINDOW};
@@ -74,9 +75,6 @@ pub fn scroll_gap(page_width: u32) -> u32 {
     (page_width / 100).clamp(8, 24)
 }
 
-/// Pages sampled across the whole book when deriving its single canvas color.
-/// An even count keeps the interpolation point between two central samples.
-const BOOK_SAMPLE_PAGES: usize = 8;
 /// Longest side, in pixels, of a page rendered for background sampling. The
 /// palette only needs the page margins, so a tiny preview is enough.
 const BOOK_SAMPLE_SIZE: f32 = 96.0;
@@ -746,35 +744,57 @@ impl RenderEngine {
 
     /// Sample page canvases across the whole book and interpolate one color.
     /// Each page is rendered at a tiny preview size, so this stays cheap even
-    /// for long books; the resulting color is stable for the whole session.
+    /// for long books. The target sample count is continuous, so adjacent
+    /// integer counts are mixed instead of switching abruptly.
     fn sample_book_background(&self) -> u32 {
         let Some(count) = self.page_count else {
             return DEFAULT_WINDOW;
         };
-        let pages = book_sample_pages(count);
-        let mut samples = Vec::with_capacity(pages.len());
-        for page_no in pages {
-            let Ok(page) = self.doc.load_page(page_no as i32) else {
-                continue;
-            };
-            let Ok(bounds) = page.bounds() else {
-                continue;
-            };
-            let (width, height) = rotated_size(&bounds, self.rotation);
-            let scale = BOOK_SAMPLE_SIZE / width.max(height).max(1.0);
-            let ctm = self.ctm_for(&bounds, scale);
-            let Ok(pixmap) = page.to_pixmap(&ctm, &Colorspace::device_rgb(), false, true) else {
-                continue;
-            };
-            let bitmap = bitmap_from_pixmap(&pixmap);
-            let position = if count > 1 {
-                page_no as f64 / (count - 1) as f64
-            } else {
-                0.5
-            };
-            samples.push((position, sample_page_background(&bitmap)));
+        let budget = book_color::sample_budget(count);
+        if budget <= 0.0 {
+            return DEFAULT_WINDOW;
         }
-        lagrange_color(&samples)
+        let lower = budget.floor().max(1.0) as usize;
+        let upper = (lower + 1).min(count.max(1));
+        let fraction = (budget - lower as f64).clamp(0.0, 1.0);
+        let mut cache = BTreeMap::new();
+        let low = self.sampled_canvas(count, lower, &mut cache);
+        if fraction <= f64::EPSILON || upper <= lower {
+            low
+        } else {
+            let high = self.sampled_canvas(count, upper, &mut cache);
+            book_color::mix(low, high, fraction)
+        }
+    }
+
+    /// Average the canvas colors of one sampling scheme across the book.
+    fn sampled_canvas(
+        &self,
+        page_count: usize,
+        samples: usize,
+        cache: &mut BTreeMap<usize, u32>,
+    ) -> u32 {
+        let mut points = Vec::with_capacity(samples);
+        for (page_no, position) in book_color::sample_pages(page_count, samples) {
+            let color = *cache
+                .entry(page_no)
+                .or_insert_with(|| self.preview_color(page_no).unwrap_or(0x00ff_ffff));
+            points.push((position, color));
+        }
+        book_color::soft_color(&points)
+    }
+
+    /// Render one page at preview size and reduce it to its canvas color.
+    fn preview_color(&self, page_no: usize) -> Option<u32> {
+        let page = self.doc.load_page(page_no as i32).ok()?;
+        let bounds = page.bounds().ok()?;
+        let (width, height) = rotated_size(&bounds, self.rotation);
+        let scale = BOOK_SAMPLE_SIZE / width.max(height).max(1.0);
+        let ctm = self.ctm_for(&bounds, scale);
+        let pixmap = page
+            .to_pixmap(&ctm, &Colorspace::device_rgb(), false, true)
+            .ok()?;
+        Some(sample_page_background(&bitmap_from_pixmap(&pixmap)))
     }
 
     pub fn clear_search(&mut self) {
@@ -1747,24 +1767,6 @@ fn rotated_size(bounds: &Rect, rotation: u16) -> (f32, f32) {
     }
 }
 
-/// Page numbers spread evenly across the book, used for the theme sample.
-/// Sampling bin centers avoids giving the cover or the last page extra weight.
-fn book_sample_pages(count: usize) -> Vec<usize> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let wanted = BOOK_SAMPLE_PAGES.min(count);
-    let mut pages = Vec::with_capacity(wanted);
-    for slot in 0..wanted {
-        let fraction = (slot as f64 + 0.5) / wanted as f64;
-        let page = ((fraction * count as f64) as usize).min(count - 1);
-        if pages.last().copied() != Some(page) {
-            pages.push(page);
-        }
-    }
-    pages
-}
-
 /// Pick a representative canvas color from one rendered page. The top-left
 /// pixel can belong to a cover or an embedded image, so sample the border
 /// instead: a text page's margins are its background, and even a full-bleed
@@ -1800,59 +1802,6 @@ fn sample_page_background(bitmap: &PageBitmap) -> u32 {
         .max_by_key(|&(color, count)| (count, std::cmp::Reverse(color)))
         .map(|(color, _)| color)
         .unwrap_or(0x00ff_ffff)
-}
-
-/// Interpolate the book-wide canvas color with a Lagrange polynomial over the
-/// sampled page positions, evaluated at the middle of the book. The barycentric
-/// form avoids expanding the polynomial; each RGB channel is interpolated
-/// separately and clamped back to the 8-bit range.
-fn lagrange_color(samples: &[(f64, u32)]) -> u32 {
-    const AT: f64 = 0.5;
-    match samples {
-        [] => 0x00ff_ffff,
-        [(_, color)] => *color,
-        _ => {
-            let mut weights = Vec::with_capacity(samples.len());
-            for (index, (x, _)) in samples.iter().enumerate() {
-                let mut denominator = 1.0;
-                for (other, (other_x, _)) in samples.iter().enumerate() {
-                    if index != other {
-                        denominator *= x - other_x;
-                    }
-                }
-                if denominator.abs() < 1.0e-12 {
-                    return samples[0].1;
-                }
-                weights.push(1.0 / denominator);
-            }
-            let mut terms = Vec::with_capacity(samples.len());
-            let mut sum = 0.0;
-            for (weight, (x, color)) in weights.iter().zip(samples) {
-                let distance = AT - x;
-                // The evaluation point is normally between samples. A very
-                // short book with an odd page count can put a sample exactly
-                // in the middle; that page is its canvas.
-                if distance.abs() < 1.0e-12 {
-                    return *color;
-                }
-                let term = weight / distance;
-                terms.push(term);
-                sum += term;
-            }
-            if sum.abs() < 1.0e-12 {
-                return samples[0].1;
-            }
-            let mut channels = [0.0f64; 3];
-            for (term, (_, color)) in terms.iter().zip(samples) {
-                let weight = term / sum;
-                channels[0] += weight * f64::from((color >> 16) & 0xff);
-                channels[1] += weight * f64::from((color >> 8) & 0xff);
-                channels[2] += weight * f64::from(color & 0xff);
-            }
-            let channel = |value: f64| value.round().clamp(0.0, 255.0) as u32;
-            (channel(channels[0]) << 16) | (channel(channels[1]) << 8) | channel(channels[2])
-        }
-    }
 }
 
 fn fit_page_scale(page_w: f32, page_h: f32, available_w: f32, available_h: f32) -> f32 {
@@ -2810,44 +2759,6 @@ mod tests {
         assert_eq!(layer.text_for_range(0, 2), "Hi\nx");
         assert_eq!(layer.text_for_range(2, 0), "Hi\nx");
         assert_eq!(layer.text_for_range(99, 99), "x");
-    }
-
-    #[test]
-    fn book_samples_span_the_document_without_duplicates() {
-        assert_eq!(book_sample_pages(0), Vec::<usize>::new());
-        assert_eq!(book_sample_pages(1), vec![0]);
-        assert_eq!(book_sample_pages(3), vec![0, 1, 2]);
-
-        let pages = book_sample_pages(200);
-        assert_eq!(pages.len(), BOOK_SAMPLE_PAGES);
-        assert!(pages[0] < 20, "the first sample starts near the front");
-        assert!(
-            pages[pages.len() - 1] > 180,
-            "the last sample reaches the back"
-        );
-        assert!(pages.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
-    #[test]
-    fn lagrange_color_reproduces_a_linear_channel_ramp() {
-        // Red rises linearly from 0 to 200. Lagrange interpolation is exact
-        // for linear data, so the middle of the book is 100.
-        let samples = [
-            (0.0, 0x0000_0000),
-            (1.0 / 3.0, 0x0032_0000),
-            (2.0 / 3.0, 0x0096_0000),
-            (1.0, 0x00c8_0000),
-        ];
-        assert_eq!(lagrange_color(&samples), 0x0064_0000);
-    }
-
-    #[test]
-    fn lagrange_color_keeps_a_uniform_book_unchanged() {
-        let color = 0x004a_5b6c;
-        let samples = [(0.1, color), (0.35, color), (0.65, color), (0.9, color)];
-        assert_eq!(lagrange_color(&samples), color);
-        assert_eq!(lagrange_color(&[]), 0x00ff_ffff);
-        assert_eq!(lagrange_color(&[(0.5, color)]), color);
     }
 
     #[test]

@@ -198,13 +198,20 @@ properties override individual parts:
 If the CSS contains no colors, the UI follows the document: it starts from the
 HTML default canvas (a white page with dark text) and derives one palette from
 the whole book. Pages spread evenly through the document are sampled at a
-small preview size, their canvas colors are reduced to one color with a
-Lagrange interpolation over page position, and the result is kept for the whole
-book. A cover, an embedded image, or a PDF page with different colors therefore
-cannot flip the shell while reading. A CSS file that only sets `font-family`
-matches the book instead of forcing a dark shell. A light background
-automatically derives dark text and a darker selected-text color, keeping
-outline and menu selections readable without adding a hue.
+small preview size and their canvas colors are joined with a Lagrange
+interpolation over page position. The color is read through a soft window
+around the middle of the book, and the target sample count grows continuously
+with the book length, blending adjacent counts by the fractional part, so
+re-layouts and page-count changes do not make the palette jump. The result is
+kept for the whole book; a cover, an embedded image, or a PDF page with
+different colors therefore cannot flip the shell while reading. The
+interpolation itself lives in a small module that knows nothing about themes or
+the optional eye-comfort palette — consumers decide whether to derive the UI
+theme from the color, feed it to the palette, or only tint the outline. A CSS
+file that only sets `font-family` matches the book instead of forcing a dark
+shell. A light background automatically derives dark text and a darker
+selected-text color, keeping outline and menu selections readable without
+adding a hue.
 
 Keys are space-separated sequences; `C-`, `M-`, and `S-` are Control, Alt, and
 Shift. Bindings replace the built-in action, and an empty array disables it.
@@ -239,8 +246,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   and color supply the base, with `--mureader-*` custom properties for
   per-surface overrides; when the CSS names no colors the theme is derived once
   from pages sampled across the whole book and Lagrange-interpolated in page
-  order, starting from the HTML default white canvas, so embedded images and
-  PDFs keep a single palette for the whole book.
+  order over a soft window near the middle, with the sample budget easing
+  continuously with the book length, starting from the HTML default white
+  canvas, so embedded images and PDFs keep a single palette for the whole book.
+  The sampler is isolated from the optional eye-comfort palette and only
+  supplies a color that the palette may consume when enabled.
 - Added an optional HPLuv `perfect-palette` eye-comfort theme. It derives the
   page paper, ink, accent, search, and selection colors from the existing
   window, text, and accent hue family, and the UI follows the tuned theme.

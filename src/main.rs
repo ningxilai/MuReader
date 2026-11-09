@@ -16,6 +16,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod activation;
+mod book_color;
 mod clipboard;
 mod config;
 mod document;
@@ -4165,6 +4166,27 @@ mod tests {
         let (css, theme) = configured_styles(&config);
         assert_eq!(css, config.reflowable_css());
         assert_eq!(theme, Theme::from_css(css.as_deref()));
+    }
+
+    #[test]
+    fn interpolated_book_color_can_drive_theme_and_palette() {
+        // `book_color` is isolated from both mechanisms, but its result is an
+        // ordinary color: the UI can derive a theme from it, and the optional
+        // eye-comfort palette can then tune that theme.
+        let samples = [
+            (0.05, 0x00f2_e8d5),
+            (0.35, 0x00f4_ead8),
+            (0.65, 0x00f1_e7d4),
+            (0.95, 0x00f3_e9d6),
+        ];
+        let background = book_color::soft_color(&samples);
+        let theme = Theme::from_document(background);
+        assert_eq!(theme.window, background);
+
+        let mut config = Config::default();
+        config.perfect_palette.enable = true;
+        let palette = palette::tune(theme, config.perfect_palette.options());
+        assert!(!palette::css(&palette).is_empty());
     }
 
     #[test]
