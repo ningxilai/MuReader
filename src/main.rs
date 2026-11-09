@@ -455,6 +455,9 @@ struct App {
     outline_preview: Option<PendingOutlinePreview>,
     /// Page shown before the outline started previewing other entries.
     outline_preview_origin: Option<usize>,
+    /// Outline entry that contains the origin page. Selecting it again returns
+    /// to that exact page instead of the entry's own first page.
+    outline_origin_entry: Option<usize>,
     page: usize,
     pages: Vec<usize>,
     page_widths: Vec<u32>,
@@ -573,6 +576,7 @@ impl App {
             outline_scroll: 0.0,
             outline_preview: None,
             outline_preview_origin: None,
+            outline_origin_entry: None,
             page: 1,
             pages: Vec::new(),
             page_widths: Vec::new(),
@@ -1070,6 +1074,7 @@ impl App {
         self.outline_open = false;
         self.outline_requested = None;
         self.outline_bitmap_selected = None;
+        self.outline_origin_entry = None;
         self.spread_blocked = false;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
@@ -1108,11 +1113,12 @@ impl App {
         if self.outline_preview_origin.is_none() {
             return;
         }
-        let Some(page) = self
-            .outline
-            .get(self.outline_selected)
-            .and_then(|entry| entry.page)
-        else {
+        let Some(page) = outline_target_page(
+            &self.outline,
+            self.outline_selected,
+            self.outline_origin_entry,
+            self.outline_preview_origin,
+        ) else {
             return;
         };
         if page == self.page || !outline_preview_allowed(self.page_fit, self.bitmap.as_ref()) {
@@ -1127,10 +1133,12 @@ impl App {
     fn activate_outline(&mut self) {
         self.finish_animation();
         self.outline_preview = None;
-        let page = self
-            .outline
-            .get(self.outline_selected)
-            .and_then(|entry| entry.page);
+        let page = outline_target_page(
+            &self.outline,
+            self.outline_selected,
+            self.outline_origin_entry,
+            self.outline_preview_origin,
+        );
         if let Some(page) = page {
             if let Some(origin) = self.outline_preview_origin.take() {
                 if origin != page {
@@ -1474,10 +1482,14 @@ impl App {
             if entry.title.chars().count() > 80 {
                 title.push('…');
             }
-            let page = entry
-                .page
-                .map(|page| format!(" — p. {page}"))
-                .unwrap_or_default();
+            let page = outline_target_page(
+                &self.outline,
+                index,
+                self.outline_origin_entry,
+                self.outline_preview_origin,
+            )
+            .map(|page| format!(" — p. {page}"))
+            .unwrap_or_default();
             window.set_title(&format!(
                 "{name} — Outline {}/{}{page} — {title}",
                 index + 1,
@@ -2405,15 +2417,15 @@ impl App {
         self.outline_preview = None;
         self.outline_requested = None;
         self.outline_bitmap_selected = None;
-        self.outline_selected = self
-            .outline
-            .iter()
-            .position(|entry| matches!(entry.page, Some(page) if page >= self.page))
-            .unwrap_or_else(|| self.outline.len().saturating_sub(1));
         // Remember where the reader was so Escape can undo live previews.
         if self.outline_preview_origin.is_none() {
             self.outline_preview_origin = Some(self.page);
         }
+        // Select the chapter that contains the current page and remember it,
+        // so focusing another chapter and coming back returns to this page.
+        let origin_page = self.outline_preview_origin.unwrap_or(self.page);
+        self.outline_origin_entry = outline_entry_for_page(&self.outline, origin_page);
+        self.outline_selected = outline_selection_for_page(&self.outline, origin_page);
         self.outline_open = true;
         self.pending_zooms.clear();
         self.last_requested_scale = self.scale;
@@ -2758,15 +2770,15 @@ impl App {
                     if self.outline_open {
                         self.outline_open = false;
                         self.outline_preview = None;
+                        self.outline_preview_origin = None;
+                        self.outline_origin_entry = None;
                         self.send_viewport();
                     }
                 } else if self.outline_open {
                     self.outline_preview = None;
-                    self.outline_selected = self
-                        .outline
-                        .iter()
-                        .position(|entry| matches!(entry.page, Some(page) if page >= self.page))
-                        .unwrap_or_else(|| self.outline.len().saturating_sub(1));
+                    let origin_page = self.outline_preview_origin.unwrap_or(self.page);
+                    self.outline_origin_entry = outline_entry_for_page(&self.outline, origin_page);
+                    self.outline_selected = outline_selection_for_page(&self.outline, origin_page);
                     self.ensure_outline_visible();
                 }
                 self.update_title();
@@ -3508,6 +3520,42 @@ fn outline_window_request(
     Some((start, count))
 }
 
+/// Index of the outline entry that contains `page`: the last entry whose
+/// chapter starts at or before it. Returns `None` for pages before the first
+/// chapter. Keeping this distinct from the selected entry means a page in the
+/// middle of a chapter stays attached to that chapter instead of the next one.
+fn outline_entry_for_page(outline: &[OutlineEntry], page: usize) -> Option<usize> {
+    outline
+        .iter()
+        .rposition(|entry| matches!(entry.page, Some(entry_page) if entry_page <= page))
+}
+
+/// Entry to highlight when the outline opens. Pages before the first chapter
+/// select the first chapter, whose own page is then the navigation target.
+fn outline_selection_for_page(outline: &[OutlineEntry], page: usize) -> usize {
+    outline_entry_for_page(outline, page)
+        .or_else(|| outline.iter().position(|entry| entry.page.is_some()))
+        .unwrap_or(0)
+}
+
+/// Page to show for an outline entry. The entry that contains the page where
+/// the outline was opened resolves to that remembered page, so leaving the
+/// chapter and coming back does not drop the reader at the chapter's first
+/// page.
+fn outline_target_page(
+    outline: &[OutlineEntry],
+    index: usize,
+    origin_entry: Option<usize>,
+    origin_page: Option<usize>,
+) -> Option<usize> {
+    if origin_entry == Some(index) {
+        if let Some(origin) = origin_page {
+            return Some(origin);
+        }
+    }
+    outline.get(index).and_then(|entry| entry.page)
+}
+
 /// Live previews are cheap at fit-page scale. At an explicit zoom the page
 /// bitmap can already be huge, so only preview while it stays modest.
 fn outline_preview_allowed(fit: Fit, bitmap: Option<&PageBitmap>) -> bool {
@@ -3851,6 +3899,74 @@ mod tests {
         assert_eq!((start, count), (0, 10));
         assert_eq!(
             outline_window_request(10, 0.0, 900, OUTLINE_ROW_HEIGHT, start, count),
+            None
+        );
+    }
+
+    fn outline_entries() -> Vec<OutlineEntry> {
+        vec![
+            OutlineEntry {
+                title: "one".to_string(),
+                page: Some(1),
+                depth: 0,
+            },
+            OutlineEntry {
+                title: "two".to_string(),
+                page: Some(100),
+                depth: 0,
+            },
+            OutlineEntry {
+                title: "three".to_string(),
+                page: Some(200),
+                depth: 0,
+            },
+        ]
+    }
+
+    #[test]
+    fn outline_entry_is_the_chapter_containing_the_page() {
+        let outline = outline_entries();
+        assert_eq!(outline_entry_for_page(&outline, 1), Some(0));
+        assert_eq!(outline_entry_for_page(&outline, 99), Some(0));
+        assert_eq!(outline_entry_for_page(&outline, 100), Some(1));
+        assert_eq!(outline_entry_for_page(&outline, 105), Some(1));
+        assert_eq!(outline_entry_for_page(&outline, 250), Some(2));
+        // Before the first chapter there is no containing entry, so opening
+        // selects the first chapter and targets its own page.
+        assert_eq!(outline_entry_for_page(&outline, 0), None);
+        assert_eq!(outline_selection_for_page(&outline, 0), 0);
+        assert_eq!(outline_target_page(&outline, 0, None, Some(0)), Some(1));
+    }
+
+    #[test]
+    fn outline_origin_entry_keeps_the_page_inside_the_chapter() {
+        let outline = outline_entries();
+        let origin = outline_entry_for_page(&outline, 105).unwrap();
+        assert_eq!(origin, 1);
+
+        // The origin entry resolves to the exact page where the outline
+        // opened, while other entries keep their own destination.
+        assert_eq!(
+            outline_target_page(&outline, origin, Some(origin), Some(105)),
+            Some(105)
+        );
+        assert_eq!(
+            outline_target_page(&outline, 2, Some(origin), Some(105)),
+            Some(200)
+        );
+
+        // Focusing another chapter and returning must not fall back to the
+        // origin chapter's first page.
+        let _ = outline_target_page(&outline, 2, Some(origin), Some(105));
+        assert_eq!(
+            outline_target_page(&outline, origin, Some(origin), Some(105)),
+            Some(105)
+        );
+
+        // Without a remembered origin the entry's own page is used.
+        assert_eq!(outline_target_page(&outline, origin, None, None), Some(100));
+        assert_eq!(
+            outline_target_page(&outline, 99, Some(origin), Some(105)),
             None
         );
     }
