@@ -23,7 +23,11 @@ use crate::UserEvent;
 
 pub enum Command {
     Viewport(u32, u32),
-    SetSpread(bool),
+    /// Select the reading model: a two-page spread (paged) or the
+    /// single-column continuous scroll.
+    SetLayout {
+        spread: bool,
+    },
     SetBackground(u32),
     Open {
         path: PathBuf,
@@ -32,12 +36,15 @@ pub enum Command {
         pretty: bool,
         page: Option<usize>,
         background: u32,
+        spread: bool,
     },
     NextPage,
     PrevPage,
     FirstPage,
     LastPage,
     GotoPage(usize),
+    /// Re-center a scroll strip without treating it as a page jump.
+    ScrollTo(usize),
     ZoomIn,
     ZoomOut,
     FontScale(f32),
@@ -62,7 +69,7 @@ pub enum Command {
 }
 
 pub enum Event {
-    Page(RenderedPage),
+    Page(Box<RenderedPage>),
     Outline(Vec<OutlineEntry>),
     OutlineBitmap {
         start: usize,
@@ -128,9 +135,9 @@ fn run(
                     }
                 }
             }
-            Command::SetSpread(spread) => {
+            Command::SetLayout { spread } => {
                 if let Some(engine) = engine.as_mut() {
-                    engine.set_spread(spread);
+                    engine.set_layout(spread);
                     render_and_send(engine, &proxy);
                 }
             }
@@ -147,6 +154,7 @@ fn run(
                 pretty,
                 page,
                 background,
+                spread,
             } => {
                 let mut opened = match RenderEngine::open(&path, fonts, css, pretty) {
                     Ok(engine) => engine,
@@ -157,6 +165,7 @@ fn run(
                 };
                 opened.set_background(background);
                 opened.set_viewport(viewport.0, viewport.1);
+                opened.set_layout(spread);
                 if let Some(page) = page {
                     opened.goto_page(page);
                 }
@@ -200,6 +209,13 @@ fn run(
             Command::GotoPage(page) => {
                 if let Some(engine) = engine.as_mut() {
                     if engine.goto_page(page) {
+                        render_and_send(engine, &proxy);
+                    }
+                }
+            }
+            Command::ScrollTo(page) => {
+                if let Some(engine) = engine.as_mut() {
+                    if engine.scroll_to(page) {
                         render_and_send(engine, &proxy);
                     }
                 }
@@ -259,7 +275,8 @@ fn run(
                     cancel.store(false, Ordering::Relaxed);
                     match engine.search(&query, scope, &cancel) {
                         Ok(Some(page)) => {
-                            let _ = proxy.send_event(UserEvent::Worker(Event::Page(page)));
+                            let _ =
+                                proxy.send_event(UserEvent::Worker(Event::Page(Box::new(page))));
                         }
                         Ok(None) => {
                             // A newer command interrupted this search; do not
@@ -323,7 +340,7 @@ fn run(
 fn render_and_send(engine: &mut RenderEngine, proxy: &EventLoopProxy<UserEvent>) {
     match engine.render() {
         Ok(page) => {
-            let _ = proxy.send_event(UserEvent::Worker(Event::Page(page)));
+            let _ = proxy.send_event(UserEvent::Worker(Event::Page(Box::new(page))));
         }
         Err(e) => {
             let _ = proxy.send_event(UserEvent::Worker(Event::Error(e)));

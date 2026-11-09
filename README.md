@@ -146,9 +146,12 @@ window immediately, then re-rendered after the delay. Set it to `0` for the
 fastest response (one frame).
 
 The reader starts in a two-page spread whenever the window fits a comfortable
-pair. `toggle_spread` switches between that spread and a centered single page;
-the choice lasts until it is toggled again, while a narrow window still falls
-back to one page automatically.
+pair. `toggle_spread` switches between that paged spread and a single-column
+continuous scroll. The choice lasts until it is toggled again, while a narrow
+window that cannot fit a comfortable pair uses continuous scroll automatically.
+Page numbers are the shared coordinate: switching modes and following outline,
+search, or link destinations lands at the start of that page, and while
+scrolling the title and progress report the page at the top of the viewport.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -259,9 +262,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   for CSS-styled documents. Previews stay debounced and are skipped for
   oversized zoomed pages.
 - Two-page reading keeps a proportional central gutter that never collapses,
-  and falls back to a single page once each spread page would be too narrow.
-  Press `s` (configurable as `toggle_spread`) to switch to a centered single
-  page and back. The outline overlays the page at full-window layout scale, so
+  and falls back to single-column continuous scroll once each spread page would
+  be too narrow. Press `s` (configurable as `toggle_spread`) to switch between
+  the spread and continuous scroll. Page keys become page jumps in scroll mode,
+  while arrows, `Space`, `PageUp`/`PageDown`, `C-n`/`C-p`, and the wheel scroll
+  continuously. The outline overlays the page at full-window layout scale, so
   opening or closing it no longer triggers a page re-render or layout hitch.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard

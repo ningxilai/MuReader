@@ -169,7 +169,7 @@ const COMMANDS: &[CommandEntry] = &[
         action: Action::ResetView,
     },
     CommandEntry {
-        label: "Toggle single page",
+        label: "Toggle continuous scroll",
         action: Action::ToggleSpread,
     },
     CommandEntry {
@@ -472,6 +472,19 @@ struct App {
     rotation: u16,
     scroll_x: f32,
     scroll_y: f32,
+    /// Continuous-scroll position: the page at the top of the viewport and the
+    /// number of bitmap pixels scrolled past that page's top edge.
+    scroll_anchor: usize,
+    scroll_in_page: f32,
+    /// Geometry of the installed vertical strip.
+    page_offsets: Vec<u32>,
+    page_heights: Vec<u32>,
+    /// True when the installed strip uses the continuous-scroll layout.
+    strip_scroll: bool,
+    /// Set while a strip re-center is in flight so the arriving strip keeps
+    /// the visual position instead of jumping to the page start.
+    scroll_keep_anchor: bool,
+    scroll_recenter_pending: Option<usize>,
     modifiers: ModifiersState,
     prompt: Prompt,
     command_menu: Option<CommandMenu>,
@@ -591,6 +604,13 @@ impl App {
             rotation: 0,
             scroll_x: 0.0,
             scroll_y: 0.0,
+            scroll_anchor: 1,
+            scroll_in_page: 0.0,
+            page_offsets: Vec::new(),
+            page_heights: Vec::new(),
+            strip_scroll: false,
+            scroll_keep_anchor: false,
+            scroll_recenter_pending: None,
             modifiers: ModifiersState::empty(),
             prompt: Prompt::None,
             command_menu: None,
@@ -712,7 +732,11 @@ impl App {
         if !self.outline_open || self.page_fit != Fit::Page {
             return 1.0;
         }
-        let natural = self.visible_width() as f32;
+        let natural = if self.strip_scroll {
+            self.bitmap.as_ref().map_or(0, |bitmap| bitmap.width) as f32
+        } else {
+            self.visible_width() as f32
+        };
         if natural <= 1.0 {
             return 1.0;
         }
@@ -763,7 +787,11 @@ impl App {
         let (viewport_w, _) = self.viewport();
         let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
         let scale = self.display_scale();
-        let page_w = self.visible_width() as f32 * scale;
+        let page_w = if self.strip_scroll {
+            self.bitmap.as_ref().map_or(0, |bitmap| bitmap.width) as f32
+        } else {
+            self.visible_width() as f32
+        } * scale;
         ((page_w - content_w) / 2.0 / scale).max(0.0)
     }
 
@@ -783,7 +811,9 @@ impl App {
     }
 
     fn maybe_enable_spread(&mut self) {
-        if self.spread_active || self.spread_blocked || self.pages.len() >= 2 {
+        // In the scroll layout `pages` always holds a multi-page strip, so
+        // `spread_active` (not the page count) says whether a spread is live.
+        if self.spread_active || self.spread_blocked {
             return;
         }
         if !self.spread_enabled {
@@ -801,35 +831,44 @@ impl App {
         }
 
         self.spread_active = true;
-        self.send(Command::SetSpread(true));
+        self.send(Command::SetLayout { spread: true });
         self.update_title();
     }
 
-    /// Switch between the default two-page spread and a centered single page.
-    /// The choice is a user preference, so single page stays single even after
-    /// the next page arrives. Turning the spread back on clears an automatic
-    /// narrow-window block and asks the worker to re-render a pair.
+    /// Switch between the paged two-page spread and the single-column
+    /// continuous scroll. Page numbers stay the shared coordinate, so the
+    /// current page is preserved across the switch.
     fn toggle_spread(&mut self) {
         self.finish_animation();
+        let reading = self.reading_page();
+        let was_scroll = !self.spread_active;
         self.spread_enabled = !self.spread_enabled;
         self.spread_blocked = false;
+        // Leaving scroll for a paged mode must use the page at the top of the
+        // viewport, not a worker focus page that may not have caught up after
+        // scrolling.
+        if self.spread_enabled && was_scroll && reading != self.page {
+            self.goto_page(reading);
+        }
         if !self.spread_enabled {
             self.spread_active = false;
-            self.send(Command::SetSpread(false));
-            self.status = Some("single page".to_string());
+            self.send(Command::SetLayout { spread: false });
+            self.status = Some("continuous scroll".to_string());
         } else if self.page_fit != Fit::Page {
             // A spread is a fit-to-page layout. Return to fit first; the next
             // page event can then start the spread through the normal path.
             self.spread_active = false;
+            self.send(Command::SetLayout { spread: false });
             self.reset_view();
             self.status = Some("two-page spread".to_string());
         } else if self.spread_can_fit() {
             self.spread_active = true;
-            self.send(Command::SetSpread(true));
+            self.send(Command::SetLayout { spread: true });
             self.status = Some("two-page spread".to_string());
         } else {
             self.spread_active = false;
-            self.status = Some("single page".to_string());
+            self.send(Command::SetLayout { spread: false });
+            self.status = Some("continuous scroll".to_string());
         }
         self.update_title();
         self.request_redraw();
@@ -842,7 +881,7 @@ impl App {
             // path enable the spread again later.
             if self.page_fit != Fit::Page {
                 self.spread_active = false;
-                self.send(Command::SetSpread(false));
+                self.send(Command::SetLayout { spread: false });
                 return;
             }
             if self.pages.len() < 2 {
@@ -867,7 +906,7 @@ impl App {
             if too_narrow {
                 self.spread_active = false;
                 self.spread_blocked = true;
-                self.send(Command::SetSpread(false));
+                self.send(Command::SetLayout { spread: false });
             }
         } else {
             self.maybe_enable_spread();
@@ -879,7 +918,13 @@ impl App {
     fn single_page_width(&self) -> Option<f32> {
         let page = self.bitmap.as_ref()?;
         let page_width = *self.page_widths.get(self.window_index)? as f32;
-        let page_height = page.height as f32;
+        // In scroll mode the bitmap is the whole vertical strip, so its height
+        // is not the focus page's aspect. Use the per-page geometry instead.
+        let page_height = if self.strip_scroll {
+            *self.page_heights.get(self.window_index)? as f32
+        } else {
+            page.height as f32
+        };
         if page_width <= 0.0 || page_height <= 0.0 {
             return None;
         }
@@ -918,7 +963,110 @@ impl App {
         self.resize_preview = true;
     }
 
+    /// True when the semantic reading model is the single-column scroll.
+    fn scroll_mode(&self) -> bool {
+        !self.spread_active
+    }
+
+    /// Page that represents the reading position. Scroll uses the page at the
+    /// top of the viewport; paged mode uses the worker's focus page.
+    fn reading_page(&self) -> usize {
+        if self.scroll_mode() && self.strip_scroll {
+            self.scroll_anchor.max(1)
+        } else {
+            self.page
+        }
+    }
+
+    fn scroll_anchor_index(&self) -> usize {
+        self.pages
+            .iter()
+            .position(|&page| page == self.scroll_anchor)
+            .or_else(|| self.pages.iter().position(|&page| page == self.page))
+            .unwrap_or(0)
+    }
+
+    /// Position of the viewport top inside the strip bitmap, in bitmap pixels.
+    fn scroll_position(&self) -> f32 {
+        self.page_offsets
+            .get(self.scroll_anchor_index())
+            .copied()
+            .unwrap_or(0) as f32
+            + self.scroll_in_page
+    }
+
+    fn set_scroll_position(&mut self, position: f32) {
+        if self.pages.is_empty() || self.page_offsets.is_empty() {
+            return;
+        }
+        let position = position.max(0.0);
+        let mut index = 0;
+        for (slot, offset) in self.page_offsets.iter().enumerate() {
+            if *offset as f32 <= position {
+                index = slot;
+            } else {
+                break;
+            }
+        }
+        self.scroll_anchor = self.pages.get(index).copied().unwrap_or(self.page);
+        self.scroll_in_page = position - self.page_offsets.get(index).copied().unwrap_or(0) as f32;
+    }
+
+    /// Scroll by device pixels. The strip is re-centered around the new top
+    /// page, but the visible position is preserved.
+    fn scroll_document(&mut self, delta: f32) {
+        if !self.strip_scroll || self.pages.is_empty() {
+            return;
+        }
+        let scale = self.display_scale().max(0.001);
+        let position = self.scroll_position() + delta / scale;
+        let (_, viewport_h) = self.viewport();
+        let view_h = viewport_h as f32 / scale;
+        // Clamp to the strip's actual extent so fast scrolling never lands in
+        // blank space past the last rendered page. Crossing a page boundary
+        // re-centers the strip and brings in the missing pages.
+        let strip_bottom = self.page_offsets.last().copied().unwrap_or(0) as f32
+            + self.page_heights.last().copied().unwrap_or(0) as f32;
+        let position = position.clamp(0.0, (strip_bottom - view_h).max(0.0));
+        self.set_scroll_position(position);
+        self.maybe_recenter_scroll();
+        let page = self.reading_page();
+        if !self.outline_open && self.recorded_page != Some(page) {
+            self.progress.record(&self.path, page);
+            self.recorded_page = Some(page);
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Ask the worker for a strip centered on the new top page. The next
+    /// `Page` event keeps the anchor instead of jumping to the page start.
+    fn maybe_recenter_scroll(&mut self) {
+        if !self.strip_scroll || self.pages.len() < 2 {
+            return;
+        }
+        // Only one re-center may be in flight. Sending overlapping requests
+        // would let an older strip arrive after the anchor moved and snap the
+        // viewport back to a page top.
+        if self.scroll_recenter_pending.is_some() {
+            return;
+        }
+        let anchor = self.scroll_anchor;
+        if anchor == self.page {
+            return;
+        }
+        self.scroll_recenter_pending = Some(anchor);
+        self.scroll_keep_anchor = true;
+        self.send(Command::ScrollTo(anchor));
+    }
+
     fn clamp_scroll(&mut self) {
+        if self.strip_scroll {
+            self.scroll_x = self
+                .scroll_x
+                .clamp(-self.max_scroll_x(), self.max_scroll_x());
+            return;
+        }
         self.scroll_y = self
             .scroll_y
             .clamp(self.min_scroll_y(), self.max_scroll_y());
@@ -928,6 +1076,10 @@ impl App {
     }
 
     fn scroll_vertical(&mut self, delta: f32) {
+        if self.scroll_mode() {
+            self.scroll_document(delta);
+            return;
+        }
         self.scroll_y += delta / self.display_scale();
         self.clamp_scroll();
         self.request_redraw();
@@ -950,7 +1102,9 @@ impl App {
     }
 
     fn scroll_down_or_next(&mut self) {
-        if !self.page_fits_height() && self.scroll_y + 0.5 < self.max_scroll_y() {
+        if self.scroll_mode()
+            || (!self.page_fits_height() && self.scroll_y + 0.5 < self.max_scroll_y())
+        {
             self.scroll_down_screen();
         } else {
             self.send(Command::NextPage);
@@ -958,7 +1112,9 @@ impl App {
     }
 
     fn scroll_up_or_prev(&mut self) {
-        if !self.page_fits_height() && self.scroll_y > self.min_scroll_y() + 0.5 {
+        if self.scroll_mode()
+            || (!self.page_fits_height() && self.scroll_y > self.min_scroll_y() + 0.5)
+        {
             self.scroll_up_screen();
         } else {
             self.send(Command::PrevPage);
@@ -1069,6 +1225,7 @@ impl App {
         // A preview may still be in flight, so restore the original page even
         // when `self.page` has not caught up yet.
         if let Some(origin) = self.outline_preview_origin.take() {
+            self.clear_scroll_recenter();
             self.send(Command::GotoPage(origin));
         }
         self.outline_open = false;
@@ -1121,7 +1278,9 @@ impl App {
         ) else {
             return;
         };
-        if page == self.page || !outline_preview_allowed(self.page_fit, self.bitmap.as_ref()) {
+        if page == self.reading_page()
+            || !outline_preview_allowed(self.page_fit, self.bitmap.as_ref())
+        {
             return;
         }
         self.outline_preview = Some(PendingOutlinePreview {
@@ -1145,6 +1304,7 @@ impl App {
                     self.push_history(origin);
                 }
             }
+            self.clear_scroll_recenter();
             self.send(Command::GotoPage(page));
             self.close_outline();
         } else {
@@ -1219,6 +1379,18 @@ impl App {
         if self.pending_turn.is_some() {
             return;
         }
+        if self.scroll_mode() {
+            // In scroll mode page keys are explicit page jumps; the scrolling
+            // keys move continuously instead.
+            let current = self.reading_page();
+            let target = self
+                .page_count
+                .map_or(current + 1, |count| (current + 1).min(count));
+            if target != current {
+                self.goto_page(target);
+            }
+            return;
+        }
         if self.can_slide(TurnDirection::Next) {
             self.start_slide(TurnDirection::Next);
         } else {
@@ -1234,6 +1406,13 @@ impl App {
         if self.pending_turn.is_some() {
             return;
         }
+        if self.scroll_mode() {
+            let current = self.reading_page();
+            if current > 1 {
+                self.goto_page(current - 1);
+            }
+            return;
+        }
         if self.can_slide(TurnDirection::Prev) {
             self.start_slide(TurnDirection::Prev);
         } else {
@@ -1244,19 +1423,59 @@ impl App {
     fn first_page(&mut self) {
         self.finish_animation();
         self.pending_turn = None;
+        self.clear_scroll_recenter();
+        if self.scroll_mode() {
+            self.scroll_to_page_start(1);
+        }
         self.send(Command::FirstPage);
     }
 
     fn last_page(&mut self) {
         self.finish_animation();
         self.pending_turn = None;
+        self.clear_scroll_recenter();
+        if self.scroll_mode() {
+            if let Some(count) = self.page_count {
+                self.scroll_to_page_start(count);
+            }
+        }
         self.send(Command::LastPage);
     }
 
     fn goto_page(&mut self, page: usize) {
         self.finish_animation();
         self.pending_turn = None;
+        self.clear_scroll_recenter();
+        if self.scroll_mode() {
+            let target = self.page_count.map_or(page, |count| page.max(1).min(count));
+            self.scroll_to_page_start(target);
+        }
         self.send(Command::GotoPage(page));
+    }
+
+    /// An explicit destination lands at the top of its page. When the target
+    /// is already inside the strip the worker may not re-render, so reset the
+    /// scroll anchor and repaint locally.
+    fn scroll_to_page_start(&mut self, page: usize) {
+        if !self.strip_scroll || !self.pages.contains(&page) {
+            return;
+        }
+        self.scroll_anchor = page;
+        self.scroll_in_page = 0.0;
+        let reading = self.reading_page();
+        if !self.outline_open && self.recorded_page != Some(reading) {
+            self.progress.record(&self.path, reading);
+            self.recorded_page = Some(reading);
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// A destination jump always lands at a page boundary, even in scroll
+    /// mode, so any in-flight re-center must not preserve the old anchor.
+    fn clear_scroll_recenter(&mut self) {
+        self.scroll_keep_anchor = false;
+        self.scroll_recenter_pending = None;
     }
 
     /// Record a destination jump. Page turns and scrolling do not call this;
@@ -1266,7 +1485,7 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        let Some(page) = self.history.go_back(self.page) else {
+        let Some(page) = self.history.go_back(self.reading_page()) else {
             self.status = Some("no previous location".to_string());
             self.update_title();
             self.request_redraw();
@@ -1279,7 +1498,7 @@ impl App {
     }
 
     fn go_forward(&mut self) {
-        let Some(page) = self.history.go_forward(self.page) else {
+        let Some(page) = self.history.go_forward(self.reading_page()) else {
             self.status = Some("no forward location".to_string());
             self.update_title();
             self.request_redraw();
@@ -1303,8 +1522,9 @@ impl App {
         match target {
             LinkTarget::Page(page) => {
                 let page = self.page_count.map_or(page, |count| page.min(count));
-                if page != self.page {
-                    self.push_history(self.page);
+                let current = self.reading_page();
+                if page != current {
+                    self.push_history(current);
                     self.goto_page(page);
                 }
                 self.status = Some(format!("link → page {page}"));
@@ -1349,6 +1569,7 @@ impl App {
     fn reset_view(&mut self) {
         self.finish_animation();
         self.pending_zooms.clear();
+        self.clear_scroll_recenter();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         // A reset means "fit the page again", so the spread may be eligible
@@ -1393,18 +1614,27 @@ impl App {
     /// The normalized page-space point currently under `screen`.
     fn page_point_at_screen(&self, screen: (f32, f32)) -> Option<(f32, f32)> {
         let page = self.bitmap.as_ref()?;
-        let width = self.visible_width();
-        if width == 0 || page.height == 0 {
+        let scale = self.display_scale();
+        let width = if self.strip_scroll {
+            page.width
+        } else {
+            self.visible_width()
+        };
+        let height = page.height;
+        if width == 0 || height == 0 {
             return None;
         }
-        let scale = self.display_scale();
         let display_w = width as f32 * scale;
-        let display_h = page.height as f32 * scale;
+        let display_h = height as f32 * scale;
         // The screen coordinate must be relative to the visible window, not
         // the whole rendered strip. `page_origin()` points at the strip start
-        // and therefore still includes `spread_offset`.
+        // and therefore still includes the scroll position.
         let window_left = self.page_left_offset(width) as f32 - self.scroll_x * scale;
-        let window_top = self.page_vertical_offset(page.height) as f32 - self.scroll_y * scale;
+        let window_top = if self.strip_scroll {
+            -(self.scroll_position() * scale)
+        } else {
+            self.page_vertical_offset(height) as f32 - self.scroll_y * scale
+        };
         Some((
             (screen.0 - window_left) / display_w,
             (screen.1 - window_top) / display_h,
@@ -1418,19 +1648,29 @@ impl App {
             return;
         };
         let scale = self.display_scale();
-        let width = self.visible_width();
+        let width = if self.strip_scroll {
+            page.width
+        } else {
+            self.visible_width()
+        };
+        let height = page.height;
         let display_w = width as f32 * scale;
-        let display_h = page.height as f32 * scale;
+        let display_h = height as f32 * scale;
         let left = self.page_left_offset(width) as f32;
-        let top = self.page_vertical_offset(page.height) as f32;
         self.scroll_x = (left + point.0 * display_w - screen.0) / scale;
-        self.scroll_y = (top + point.1 * display_h - screen.1) / scale;
+        if self.strip_scroll {
+            self.set_scroll_position((point.1 * display_h - screen.1) / scale);
+        } else {
+            let top = self.page_vertical_offset(height) as f32;
+            self.scroll_y = (top + point.1 * display_h - screen.1) / scale;
+        }
         self.clamp_scroll();
     }
 
     fn rotate(&mut self, right: bool) {
         self.finish_animation();
         self.spread_blocked = false;
+        self.clear_scroll_recenter();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.pending_zooms.clear();
@@ -1503,16 +1743,25 @@ impl App {
             return;
         }
 
-        let start = self.window_index.min(self.pages.len());
-        let visible = &self.pages[start..start + self.visible_page_count()];
-        let page = match (visible.first(), visible.last(), self.page_count) {
-            (Some(first), Some(last), Some(total)) if first != last => {
-                format!("{first}–{last}/{total}")
+        let page = if self.strip_scroll {
+            match self.page_count {
+                Some(total) => format!("{}/{}", self.reading_page(), total),
+                None => self.reading_page().to_string(),
             }
-            (Some(first), _, Some(total)) => format!("{first}/{total}"),
-            (Some(first), Some(last), None) if first != last => format!("{first}–{last}"),
-            (Some(first), _, None) => first.to_string(),
-            _ => self.page.to_string(),
+        } else {
+            let start = self.window_index.min(self.pages.len());
+            let visible = &self.pages[start..start + self.visible_page_count()];
+            match (visible.first(), visible.last(), self.page_count) {
+                (Some(first), Some(last), Some(total)) if first != last => {
+                    format!("{first}–{last}/{total}")
+                }
+                (Some(first), _, Some(total)) => format!("{first}/{total}"),
+                (Some(first), Some(last), None) if first != last => {
+                    format!("{first}–{last}")
+                }
+                (Some(first), _, None) => first.to_string(),
+                _ => self.page.to_string(),
+            }
         };
         let rotation = if self.rotation == 0 {
             String::new()
@@ -2419,11 +2668,13 @@ impl App {
         self.outline_bitmap_selected = None;
         // Remember where the reader was so Escape can undo live previews.
         if self.outline_preview_origin.is_none() {
-            self.outline_preview_origin = Some(self.page);
+            self.outline_preview_origin = Some(self.reading_page());
         }
         // Select the chapter that contains the current page and remember it,
         // so focusing another chapter and coming back returns to this page.
-        let origin_page = self.outline_preview_origin.unwrap_or(self.page);
+        let origin_page = self
+            .outline_preview_origin
+            .unwrap_or_else(|| self.reading_page());
         self.outline_origin_entry = outline_entry_for_page(&self.outline, origin_page);
         self.outline_selected = outline_selection_for_page(&self.outline, origin_page);
         self.outline_open = true;
@@ -2449,6 +2700,13 @@ impl App {
             Prompt::Search(query, scope) => {
                 if !query.is_empty() {
                     self.finish_animation();
+                    // The worker searches from its focus page. In scroll mode
+                    // the reading page is the top of the viewport, which can
+                    // briefly differ from the focus page.
+                    let reading = self.reading_page();
+                    if reading != self.page {
+                        self.goto_page(reading);
+                    }
                     self.status = Some(match scope {
                         SearchScope::Page => "searching this page…".to_string(),
                         SearchScope::Book => "searching the whole book…".to_string(),
@@ -2619,10 +2877,29 @@ impl App {
             self.pending_zooms.pop_front();
         }
 
+        // Scroll positions are stored in bitmap pixels, which scale with the
+        // window. Capture the old geometry so a resize can preserve the
+        // fraction of the page that is scrolled past, not just the raw pixel
+        // offset.
+        let old_strip_scroll = self.strip_scroll;
+        let old_scroll_anchor = self.scroll_anchor;
+        let old_scroll_in_page = self.scroll_in_page;
+        let old_page_height = self
+            .page_heights
+            .get(self.scroll_anchor_index())
+            .copied()
+            .unwrap_or(0) as f32;
+        // A scroll re-center changes the strip pages without being a jump, so
+        // it must not disturb the horizontal pan or an active selection.
+        let scroll_recenter = self.scroll_keep_anchor;
+
         self.page = page.page;
         self.pages = page.pages;
         self.page_widths = page.page_widths;
         self.spread_gap = page.gap;
+        self.strip_scroll = page.scroll;
+        self.page_offsets = page.page_offsets;
+        self.page_heights = page.page_heights;
         self.page_count = page.page_count;
         self.scale = new_scale;
         self.page_fit = page.fit;
@@ -2642,13 +2919,62 @@ impl App {
         self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
         self.window_index = window_index_for(&self.pages, self.page);
-        self.spread_offset = self.normal_offset();
-        if page_changed {
+        self.spread_offset = if self.strip_scroll {
+            0.0
+        } else {
+            self.normal_offset()
+        };
+        if page_changed && !scroll_recenter {
             self.clear_selection();
             self.scroll_x = 0.0;
             self.scroll_y = 0.0;
         } else if let Some((anchor, screen)) = zoom_anchor {
             self.place_page_point(anchor, screen);
+        }
+        if self.strip_scroll {
+            // A re-center, zoom, or resize keeps the visual anchor. A real page
+            // jump resets to the top of the target page, matching paged mode.
+            let keep = (self.scroll_keep_anchor || !page_changed)
+                && self.pages.contains(&self.scroll_anchor);
+            if !keep {
+                self.scroll_anchor = self.page;
+                self.scroll_in_page = 0.0;
+            }
+            let index = self.scroll_anchor_index();
+            // A re-render at a new scale changes the bitmap pixel geometry.
+            // Keep the same fraction of the page under the viewport top so a
+            // resize or re-center does not visibly drift.
+            if zoom_anchor.is_none()
+                && keep
+                && old_strip_scroll
+                && old_scroll_anchor == self.scroll_anchor
+                && old_page_height > 0.0
+            {
+                let new_page_height = self.page_heights.get(index).copied().unwrap_or(0) as f32;
+                if new_page_height > 0.0 {
+                    self.scroll_in_page = old_scroll_in_page * (new_page_height / old_page_height);
+                }
+            }
+            let start = self.page_offsets.get(index).copied().unwrap_or(0) as f32;
+            let next = self
+                .page_offsets
+                .get(index + 1)
+                .copied()
+                .unwrap_or_else(|| page_offsets_end(&self.page_offsets, &self.page_heights, index))
+                as f32;
+            self.scroll_in_page = self.scroll_in_page.clamp(0.0, (next - start).max(0.0));
+            self.scroll_keep_anchor = false;
+            self.scroll_recenter_pending = None;
+            // The reader may have scrolled past this strip while it rendered.
+            // Catch the anchor up now that the previous request is complete.
+            if self.scroll_anchor != self.page {
+                self.maybe_recenter_scroll();
+            }
+        } else {
+            self.scroll_anchor = self.page;
+            self.scroll_in_page = 0.0;
+            self.scroll_keep_anchor = false;
+            self.scroll_recenter_pending = None;
         }
         if self.pending_zooms.is_empty() {
             self.last_requested_scale = new_scale;
@@ -2672,9 +2998,10 @@ impl App {
         self.update_spread_layout();
         // Outline entries are previews until Enter keeps them, so only a
         // settled page belongs in the progress file.
-        if !self.outline_open && self.recorded_page != Some(self.page) {
-            self.progress.record(&self.path, self.page);
-            self.recorded_page = Some(self.page);
+        let reading_page = self.reading_page();
+        if !self.outline_open && self.recorded_page != Some(reading_page) {
+            self.progress.record(&self.path, reading_page);
+            self.recorded_page = Some(reading_page);
         }
         self.update_title();
         self.request_redraw();
@@ -2762,7 +3089,7 @@ impl App {
     fn handle_worker_event(&mut self, event_loop: &ActiveEventLoop, event: WorkerEvent) {
         match event {
             WorkerEvent::Page(page) => {
-                self.handle_page(page);
+                self.handle_page(*page);
             }
             WorkerEvent::Outline(entries) => {
                 self.outline = entries;
@@ -2776,7 +3103,9 @@ impl App {
                     }
                 } else if self.outline_open {
                     self.outline_preview = None;
-                    let origin_page = self.outline_preview_origin.unwrap_or(self.page);
+                    let origin_page = self
+                        .outline_preview_origin
+                        .unwrap_or_else(|| self.reading_page());
                     self.outline_origin_entry = outline_entry_for_page(&self.outline, origin_page);
                     self.outline_selected = outline_selection_for_page(&self.outline, origin_page);
                     self.ensure_outline_visible();
@@ -2844,6 +3173,12 @@ impl App {
     fn page_origin(&self) -> Option<(i32, i32)> {
         let bitmap = self.bitmap.as_ref()?;
         let scale = self.display_scale();
+        if self.strip_scroll {
+            return Some((
+                self.page_left_offset(bitmap.width) - (self.scroll_x * scale).round() as i32,
+                -((self.scroll_position() * scale).round() as i32),
+            ));
+        }
         let visible = self.visible_width();
         Some((
             self.page_left_offset(visible)
@@ -2867,6 +3202,12 @@ impl App {
         let (x0, y0) = self.page_origin()?;
         let x = (position.x as f32 - x0 as f32) / scale;
         let y = (position.y as f32 - y0 as f32) / scale;
+        if self.strip_scroll {
+            if x < 0.0 || x >= page.width as f32 || y < 0.0 || y >= page.height as f32 {
+                return None;
+            }
+            return Some((x, y));
+        }
         let left = self.spread_offset;
         let right = left + self.visible_width() as f32;
         if x < left || x >= right || y < 0.0 || y >= page.height as f32 {
@@ -3032,6 +3373,51 @@ impl App {
         }
     }
 
+    /// Paint search highlights and the text selection on top of a rendered
+    /// page or scroll strip. `origin_x`/`y0` are the bitmap's top-left on
+    /// screen and `scale` converts bitmap pixels to device pixels.
+    fn draw_text_overlays(
+        &self,
+        list: &mut DrawList,
+        origin_x: i32,
+        y0: i32,
+        scale: f32,
+        clip: Rect,
+    ) {
+        let scaled = |value: u32| (value as f32 * scale).round() as i32;
+        for highlight in &self.highlights {
+            list.solid(
+                Rect::new(
+                    origin_x + scaled(highlight.x0),
+                    y0 + scaled(highlight.y0),
+                    (scaled(highlight.x1) - scaled(highlight.x0)).max(1),
+                    (scaled(highlight.y1) - scaled(highlight.y0)).max(1),
+                ),
+                rgb(self.theme.search_highlight, self.theme.search_alpha),
+                clip,
+            );
+        }
+
+        if let Some(selection) = self.selection {
+            let (start, end) = selection.bounds();
+            if start < self.text.chars.len() {
+                let end = end.min(self.text.chars.len() - 1);
+                for ch in &self.text.chars[start..=end] {
+                    list.solid(
+                        Rect::new(
+                            origin_x + scaled(ch.rect.x0),
+                            y0 + scaled(ch.rect.y0),
+                            (scaled(ch.rect.x1) - scaled(ch.rect.x0)).max(1),
+                            (scaled(ch.rect.y1) - scaled(ch.rect.y0)).max(1),
+                        ),
+                        rgb(self.theme.selection_highlight, self.theme.selection_alpha),
+                        clip,
+                    );
+                }
+            }
+        }
+    }
+
     fn draw(&mut self) {
         self.tick_animation();
         let Some(window) = self.window.clone() else {
@@ -3054,7 +3440,7 @@ impl App {
         let full = Rect::new(0, 0, vw, vh);
         let mut list = DrawList::new();
 
-        if self.resize_preview {
+        if self.resize_preview && !self.strip_scroll {
             if let Some(page) = self.bitmap.as_ref() {
                 let visible = self.visible_width().max(1) as f32;
                 let content_w = (vw - content_left).max(1) as f32;
@@ -3073,50 +3459,39 @@ impl App {
                 );
             }
         } else if let Some(page) = self.bitmap.as_ref() {
-            let scale = self.display_scale();
-            let bw = (page.width as f32 * scale).round().max(1.0) as i32;
-            let bh = (page.height as f32 * scale).round().max(1.0) as i32;
-            let visible_width = self.visible_width() as i32;
-            let display_width = (visible_width as f32 * scale).round().max(1.0) as i32;
-            let window_left = page_left_offset(viewport, content_left, display_width as u32)
-                - (self.scroll_x * scale).round() as i32;
-            let origin_x = window_left - (self.spread_offset * scale).round() as i32;
-            let y0 =
-                self.page_vertical_offset(page.height) - (self.scroll_y * scale).round() as i32;
-            let clip = Rect::new(window_left, 0, display_width, vh);
-            list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
-
-            let scaled = |value: u32| (value as f32 * scale).round() as i32;
-            for highlight in &self.highlights {
-                list.solid(
-                    Rect::new(
-                        origin_x + scaled(highlight.x0),
-                        y0 + scaled(highlight.y0),
-                        (scaled(highlight.x1) - scaled(highlight.x0)).max(1),
-                        (scaled(highlight.y1) - scaled(highlight.y0)).max(1),
-                    ),
-                    rgb(self.theme.search_highlight, self.theme.search_alpha),
-                    clip,
-                );
-            }
-
-            if let Some(selection) = self.selection {
-                let (start, end) = selection.bounds();
-                if start < self.text.chars.len() {
-                    let end = end.min(self.text.chars.len() - 1);
-                    for ch in &self.text.chars[start..=end] {
-                        list.solid(
-                            Rect::new(
-                                origin_x + scaled(ch.rect.x0),
-                                y0 + scaled(ch.rect.y0),
-                                (scaled(ch.rect.x1) - scaled(ch.rect.x0)).max(1),
-                                (scaled(ch.rect.y1) - scaled(ch.rect.y0)).max(1),
-                            ),
-                            rgb(self.theme.selection_highlight, self.theme.selection_alpha),
-                            clip,
-                        );
-                    }
-                }
+            if self.strip_scroll {
+                // The strip is already laid out top-to-bottom at the reading
+                // scale. A resize preview only needs a width fit; normal
+                // frames draw at the worker's scale and scroll through the
+                // strip via the saved anchor.
+                let content_w = (vw - content_left).max(1);
+                let scale = if self.resize_preview {
+                    (content_w as f32 / page.width.max(1) as f32).max(0.01)
+                } else {
+                    self.display_scale()
+                };
+                let bw = (page.width as f32 * scale).round().max(1.0) as i32;
+                let bh = (page.height as f32 * scale).round().max(1.0) as i32;
+                let origin_x =
+                    content_left + ((content_w - bw) / 2) - (self.scroll_x * scale).round() as i32;
+                let y0 = -(self.scroll_position() * scale).round() as i32;
+                let clip = Rect::new(content_left, 0, content_w, vh);
+                list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
+                self.draw_text_overlays(&mut list, origin_x, y0, scale, clip);
+            } else {
+                let scale = self.display_scale();
+                let bw = (page.width as f32 * scale).round().max(1.0) as i32;
+                let bh = (page.height as f32 * scale).round().max(1.0) as i32;
+                let visible_width = self.visible_width() as i32;
+                let display_width = (visible_width as f32 * scale).round().max(1.0) as i32;
+                let window_left = page_left_offset(viewport, content_left, display_width as u32)
+                    - (self.scroll_x * scale).round() as i32;
+                let origin_x = window_left - (self.spread_offset * scale).round() as i32;
+                let y0 =
+                    self.page_vertical_offset(page.height) - (self.scroll_y * scale).round() as i32;
+                let clip = Rect::new(window_left, 0, display_width, vh);
+                list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
+                self.draw_text_overlays(&mut list, origin_x, y0, scale, clip);
             }
         }
 
@@ -3287,6 +3662,7 @@ impl ApplicationHandler<UserEvent> for App {
             pretty: self.pretty_text,
             page: self.resume_page,
             background: self.theme.window,
+            spread: self.spread_active,
         });
         self.worker = Some(worker);
 
@@ -3357,8 +3733,9 @@ impl ApplicationHandler<UserEvent> for App {
             let preview = self.outline_preview.take().expect("outline preview is due");
             if self.outline_open
                 && self.outline_preview_origin.is_some()
-                && preview.page != self.page
+                && preview.page != self.reading_page()
             {
+                self.clear_scroll_recenter();
                 self.send(Command::GotoPage(preview.page));
             }
         }
@@ -3587,6 +3964,14 @@ fn window_index_for(pages: &[usize], page: usize) -> usize {
         .iter()
         .position(|&candidate| candidate == page)
         .unwrap_or(0)
+}
+
+/// Bottom edge of a page inside a vertical scroll strip, used when the next
+/// page's offset is unavailable (the last page of the strip).
+fn page_offsets_end(offsets: &[u32], heights: &[u32], index: usize) -> u32 {
+    let offset = offsets.get(index).copied().unwrap_or(0);
+    let height = heights.get(index).copied().unwrap_or(0);
+    offset.saturating_add(height)
 }
 
 #[cfg(test)]

@@ -61,6 +61,18 @@ pub fn spread_gap(page_width: u32) -> u32 {
     ((page_width as f32 * SPREAD_GAP_RATIO).floor() as u32).max(1)
 }
 
+/// Pages kept in a scroll strip. One page behind and two ahead keep scrolling
+/// in both directions seamless without making an enormous texture.
+const SCROLL_STRIP_PAGES: usize = 4;
+/// Cap the strip so it stays within common GPU texture limits. The automatic
+/// width fit shrinks slightly for extreme aspect ratios instead of failing.
+const SCROLL_STRIP_MAX_HEIGHT: f32 = 8192.0;
+
+/// Vertical breathing room between pages in the scroll strip.
+pub fn scroll_gap(page_width: u32) -> u32 {
+    (page_width / 100).clamp(8, 24)
+}
+
 /// Left padding for outline titles. It also keeps the selection rail clear of
 /// the first glyph.
 const OUTLINE_TEXT_PADDING: usize = 12;
@@ -296,6 +308,13 @@ pub struct RenderedPage {
     pub highlights: Vec<HighlightRect>,
     pub links: Vec<RenderedLink>,
     pub text: TextLayer,
+    /// True when the strip is a vertical continuous-scroll layout rather than a
+    /// horizontal page or spread.
+    pub scroll: bool,
+    /// Geometry of each page inside the strip bitmap. Only meaningful for a
+    /// scroll strip; paged layouts also fill them for completeness.
+    pub page_offsets: Vec<u32>,
+    pub page_heights: Vec<u32>,
     /// Text-size multiplier for reflowable documents. For fixed-layout
     /// documents this stays at 1.0; page zoom is used instead.
     pub font_scale: f32,
@@ -341,6 +360,8 @@ pub struct RenderEngine {
     reflowable: bool,
     rotation: u16,
     spread: bool,
+    /// Single-column continuous scroll. Mutually exclusive with `spread`.
+    scroll: bool,
     viewport: (u32, u32),
     search_query: Option<String>,
     outline: Vec<OutlineEntry>,
@@ -427,6 +448,7 @@ impl RenderEngine {
             reflowable,
             rotation: 0,
             spread: false,
+            scroll: false,
             viewport: (1100, 900),
             search_query: None,
             outline,
@@ -573,8 +595,29 @@ impl RenderEngine {
         self.fit
     }
 
-    pub fn set_spread(&mut self, spread: bool) {
-        self.spread = spread;
+    /// Switch the reading model. A spread is paged; everything else is the
+    /// single-column scroll layout.
+    pub fn set_layout(&mut self, spread: bool) {
+        let scroll = !spread;
+        if self.spread != spread || self.scroll != scroll {
+            self.spread = spread;
+            self.scroll = scroll;
+            self.page_cache.clear();
+        }
+    }
+
+    /// Move the scroll strip without skipping blank pages. Page jumps still use
+    /// `goto_page`; this only re-centers the strip while continuous scrolling.
+    pub fn scroll_to(&mut self, page: usize) -> bool {
+        let target = match self.page_count {
+            Some(count) => page.max(1).min(count) - 1,
+            None => page.max(1) - 1,
+        };
+        if target == self.page {
+            return false;
+        }
+        self.page = target;
+        true
     }
 
     pub fn next_page(&mut self) -> bool {
@@ -957,6 +1000,10 @@ impl RenderEngine {
         };
 
         let mut scale = match self.fit {
+            // Continuous scroll reads at page width, not page height, so the
+            // content flows naturally under the viewport.
+            Fit::Page if self.scroll => (available_w / rotated_w)
+                .min(SCROLL_STRIP_MAX_HEIGHT / self.scroll_strip_pages() as f32 / rotated_h),
             Fit::Page => fit_page_scale(rotated_w, rotated_h, available_w, available_h),
             Fit::None => self.scale,
         };
@@ -967,6 +1014,14 @@ impl RenderEngine {
             .min(MAX_DIMENSION / rotated_w)
             .min(MAX_DIMENSION / rotated_h);
         scale = scale.min((MAX_PIXELS / (rotated_w * rotated_h)).sqrt());
+        if self.scroll {
+            // The strip is taller than one page. Keep it inside both the GPU
+            // texture edge and a single page's pixel budget.
+            let count = self.scroll_strip_pages() as f32;
+            scale = scale
+                .min(MAX_DIMENSION / (count * rotated_h))
+                .min((MAX_PIXELS / (rotated_w * rotated_h * count)).sqrt());
+        }
         if !scale.is_finite() || scale <= 0.0 {
             Err("invalid page scale".to_string())
         } else {
@@ -1044,18 +1099,38 @@ impl RenderEngine {
         })
     }
 
-    fn render_with_quads(&mut self, quads: &[Quad]) -> Result<RenderedPage, String> {
-        // A spread is a fit-to-page layout. Once the user zooms explicitly,
-        // rendering four pages at that scale can cost hundreds of megabytes;
-        // fall back to a single page even if the UI request has not arrived.
-        let page_numbers = if self.spread && self.fit != Fit::None {
+    fn page_numbers_for(&self) -> Vec<usize> {
+        if self.scroll {
+            // Keep a page behind and at least two ahead so continuous
+            // scrolling works in both directions. An explicit zoom renders
+            // fewer pages so the vertical strip stays within texture limits.
+            let count = self.scroll_strip_pages();
+            let start = self.page.saturating_sub(1);
+            (start..start + count).collect()
+        } else if self.spread && self.fit != Fit::None {
             let start = self.page.saturating_sub(1);
             vec![start, start + 1, start + 2, start + 3]
         } else {
             vec![self.page]
-        };
+        }
+    }
+
+    /// Number of contiguous pages in the scroll strip. Auto-fit can afford the
+    /// full window; explicit zoom keeps three pages (one behind, one ahead).
+    fn scroll_strip_pages(&self) -> usize {
+        if self.fit == Fit::Page {
+            SCROLL_STRIP_PAGES
+        } else {
+            3
+        }
+    }
+
+    fn render_with_quads(&mut self, quads: &[Quad]) -> Result<RenderedPage, String> {
+        let page_numbers = self.page_numbers_for();
         let cacheable = quads.is_empty() && self.search_query.is_none();
-        if self.reflowable {
+        // Blank reflow pages are skipped in paged layouts, but a scroll strip
+        // must stay contiguous so its page offsets match the page numbers.
+        if self.reflowable && !self.scroll {
             let mut filtered = Vec::with_capacity(page_numbers.len());
             for &page_no in &page_numbers {
                 if !self.page_is_blank(page_no) {
@@ -1093,17 +1168,28 @@ impl RenderEngine {
             pages.push(page_no + 1);
         }
 
-        let first_bounds = self
+        // Scale from the page being read, not the page that happens to start
+        // the strip. In scroll mode the focus is often the second page.
+        let scale_no = if self.scroll { self.page } else { first_no };
+        let scale_bounds = self
             .doc
-            .load_page(first_no as i32)
+            .load_page(scale_no as i32)
             .and_then(|page| page.bounds())
             .map_err(|e| format!("page bounds: {e}"))?;
-        let scale = self.scale_for(&first_bounds)?;
+        let scale = self.scale_for(&scale_bounds)?;
         self.scale = scale;
+        let first_bounds = if scale_no == first_no {
+            scale_bounds
+        } else {
+            self.doc
+                .load_page(first_no as i32)
+                .and_then(|page| page.bounds())
+                .map_err(|e| format!("page bounds: {e}"))?
+        };
         let first_ctm = self.ctm_for(&first_bounds, scale);
 
-        // Search highlights only apply to the first page, so searches take
-        // the direct path. Normal reading reuses the overlapping spread pages.
+        // Search highlights apply to the page being read, which may not be the
+        // first page of a scroll strip. Normal reading reuses cached pages.
         let mut direct = Vec::new();
         for (index, &page_no) in numbers.iter().enumerate() {
             if cacheable
@@ -1123,7 +1209,7 @@ impl RenderEngine {
                     .map_err(|e| format!("page bounds: {e}"))?;
                 self.ctm_for(&bounds, scale)
             };
-            let page_quads = if index == 0 { quads } else { &[] };
+            let page_quads = if page_no == self.page { quads } else { &[] };
             #[cfg(test)]
             {
                 self.page_renders += 1;
@@ -1162,12 +1248,23 @@ impl RenderEngine {
             .iter()
             .position(|&page| page == self.page + 1)
             .unwrap_or(0);
-        let gap = if page_widths.len() > 1 {
-            spread_gap(page_widths[focus_index])
+        let (bitmap, page_offsets, page_heights, gap) = if self.scroll {
+            let gap = scroll_gap(page_widths.get(focus_index).copied().unwrap_or(1));
+            let strip = compose_pages_vertical(&rendered, gap, self.background);
+            (strip.page, strip.offsets, strip.heights, gap)
         } else {
-            0
+            let gap = if page_widths.len() > 1 {
+                spread_gap(page_widths[focus_index])
+            } else {
+                0
+            };
+            (
+                compose_pages(&rendered, gap, self.background),
+                vec![0; page_widths.len()],
+                rendered.iter().map(|page| page.bitmap.height).collect(),
+                gap,
+            )
         };
-        let bitmap = compose_pages(&rendered, gap, self.background);
 
         Ok(RenderedPage {
             bitmap: bitmap.bitmap,
@@ -1182,13 +1279,19 @@ impl RenderEngine {
             highlights: bitmap.highlights,
             links: bitmap.links,
             text: bitmap.text,
+            scroll: self.scroll,
+            page_offsets,
+            page_heights,
             font_scale: self.font_scale(),
             reflowable: self.reflowable,
         })
     }
 
     fn cache_capacity(&self) -> usize {
-        if self.spread && self.fit != Fit::None {
+        if self.scroll {
+            // A scroll strip references every page in its window at once.
+            self.scroll_strip_pages()
+        } else if self.spread && self.fit != Fit::None {
             PAGE_CACHE_CAPACITY
         } else {
             PAGE_CACHE_SINGLE_CAPACITY
@@ -1315,6 +1418,109 @@ fn compose_pages(pages: &[&PageRender], gap: u32, background: u32) -> PageRender
         text,
     }
 }
+struct VerticalStrip {
+    page: PageRender,
+    offsets: Vec<u32>,
+    heights: Vec<u32>,
+}
+
+impl PageRender {
+    fn translated(&self, x: u32, y: u32, char_offset: usize, line_offset: usize) -> TranslatedPage {
+        let highlight = |rect: &HighlightRect| HighlightRect {
+            x0: rect.x0 + x,
+            y0: rect.y0 + y,
+            x1: rect.x1 + x,
+            y1: rect.y1 + y,
+        };
+        let mut text = TextLayer::default();
+        for ch in &self.text.chars {
+            text.chars.push(TextChar {
+                rect: highlight(&ch.rect),
+                line: ch.line + line_offset,
+                ..*ch
+            });
+        }
+        for line in &self.text.lines {
+            text.lines.push(TextLine {
+                start: line.start + char_offset,
+                end: line.end + char_offset,
+                rect: highlight(&line.rect),
+            });
+        }
+        let mut links = Vec::with_capacity(self.links.len());
+        for link in &self.links {
+            let mut link = link.clone();
+            link.bounds = highlight(&link.bounds);
+            links.push(link);
+        }
+        TranslatedPage {
+            highlights: self.highlights.iter().map(highlight).collect(),
+            links,
+            text,
+        }
+    }
+}
+
+struct TranslatedPage {
+    highlights: Vec<HighlightRect>,
+    links: Vec<RenderedLink>,
+    text: TextLayer,
+}
+
+/// Stack pages vertically with a gap. Every page is centered in the strip
+/// width, and all geometry is translated so highlights, links, and text hit
+/// testing keep working in strip coordinates.
+fn compose_pages_vertical(pages: &[&PageRender], gap: u32, background: u32) -> VerticalStrip {
+    let width = pages
+        .iter()
+        .map(|page| page.bitmap.width)
+        .max()
+        .unwrap_or(0);
+    let mut offsets = Vec::with_capacity(pages.len());
+    let mut lefts = Vec::with_capacity(pages.len());
+    let mut heights = Vec::with_capacity(pages.len());
+    let mut y = 0u32;
+    for page in pages {
+        offsets.push(y);
+        lefts.push((width.saturating_sub(page.bitmap.width)) / 2);
+        heights.push(page.bitmap.height);
+        y = y.saturating_add(page.bitmap.height).saturating_add(gap);
+    }
+    let height = y.saturating_sub(gap);
+    let mut pixels = vec![background; width as usize * height as usize];
+
+    let mut highlights = Vec::new();
+    let mut links = Vec::new();
+    let mut text = TextLayer::default();
+    for (index, page) in pages.iter().enumerate() {
+        let x = lefts[index];
+        let y = offsets[index];
+        blit_bitmap(&mut pixels, width, &page.bitmap, x, y);
+        let char_offset = text.chars.len();
+        let line_offset = text.lines.len();
+        let page = page.translated(x, y, char_offset, line_offset);
+        highlights.extend(page.highlights);
+        links.extend(page.links);
+        text.chars.extend(page.text.chars);
+        text.lines.extend(page.text.lines);
+    }
+
+    VerticalStrip {
+        page: PageRender {
+            bitmap: PageBitmap {
+                width,
+                height,
+                pixels,
+            },
+            highlights,
+            links,
+            text,
+        },
+        offsets,
+        heights,
+    }
+}
+
 fn blit_bitmap(dst: &mut [u32], dst_width: u32, src: &PageBitmap, x: u32, y: u32) {
     if src.width == 0 || src.height == 0 {
         return;
@@ -2097,7 +2303,7 @@ mod tests {
         let single_width = single.bitmap.width;
         let single_height = single.bitmap.height;
 
-        engine.set_spread(true);
+        engine.set_layout(true);
         engine.set_viewport(single_width * 2, 900);
         let tight = engine.render().unwrap();
         assert_eq!(tight.pages, vec![1, 2, 3, 4]);
@@ -2170,6 +2376,70 @@ mod tests {
     }
 
     #[test]
+    fn scroll_renders_a_vertical_strip() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("scroll");
+        let path = dir.join("sample.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+
+        let strip = engine.render().unwrap();
+        assert!(strip.scroll);
+        assert_eq!(strip.pages, vec![1, 2, 3, 4]);
+        let first_height = strip.page_heights[0];
+        let gap = scroll_gap(strip.page_widths[0]);
+        assert_eq!(strip.gap, gap);
+        assert!(gap > 0);
+        assert_eq!(strip.page_offsets[0], 0);
+        assert_eq!(strip.page_offsets[1], first_height + gap);
+        assert_eq!(
+            strip.bitmap.width,
+            strip.page_widths.iter().copied().max().unwrap(),
+            "the strip is as wide as its widest page"
+        );
+        assert!(strip.bitmap.height > first_height, "pages stack vertically");
+        assert!(
+            strip.page_widths[0] <= 900,
+            "scroll fits the page width to the viewport"
+        );
+        assert!(
+            strip
+                .text
+                .chars
+                .iter()
+                .any(|ch| ch.rect.y0 >= first_height + gap),
+            "later pages are shifted into vertical strip coordinates"
+        );
+
+        // An explicit zoom keeps a three-page window so scrolling can still
+        // move in both directions without exceeding the texture budget.
+        engine.set_scale(2.0);
+        let zoomed = engine.render().unwrap();
+        assert!(zoomed.scroll);
+        assert_eq!(zoomed.pages, vec![1, 2, 3]);
+
+        engine.fit_page();
+        engine.goto_page(4);
+        let recentered = engine.render().unwrap();
+        assert_eq!(recentered.page, 4);
+        assert_eq!(recentered.pages, vec![3, 4, 5, 6]);
+        assert_eq!(recentered.page_offsets[0], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn spread_reuses_overlapping_pages() {
         let _guard = doc_test_guard();
         let dir = test_dir("spread-cache");
@@ -2187,7 +2457,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(2400, 900);
-        engine.set_spread(true);
+        engine.set_layout(true);
 
         let first = engine.render().unwrap();
         assert_eq!(first.pages, vec![1, 2, 3, 4]);
