@@ -164,8 +164,9 @@ impl TextLayer {
         (line.start < line.end).then_some(best)
     }
 
-    /// Text between two inclusive character indices, with line breaks between
-    /// MuPDF text lines.
+    /// Text between two inclusive character indices. Visual line wraps become
+    /// a space for Latin text (or nothing for CJK), while paragraph spacing and
+    /// page/column jumps keep the line break that was actually in the source.
     pub fn text_for_range(&self, start: usize, end: usize) -> String {
         if self.chars.is_empty() {
             return String::new();
@@ -179,16 +180,64 @@ impl TextLayer {
         };
 
         let mut out = String::new();
-        let mut previous_line = None;
+        let mut previous: Option<&TextChar> = None;
         for ch in &self.chars[start..=end] {
-            if previous_line.is_some_and(|line| line != ch.line) && !out.ends_with('\n') {
-                out.push('\n');
+            if let Some(previous) = previous {
+                if previous.line != ch.line {
+                    out.push_str(self.line_separator(previous, ch));
+                }
             }
             out.push(ch.ch);
-            previous_line = Some(ch.line);
+            previous = Some(ch);
         }
         out
     }
+
+    fn line_separator(&self, previous: &TextChar, next: &TextChar) -> &'static str {
+        let (Some(previous_line), Some(next_line)) =
+            (self.lines.get(previous.line), self.lines.get(next.line))
+        else {
+            return "\n";
+        };
+        let previous_height = previous_line.rect.y1.saturating_sub(previous_line.rect.y0) as f32;
+        let advance = next_line.rect.y0 as f32 - previous_line.rect.y0 as f32;
+        if advance <= 0.0 || advance > previous_height * PARAGRAPH_GAP_FACTOR {
+            "\n"
+        } else if soft_wrap_needs_space(previous.ch, next.ch) {
+            " "
+        } else {
+            ""
+        }
+    }
+}
+
+/// A line advance this much larger than the previous line's height is
+/// paragraph spacing, not a visual wrap. Ordinary line advances stay near one
+/// line height.
+const PARAGRAPH_GAP_FACTOR: f32 = 1.35;
+
+/// Wrapped Latin words need the space that disappeared at the line end. CJK
+/// text runs together without one, and existing whitespace already separates.
+fn soft_wrap_needs_space(previous: char, next: char) -> bool {
+    if previous.is_whitespace() || next.is_whitespace() {
+        return false;
+    }
+    if is_wide_script(previous) || is_wide_script(next) {
+        return false;
+    }
+    let previous_ends_word = previous.is_alphanumeric()
+        || matches!(
+            previous,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '"' | '\''
+        );
+    previous_ends_word && next.is_alphanumeric()
+}
+
+fn is_wide_script(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FA1F
+    )
 }
 
 /// Vertical distance first, then horizontal. This keeps a click on a line's
@@ -1614,6 +1663,68 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn wrapped_layer(first: char, second: char, advance: u32) -> TextLayer {
+        TextLayer {
+            chars: vec![
+                TextChar {
+                    ch: first,
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10,
+                        x1: 20,
+                        y1: 30,
+                    },
+                    line: 0,
+                },
+                TextChar {
+                    ch: second,
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10 + advance,
+                        x1: 20,
+                        y1: 30 + advance,
+                    },
+                    line: 1,
+                },
+            ],
+            lines: vec![
+                TextLine {
+                    start: 0,
+                    end: 1,
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10,
+                        x1: 20,
+                        y1: 30,
+                    },
+                },
+                TextLine {
+                    start: 1,
+                    end: 2,
+                    rect: HighlightRect {
+                        x0: 10,
+                        y0: 10 + advance,
+                        x1: 20,
+                        y1: 30 + advance,
+                    },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn copied_text_joins_visual_line_wraps() {
+        // Latin wraps keep the space that the line break swallowed.
+        assert_eq!(wrapped_layer('H', 'i', 20).text_for_range(0, 1), "H i");
+        assert_eq!(wrapped_layer('中', '文', 20).text_for_range(0, 1), "中文");
+        assert_eq!(wrapped_layer('.', 'A', 20).text_for_range(0, 1), ". A");
+    }
+
+    #[test]
+    fn copied_text_keeps_paragraph_breaks() {
+        assert_eq!(wrapped_layer('H', 'i', 34).text_for_range(0, 1), "H\ni");
     }
 
     #[test]
