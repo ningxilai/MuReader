@@ -159,9 +159,12 @@ to a worker focus page, and one scale stays locked for the session so pages of
 different sizes cannot re-zoom mid-scroll. The column also keeps side margins
 in every window geometry, including narrow windows and while the outline is
 open. Arrow keys move one line at a time, matching a mouse-wheel notch, while
-`Space`/`PageDown` and `PageUp` move most of a screen; holding an arrow key
-therefore glides through the column instead of jumping by pages. Continuous
-scroll works for fixed-layout documents such as PDFs as well
+`Space`/`PageDown` and `PageUp` move most of a screen. Key steps and wheel
+notches glide smoothly over a few frames, following the same idea as CSSOM
+View's `scroll-behavior: smooth` and EPUB's scrolled-continuous flow, so
+holding an arrow key carries the column forward instead of stepping it page by
+page. Trackpad pixel deltas stay direct. Continuous scroll works for
+fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
 its simulated page, but the reader crops to the picture and scales it to the
@@ -256,6 +259,14 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Continuous scroll now glides between positions at pixel granularity instead
+  of teleporting on each key press. Wheel notches and `Down`/`Up`, `Space`,
+  `PageUp`/`PageDown`, and `C-n`/`C-p` feed one exponential ease-out curve, in
+  the spirit of CSSOM View's `scroll-behavior: smooth` and EPUB's
+  `rendition:flow: scrolled-continuous`. Repeated input extends the same glide,
+  high-resolution trackpad deltas remain direct, and a prefetched window can
+  re-center underneath the glide without a visual jump. Paged and explicit-zoom
+  modes keep their page-shaped scrolling.
 - Arrow keys now move the continuous scroll by one line instead of nearly a
   full screen. `Down`/`Up` and the mouse wheel share a single-line step, while
   `Space`, `PageUp`/`PageDown`, and `C-n`/`C-p` keep the larger screen step, so

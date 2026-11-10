@@ -92,6 +92,14 @@ const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
 /// One arrow-key press or wheel notch moves the viewport by about one text
 /// line. Page keys keep their full-screen step.
 const SCROLL_LINE_PIXELS: f32 = 60.0;
+/// CSSOM View leaves the smooth-scroll curve to the user agent (`scroll-behavior:
+/// smooth`). Use an exponential ease-out with a short time constant: key
+/// repeat stays fluid, but the first pixels of a press appear immediately.
+const SCROLL_GLIDE_TAU: f32 = 0.07;
+/// Cap the glide speed so a full-screen step glides instead of teleporting.
+const SCROLL_GLIDE_MAX_SPEED: f32 = 3200.0;
+/// Finish a glide once less than this many bitmap pixels remain.
+const SCROLL_GLIDE_SNAP: f32 = 0.5;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -419,6 +427,16 @@ struct SpreadAnimation {
     command: TurnDirection,
 }
 
+/// In-flight smooth scroll for key and wheel steps.
+///
+/// Only the distance left to travel is stored, not absolute coordinates: a
+/// recenter may slide the rendered window and rebase its offsets mid-glide,
+/// while each frame still applies a relative delta to the current position.
+struct ScrollGlide {
+    remaining: f32,
+    last: Instant,
+}
+
 struct App {
     path: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
@@ -530,6 +548,7 @@ struct App {
     spread_enabled: bool,
     pending_turn: Option<TurnDirection>,
     animation: Option<SpreadAnimation>,
+    scroll_glide: Option<ScrollGlide>,
     progress: ProgressStore,
     /// Pages visited by following a link or an outline entry. Normal page
     /// turns do not create history entries; Back/Forward move between
@@ -650,6 +669,7 @@ impl App {
             spread_enabled: true,
             pending_turn: None,
             animation: None,
+            scroll_glide: None,
             progress,
             history: NavigationHistory::default(),
             recorded_page: None,
@@ -868,6 +888,7 @@ impl App {
     /// current page is preserved across the switch.
     fn toggle_spread(&mut self) {
         self.finish_animation();
+        self.scroll_glide = None;
         let reading = self.reading_page();
         let was_scroll = !self.spread_active;
         self.spread_enabled = !self.spread_enabled;
@@ -1069,16 +1090,22 @@ impl App {
         let at_start = self.pages.first().copied().unwrap_or(1) <= 1;
         if (pending > 0.0 && at_end) || (pending < 0.0 && at_start) {
             pending = 0.0;
+            // Nothing can consume the rest of the glide at a document edge.
+            self.scroll_glide = None;
         }
         self.scroll_pending = pending;
         self.set_scroll_position(clamped);
         self.maybe_prefetch_scroll();
         let page = self.reading_page();
-        if !self.outline_open && self.recorded_page != Some(page) {
-            self.progress.record(&self.path, page);
-            self.recorded_page = Some(page);
+        if self.recorded_page != Some(page) {
+            if !self.outline_open {
+                self.progress.record(&self.path, page);
+                self.recorded_page = Some(page);
+            }
+            // During a glide this runs once per page, not once per frame: the
+            // title only depends on the reading page.
+            self.update_title();
         }
-        self.update_title();
         self.request_redraw();
     }
 
@@ -1158,52 +1185,121 @@ impl App {
 
     fn scroll_down_screen(&mut self) {
         let (_, viewport_h) = self.viewport();
-        self.scroll_vertical(viewport_h as f32 * 0.9);
+        if self.scroll_mode() {
+            self.scroll_smoothly(viewport_h as f32 * 0.9);
+        } else {
+            self.scroll_vertical(viewport_h as f32 * 0.9);
+        }
     }
 
     fn scroll_up_screen(&mut self) {
         let (_, viewport_h) = self.viewport();
-        self.scroll_vertical(-(viewport_h as f32 * 0.9));
+        if self.scroll_mode() {
+            self.scroll_smoothly(-(viewport_h as f32 * 0.9));
+        } else {
+            self.scroll_vertical(-(viewport_h as f32 * 0.9));
+        }
     }
 
     fn scroll_down_or_next(&mut self) {
         let (_, viewport_h) = self.viewport();
-        self.scroll_down_step(viewport_h as f32 * 0.9);
+        if self.scroll_mode() {
+            self.scroll_smoothly(viewport_h as f32 * 0.9);
+        } else {
+            self.scroll_page_step(viewport_h as f32 * 0.9);
+        }
     }
 
     fn scroll_up_or_prev(&mut self) {
         let (_, viewport_h) = self.viewport();
-        self.scroll_up_step(viewport_h as f32 * 0.9);
-    }
-
-    fn scroll_line_down(&mut self) {
-        self.scroll_down_step(SCROLL_LINE_PIXELS);
-    }
-
-    fn scroll_line_up(&mut self) {
-        self.scroll_up_step(SCROLL_LINE_PIXELS);
-    }
-
-    /// Scroll by `delta` in continuous scroll, or inside a page that is taller
-    /// than the viewport. Once such a page is scrolled to its end, the next
-    /// step turns the page.
-    fn scroll_down_step(&mut self, delta: f32) {
-        if self.scroll_mode()
-            || (!self.page_fits_height() && self.scroll_y + 0.5 < self.max_scroll_y())
-        {
-            self.scroll_vertical(delta);
+        if self.scroll_mode() {
+            self.scroll_smoothly(-(viewport_h as f32 * 0.9));
         } else {
-            self.send(Command::NextPage);
+            self.scroll_page_step(-(viewport_h as f32 * 0.9));
         }
     }
 
-    fn scroll_up_step(&mut self, delta: f32) {
-        if self.scroll_mode()
-            || (!self.page_fits_height() && self.scroll_y > self.min_scroll_y() + 0.5)
+    fn scroll_line_down(&mut self) {
+        if self.scroll_mode() {
+            self.scroll_smoothly(SCROLL_LINE_PIXELS);
+        } else {
+            self.scroll_page_step(SCROLL_LINE_PIXELS);
+        }
+    }
+
+    fn scroll_line_up(&mut self) {
+        if self.scroll_mode() {
+            self.scroll_smoothly(-SCROLL_LINE_PIXELS);
+        } else {
+            self.scroll_page_step(-SCROLL_LINE_PIXELS);
+        }
+    }
+
+    /// Scroll inside a page that is taller than the viewport, then turn the
+    /// page once its end is reached. Used by paged mode, which keeps its
+    /// immediate page-shaped scrolling rather than the continuous glide.
+    fn scroll_page_step(&mut self, delta: f32) {
+        if !self.page_fits_height()
+            && if delta > 0.0 {
+                self.scroll_y + 0.5 < self.max_scroll_y()
+            } else {
+                self.scroll_y > self.min_scroll_y() + 0.5
+            }
         {
-            self.scroll_vertical(-delta);
+            self.scroll_vertical(delta);
+        } else if delta > 0.0 {
+            self.send(Command::NextPage);
         } else {
             self.send(Command::PrevPage);
+        }
+    }
+
+    /// Add a step to the continuous scroll glide. Repeated key events extend
+    /// the same glide instead of restarting it, so holding an arrow key moves
+    /// at a steady pixel rate. CSSOM View's `scroll-behavior: smooth` likewise
+    /// lets consecutive scrolls interrupt and retarget the running animation.
+    fn scroll_smoothly(&mut self, delta: f32) {
+        if !self.strip_scroll || !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        // Extend the running curve without rebasing its clock: the distance
+        // added now is consumed by the next frame over that frame's real
+        // elapsed time, so key auto-repeat keeps a steady rate.
+        match self.scroll_glide.as_mut() {
+            Some(glide) => glide.remaining += delta,
+            None => {
+                self.scroll_glide = Some(ScrollGlide {
+                    remaining: delta,
+                    last: Instant::now(),
+                });
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Advance the smooth scroll by one frame. The bitmap position is applied
+    /// as a relative delta, so a prefetched window can recenter underneath the
+    /// glide without losing the visual position.
+    fn tick_scroll_glide(&mut self) {
+        let Some(glide) = self.scroll_glide.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(glide.last)
+            .as_secs_f32()
+            .clamp(0.0, 0.05);
+        glide.last = now;
+        if dt <= 0.0 {
+            return;
+        }
+        let (step, remaining) = glide_frame(glide.remaining, dt);
+        glide.remaining = remaining;
+        if remaining == 0.0 {
+            self.scroll_glide = None;
+        }
+        if step != 0.0 {
+            self.scroll_document(step);
         }
     }
 
@@ -1546,6 +1642,7 @@ impl App {
         if !self.strip_scroll || !self.pages.contains(&page) {
             return;
         }
+        self.scroll_glide = None;
         self.scroll_anchor = page;
         self.scroll_in_page = 0.0;
         self.scroll_pending = 0.0;
@@ -1565,6 +1662,7 @@ impl App {
         self.scroll_keep_anchor = false;
         self.scroll_recenter_pending = None;
         self.scroll_pending = 0.0;
+        self.scroll_glide = None;
     }
 
     /// Record a destination jump. Page turns and scrolling do not call this;
@@ -1652,6 +1750,7 @@ impl App {
         self.finish_animation();
         self.pending_turn = None;
         self.status = None;
+        self.scroll_glide = None;
         self.send(Command::FontScale(factor));
     }
 
@@ -1669,6 +1768,7 @@ impl App {
 
     fn zoom(&mut self, factor: f32, command: Command) {
         self.finish_animation();
+        self.scroll_glide = None;
         let expected_scale = (self.last_requested_scale * factor).clamp(MIN_SCALE, MAX_SCALE);
         self.last_requested_scale = expected_scale;
         let screen = self.zoom_screen_point();
@@ -2065,6 +2165,7 @@ impl App {
             return;
         }
         self.finish_animation();
+        self.scroll_glide = None;
         self.prompt = Prompt::None;
         self.menu_keys.reset();
         self.command_menu = Some(CommandMenu {
@@ -2747,6 +2848,7 @@ impl App {
 
     fn open_outline(&mut self) {
         self.finish_animation();
+        self.scroll_glide = None;
         if self.outline.is_empty() {
             self.status = Some("this document has no outline".to_string());
             self.update_title();
@@ -2954,6 +3056,15 @@ impl App {
             || self.pages != page.pages
             || self.rotation != page.rotation
             || (self.font_scale - page.font_scale).abs() > 1.0e-4;
+        // A re-layout rescales the bitmap, so the glide's remaining distance,
+        // stored in bitmap pixels, no longer describes the same motion. A
+        // strip re-center keeps the scale locked and must not cancel it.
+        if (self.rotation != page.rotation)
+            || (self.font_scale - page.font_scale).abs() > 1.0e-4
+            || (self.scale - page.scale).abs() > 1.0e-4
+        {
+            self.scroll_glide = None;
+        }
         let new_scale = page.scale;
         let zoom_anchor = if page_changed {
             self.pending_zooms.clear();
@@ -3464,9 +3575,11 @@ impl App {
             return;
         }
         self.finish_animation();
-        let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (x * SCROLL_LINE_PIXELS, y * SCROLL_LINE_PIXELS),
-            MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+        let (dx, dy, smooth) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                (x * SCROLL_LINE_PIXELS, y * SCROLL_LINE_PIXELS, true)
+            }
+            MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32, false),
         };
         if self.outline_open {
             self.outline_scroll = (self.outline_scroll - dy).clamp(0.0, self.outline_max_scroll());
@@ -3483,7 +3596,16 @@ impl App {
         } else if self.modifiers.shift_key() {
             let amount = if dx.abs() > 0.0 { dx } else { dy };
             self.scroll_horizontal(amount);
+        } else if smooth && self.scroll_mode() {
+            // Discrete wheel notches glide like the key steps. High-resolution
+            // trackpad deltas stay direct so pointer input is never filtered.
+            self.scroll_smoothly(-dy);
         } else {
+            // Direct pixel input takes over from an in-flight glide instead of
+            // adding to it, matching how a browser interrupts smooth scrolling.
+            if !smooth {
+                self.scroll_glide = None;
+            }
             self.scroll_vertical(-dy);
         }
     }
@@ -3534,6 +3656,7 @@ impl App {
     }
 
     fn draw(&mut self) {
+        self.tick_scroll_glide();
         self.tick_animation();
         let Some(window) = self.window.clone() else {
             return;
@@ -3830,7 +3953,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.animation.is_some() {
+        if self.animation.is_some() || self.scroll_glide.is_some() {
             self.request_redraw();
         }
         let now = Instant::now();
@@ -3884,6 +4007,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
                 self.finish_animation();
+                self.scroll_glide = None;
                 self.spread_blocked = false;
                 if let Some(menu) = self.command_menu.as_mut() {
                     menu.dirty = true;
@@ -4122,6 +4246,28 @@ fn page_offsets_end(offsets: &[u32], heights: &[u32], index: usize) -> u32 {
     let offset = offsets.get(index).copied().unwrap_or(0);
     let height = heights.get(index).copied().unwrap_or(0);
     offset.saturating_add(height)
+}
+
+/// One frame of the exponential ease-out scroll glide.
+///
+/// Returns the distance to apply this frame and the distance left afterwards.
+/// The curve follows CSSOM View's user-agent-defined smooth scrolling: most of
+/// the distance moves early and the tail eases to a stop. A speed cap keeps a
+/// large step (a screen or a page) from looking like a teleport on a slow
+/// frame, and the remainder snaps to zero so the glide always terminates.
+fn glide_frame(remaining: f32, dt: f32) -> (f32, f32) {
+    if remaining == 0.0 || dt <= 0.0 {
+        return (0.0, remaining);
+    }
+    let factor = 1.0 - (-dt / SCROLL_GLIDE_TAU).exp();
+    let max_step = SCROLL_GLIDE_MAX_SPEED * dt;
+    let mut step = (remaining * factor).clamp(-max_step, max_step);
+    let mut rest = remaining - step;
+    if rest.abs() <= SCROLL_GLIDE_SNAP {
+        step += rest;
+        rest = 0.0;
+    }
+    (step, rest)
 }
 
 #[cfg(test)]
@@ -4647,6 +4793,36 @@ mod tests {
         assert!(resize_preview_done(Fit::None, false));
         assert!(resize_preview_done(Fit::Page, true));
         assert!(!resize_preview_done(Fit::Page, false));
+    }
+
+    #[test]
+    fn scroll_glide_moves_toward_the_target_and_snaps_to_rest() {
+        // A frame never overshoots and never reverses direction.
+        let (step, rest) = glide_frame(120.0, 1.0 / 120.0);
+        assert!(step > 0.0 && step < 120.0);
+        assert!(rest > 0.0 && rest < 120.0);
+        assert!(close(step + rest, 120.0));
+
+        let (up, _) = glide_frame(-120.0, 1.0 / 120.0);
+        assert!(close(up, -step));
+
+        // Time constant: after one tau the remaining distance is about 1/e.
+        let (_, rest) = glide_frame(100.0, SCROLL_GLIDE_TAU);
+        assert!(close(rest, 100.0 / std::f32::consts::E));
+        // The speed cap keeps a big step from teleporting on a slow frame.
+        let (step, rest) = glide_frame(10_000.0, 0.05);
+        assert!(step <= SCROLL_GLIDE_MAX_SPEED * 0.05 + 1.0e-3);
+        assert!(rest > 0.0);
+        // Repeated frames always terminate at exactly zero.
+        let mut remaining = 60.0;
+        for _ in 0..600 {
+            let (_, rest) = glide_frame(remaining, 1.0 / 60.0);
+            remaining = rest;
+            if remaining == 0.0 {
+                break;
+            }
+        }
+        assert_eq!(remaining, 0.0);
     }
 
     #[test]
