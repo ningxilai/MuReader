@@ -17,6 +17,8 @@ pub enum Action {
     LastPage,
     ScrollDown,
     ScrollUp,
+    ScrollLineDown,
+    ScrollLineUp,
     ScrollDownScreen,
     ScrollUpScreen,
     ScrollLeft,
@@ -50,6 +52,8 @@ impl Action {
             "last_page" => Self::LastPage,
             "scroll_down" => Self::ScrollDown,
             "scroll_up" => Self::ScrollUp,
+            "scroll_line_down" => Self::ScrollLineDown,
+            "scroll_line_up" => Self::ScrollLineUp,
             "scroll_down_screen" => Self::ScrollDownScreen,
             "scroll_up_screen" => Self::ScrollUpScreen,
             "scroll_left" => Self::ScrollLeft,
@@ -536,15 +540,15 @@ const DEFAULT_BINDINGS: &[(Action, &str)] = &[
     (Action::LastPage, "G"),
     (Action::LastPage, "End"),
     (Action::LastPage, "M->"),
-    (Action::ScrollDown, "Down"),
     (Action::ScrollDown, "PageDown"),
     (Action::ScrollDown, "Space"),
     (Action::ScrollDown, "C-n"),
-    (Action::ScrollUp, "Up"),
     (Action::ScrollUp, "PageUp"),
     (Action::ScrollUp, "S-Space"),
     (Action::ScrollUp, "Delete"),
     (Action::ScrollUp, "C-p"),
+    (Action::ScrollLineDown, "Down"),
+    (Action::ScrollLineUp, "Up"),
     (Action::ScrollDownScreen, "C-v"),
     (Action::ScrollUpScreen, "M-v"),
     (Action::ScrollLeft, "Left"),
@@ -651,9 +655,60 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_scroll_one_line_while_page_keys_scroll_a_screen() {
+        let keymap = Keymap::new(&BTreeMap::new());
+        assert_eq!(
+            keymap.exact(&parse_sequence("Down").unwrap()),
+            Some(Action::ScrollLineDown)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("Up").unwrap()),
+            Some(Action::ScrollLineUp)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("PageDown").unwrap()),
+            Some(Action::ScrollDown)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("Space").unwrap()),
+            Some(Action::ScrollDown)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("PageUp").unwrap()),
+            Some(Action::ScrollUp)
+        );
+        assert_eq!(
+            Action::from_name("scroll_line_down"),
+            Some(Action::ScrollLineDown)
+        );
+        assert_eq!(
+            Action::from_name("scroll-line-up"),
+            Some(Action::ScrollLineUp)
+        );
+    }
+
+    #[test]
     fn default_config_has_valid_bindings() {
         let config: crate::config::Config = toml::from_str(include_str!("../config.toml")).unwrap();
         assert_no_collisions(&Keymap::new(&config.keys));
+    }
+
+    #[test]
+    fn shipped_config_keeps_arrows_on_line_scroll() {
+        let config: crate::config::Config = toml::from_str(include_str!("../config.toml")).unwrap();
+        let keymap = Keymap::new(&config.keys);
+        assert_eq!(
+            keymap.exact(&parse_sequence("Down").unwrap()),
+            Some(Action::ScrollLineDown)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("Up").unwrap()),
+            Some(Action::ScrollLineUp)
+        );
+        assert_eq!(
+            keymap.exact(&parse_sequence("PageDown").unwrap()),
+            Some(Action::ScrollDown)
+        );
     }
 
     #[test]

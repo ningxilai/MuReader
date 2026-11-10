@@ -158,7 +158,10 @@ runs past it is replayed when new pages arrive, the viewport never snaps back
 to a worker focus page, and one scale stays locked for the session so pages of
 different sizes cannot re-zoom mid-scroll. The column also keeps side margins
 in every window geometry, including narrow windows and while the outline is
-open. Continuous scroll works for fixed-layout documents such as PDFs as well
+open. Arrow keys move one line at a time, matching a mouse-wheel notch, while
+`Space`/`PageDown` and `PageUp` move most of a screen; holding an arrow key
+therefore glides through the column instead of jumping by pages. Continuous
+scroll works for fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
 its simulated page, but the reader crops to the picture and scales it to the
@@ -253,6 +256,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Arrow keys now move the continuous scroll by one line instead of nearly a
+  full screen. `Down`/`Up` and the mouse wheel share a single-line step, while
+  `Space`, `PageUp`/`PageDown`, and `C-n`/`C-p` keep the larger screen step, so
+  holding an arrow key glides through the column instead of jumping page-sized
+  distances.
 - Standalone illustrations in reflowable documents no longer sit on MuPDF's
   simulated 612x792 reflow page. In continuous scroll the reader crops such a
   page to its images and renders them at the reading-column width with their
@@ -308,9 +316,10 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   and falls back to single-column continuous scroll once each spread page would
   be too narrow. Press `s` (configurable as `toggle_spread`) to switch between
   the spread and continuous scroll. Page keys become page jumps in scroll mode,
-  while arrows, `Space`, `PageUp`/`PageDown`, `C-n`/`C-p`, and the wheel scroll
-  continuously. The outline overlays the page at full-window layout scale, so
-  opening or closing it no longer triggers a page re-render or layout hitch.
+  while `Down`/`Up` move one line, `Space`, `PageUp`/`PageDown`, `C-n`/`C-p`
+  move most of a screen, and the wheel scrolls continuously. The outline
+  overlays the page at full-window layout scale, so opening or closing it no
+  longer triggers a page re-render or layout hitch.
 - Renamed the preview application to **MuReader** (`mureader`).
 - Merged the Wayland data-control clipboard client into MuReader's clipboard
   module and reduced it to the copy path.

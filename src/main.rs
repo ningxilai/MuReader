@@ -89,6 +89,9 @@ const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
 /// exceeds this many pixels so outline browsing cannot stall the UI on an
 /// expensive render/upload.
 const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
+/// One arrow-key press or wheel notch moves the viewport by about one text
+/// line. Page keys keep their full-screen step.
+const SCROLL_LINE_PIXELS: f32 = 60.0;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -1164,20 +1167,41 @@ impl App {
     }
 
     fn scroll_down_or_next(&mut self) {
+        let (_, viewport_h) = self.viewport();
+        self.scroll_down_step(viewport_h as f32 * 0.9);
+    }
+
+    fn scroll_up_or_prev(&mut self) {
+        let (_, viewport_h) = self.viewport();
+        self.scroll_up_step(viewport_h as f32 * 0.9);
+    }
+
+    fn scroll_line_down(&mut self) {
+        self.scroll_down_step(SCROLL_LINE_PIXELS);
+    }
+
+    fn scroll_line_up(&mut self) {
+        self.scroll_up_step(SCROLL_LINE_PIXELS);
+    }
+
+    /// Scroll by `delta` in continuous scroll, or inside a page that is taller
+    /// than the viewport. Once such a page is scrolled to its end, the next
+    /// step turns the page.
+    fn scroll_down_step(&mut self, delta: f32) {
         if self.scroll_mode()
             || (!self.page_fits_height() && self.scroll_y + 0.5 < self.max_scroll_y())
         {
-            self.scroll_down_screen();
+            self.scroll_vertical(delta);
         } else {
             self.send(Command::NextPage);
         }
     }
 
-    fn scroll_up_or_prev(&mut self) {
+    fn scroll_up_step(&mut self, delta: f32) {
         if self.scroll_mode()
             || (!self.page_fits_height() && self.scroll_y > self.min_scroll_y() + 0.5)
         {
-            self.scroll_up_screen();
+            self.scroll_vertical(-delta);
         } else {
             self.send(Command::PrevPage);
         }
@@ -2900,6 +2924,8 @@ impl App {
             Action::LastPage => self.last_page(),
             Action::ScrollDown => self.scroll_down_or_next(),
             Action::ScrollUp => self.scroll_up_or_prev(),
+            Action::ScrollLineDown => self.scroll_line_down(),
+            Action::ScrollLineUp => self.scroll_line_up(),
             Action::ScrollDownScreen => self.scroll_down_screen(),
             Action::ScrollUpScreen => self.scroll_up_screen(),
             Action::ScrollLeft => self.scroll_horizontal(-60.0),
@@ -3439,7 +3465,7 @@ impl App {
         }
         self.finish_animation();
         let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (x * 60.0, y * 60.0),
+            MouseScrollDelta::LineDelta(x, y) => (x * SCROLL_LINE_PIXELS, y * SCROLL_LINE_PIXELS),
             MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
         };
         if self.outline_open {
