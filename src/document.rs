@@ -63,8 +63,9 @@ pub fn spread_gap(page_width: u32) -> u32 {
     ((page_width as f32 * SPREAD_GAP_RATIO).floor() as u32).max(1)
 }
 
-/// Pages kept in a scroll strip. One page behind and two ahead keep scrolling
-/// in both directions seamless without making an enormous texture.
+/// Pages kept in a scroll strip. The strip is a sliding window: the reader
+/// keeps at least one page behind and two ahead, and re-centers before the
+/// viewport reaches an edge, so continuous scrolling never stalls on a boundary.
 const SCROLL_STRIP_PAGES: usize = 4;
 /// Cap the strip so it stays within common GPU texture limits. The automatic
 /// width fit shrinks slightly for extreme aspect ratios instead of failing.
@@ -73,6 +74,16 @@ const SCROLL_STRIP_MAX_HEIGHT: f32 = 8192.0;
 /// Vertical breathing room between pages in the scroll strip.
 pub fn scroll_gap(page_width: u32) -> u32 {
     (page_width / 100).clamp(8, 24)
+}
+
+/// Side margin reserved in continuous scroll. Unlike the paged fit, which can
+/// let a page touch the window edge, a scrolling column always keeps a little
+/// air on both sides, including in narrow windows and when the outline opens.
+pub fn scroll_side_margin(viewport_width: u32) -> u32 {
+    let proportional = (viewport_width as f32 * 0.04).round() as u32;
+    proportional
+        .clamp(12, 64)
+        .min(viewport_width.saturating_div(4))
 }
 
 /// Longest side, in pixels, of a page rendered for background sampling. The
@@ -371,6 +382,15 @@ pub struct RenderEngine {
     spread: bool,
     /// Single-column continuous scroll. Mutually exclusive with `spread`.
     scroll: bool,
+    /// Pages rendered before the scroll anchor. The reader chooses one for
+    /// downward scrolling and two for upward scrolling, so the strip always
+    /// has lookahead in the direction of travel.
+    scroll_before: usize,
+    /// Fit scale locked for the current scroll session. A continuous canvas
+    /// must not re-zoom when the anchor moves to a page with slightly
+    /// different bounds, so the first scroll render fixes it until the
+    /// viewport, fit, rotation, or text size changes.
+    scroll_scale: Option<f32>,
     viewport: (u32, u32),
     search_query: Option<String>,
     outline: Vec<OutlineEntry>,
@@ -461,6 +481,8 @@ impl RenderEngine {
             rotation: 0,
             spread: false,
             scroll: false,
+            scroll_before: 1,
+            scroll_scale: None,
             viewport: (1100, 900),
             search_query: None,
             outline,
@@ -496,6 +518,7 @@ impl RenderEngine {
             return Ok(false);
         }
         self.page_cache.clear();
+        self.scroll_scale = None;
         let old_page = self.page;
         let old_count = self.page_count.unwrap_or(1).max(1);
         let anchor = self.page_anchor();
@@ -601,6 +624,7 @@ impl RenderEngine {
         let next = (width.max(1), height.max(1));
         if next != self.viewport {
             self.viewport = next;
+            self.scroll_scale = None;
             self.page_cache.clear();
         }
     }
@@ -616,21 +640,26 @@ impl RenderEngine {
         if self.spread != spread || self.scroll != scroll {
             self.spread = spread;
             self.scroll = scroll;
+            self.scroll_scale = None;
             self.page_cache.clear();
         }
     }
 
     /// Move the scroll strip without skipping blank pages. Page jumps still use
-    /// `goto_page`; this only re-centers the strip while continuous scrolling.
-    pub fn scroll_to(&mut self, page: usize) -> bool {
+    /// `goto_page`; this only slides the rendered window while scrolling.
+    /// `before` chooses how many pages sit above the anchor, so the reader can
+    /// keep lookahead in whichever direction it is moving.
+    pub fn scroll_to(&mut self, page: usize, before: usize) -> bool {
         let target = match self.page_count {
             Some(count) => page.max(1).min(count) - 1,
             None => page.max(1) - 1,
         };
-        if target == self.page {
+        let before = before.min(self.scroll_strip_pages().saturating_sub(1));
+        if target == self.page && before == self.scroll_before {
             return false;
         }
         self.page = target;
+        self.scroll_before = before;
         true
     }
 
@@ -916,6 +945,7 @@ impl RenderEngine {
         if factor.is_finite() && factor > 0.0 {
             self.fit = Fit::None;
             self.scale = (self.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+            self.scroll_scale = None;
             self.page_cache.clear();
         }
     }
@@ -925,6 +955,7 @@ impl RenderEngine {
         if scale.is_finite() && scale > 0.0 {
             self.fit = Fit::None;
             self.scale = scale.clamp(MIN_SCALE, MAX_SCALE);
+            self.scroll_scale = None;
             self.page_cache.clear();
         }
     }
@@ -933,11 +964,13 @@ impl RenderEngine {
     pub fn fit_page(&mut self) {
         self.fit = Fit::Page;
         self.search_query = None;
+        self.scroll_scale = None;
         self.page_cache.clear();
     }
 
     pub fn rotate(&mut self, delta: i32) {
         self.rotation = ((self.rotation as i32 + delta).rem_euclid(360)) as u16;
+        self.scroll_scale = None;
         self.page_cache.clear();
     }
 
@@ -1040,14 +1073,15 @@ impl RenderEngine {
             .map_err(|e| format!("search page {}: {e}", page_no + 1))
     }
 
-    fn scale_for(&self, bounds: &Rect) -> Result<f32, String> {
+    fn scale_for(&mut self, bounds: &Rect) -> Result<f32, String> {
         let (rotated_w, rotated_h) = rotated_size(bounds, self.rotation);
 
-        let available_w = self
-            .viewport
-            .0
-            .saturating_sub(MARGIN.saturating_mul(2))
-            .max(1) as f32;
+        let horizontal_inset = if self.scroll {
+            scroll_side_margin(self.viewport.0).saturating_mul(2)
+        } else {
+            MARGIN.saturating_mul(2)
+        };
+        let available_w = self.viewport.0.saturating_sub(horizontal_inset).max(1) as f32;
         let available_h = self
             .viewport
             .1
@@ -1065,8 +1099,20 @@ impl RenderEngine {
         let mut scale = match self.fit {
             // Continuous scroll reads at page width, not page height, so the
             // content flows naturally under the viewport.
-            Fit::Page if self.scroll => (available_w / rotated_w)
-                .min(SCROLL_STRIP_MAX_HEIGHT / self.scroll_strip_pages() as f32 / rotated_h),
+            Fit::Page if self.scroll => {
+                // Mixed page sizes must not re-zoom the column when the window
+                // slides. Reuse the first fit computed for this scroll session
+                // and keep the per-page caps below as a safety net.
+                if let Some(locked) = self.scroll_scale {
+                    locked
+                } else {
+                    let fitted = (available_w / rotated_w).min(
+                        SCROLL_STRIP_MAX_HEIGHT / self.scroll_strip_pages() as f32 / rotated_h,
+                    );
+                    self.scroll_scale = Some(fitted);
+                    fitted
+                }
+            }
             Fit::Page => fit_page_scale(rotated_w, rotated_h, available_w, available_h),
             Fit::None => self.scale,
         };
@@ -1164,11 +1210,13 @@ impl RenderEngine {
 
     fn page_numbers_for(&self) -> Vec<usize> {
         if self.scroll {
-            // Keep a page behind and at least two ahead so continuous
-            // scrolling works in both directions. An explicit zoom renders
-            // fewer pages so the vertical strip stays within texture limits.
+            // The strip is a sliding window around the anchor. `scroll_before`
+            // decides how much sits above it, so scrolling up and down both
+            // keep lookahead. An explicit zoom renders fewer pages so the
+            // vertical strip stays within texture limits.
             let count = self.scroll_strip_pages();
-            let start = self.page.saturating_sub(1);
+            let before = self.scroll_before.min(count.saturating_sub(1));
+            let start = self.page.saturating_sub(before);
             (start..start + count).collect()
         } else if self.spread && self.fit != Fit::None {
             let start = self.page.saturating_sub(1);
@@ -2325,6 +2373,18 @@ mod tests {
     }
 
     #[test]
+    fn scroll_side_margin_always_leaves_air_and_room_for_the_page() {
+        assert_eq!(scroll_side_margin(0), 0);
+        for width in [120, 240, 400, 800, 1600, 3200] {
+            let margin = scroll_side_margin(width);
+            assert!(margin <= width / 4, "margins must not swallow the page");
+        }
+        assert!(scroll_side_margin(400) >= 12);
+        assert!(scroll_side_margin(3200) <= 64);
+        assert!(scroll_side_margin(1600) >= scroll_side_margin(400));
+    }
+
+    #[test]
     fn page_outline_covers_every_page() {
         let outline = page_outline(3);
         assert_eq!(outline.len(), 3);
@@ -2523,9 +2583,11 @@ mod tests {
             "the strip is as wide as its widest page"
         );
         assert!(strip.bitmap.height > first_height, "pages stack vertically");
+        let margin = scroll_side_margin(900);
+        assert!(margin > 0, "scroll reserves side margins");
         assert!(
-            strip.page_widths[0] <= 900,
-            "scroll fits the page width to the viewport"
+            strip.page_widths[0] <= 900 - margin * 2 + 1,
+            "scroll fits the page width inside the viewport margins"
         );
         assert!(
             strip
@@ -2545,12 +2607,70 @@ mod tests {
         assert_eq!(zoomed.book_background, book_background);
 
         engine.fit_page();
+        // Scrolling up and down renders different sides of the anchor so the
+        // strip always keeps lookahead in the direction of travel.
+        if engine.page_count.unwrap_or(0) >= 8 {
+            assert!(engine.scroll_to(5, 2));
+            let upward = engine.render().unwrap();
+            assert_eq!(upward.page, 5);
+            assert_eq!(upward.pages, vec![3, 4, 5, 6]);
+            assert!(engine.scroll_to(5, 1));
+            let downward = engine.render().unwrap();
+            assert_eq!(downward.page, 5);
+            assert_eq!(downward.pages, vec![4, 5, 6, 7]);
+        }
+
         engine.goto_page(4);
         let recentered = engine.render().unwrap();
         assert_eq!(recentered.page, 4);
         assert_eq!(recentered.pages, vec![3, 4, 5, 6]);
         assert_eq!(recentered.page_offsets[0], 0);
         assert_eq!(recentered.book_background, book_background);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scroll_scale_is_locked_until_the_geometry_changes() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("scroll-scale");
+        let path = dir.join("sample.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..80 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+
+        // A mixed-size page in the same window must reuse the first fit, so the
+        // column does not re-zoom when the scroll window slides.
+        let portrait = Rect::new(0.0, 0.0, 612.0, 792.0);
+        let landscape = Rect::new(0.0, 0.0, 1224.0, 792.0);
+        let locked = engine.scale_for(&portrait).unwrap();
+        assert!((engine.scale_for(&landscape).unwrap() - locked).abs() < 1.0e-6);
+
+        // A resize invalidates the lock and refits the column.
+        engine.set_viewport(1800, 1200);
+        let refit = engine.scale_for(&portrait).unwrap();
+        assert!(refit > locked * 1.5, "a wider window refits the column");
+
+        // Switching layout also starts a fresh scroll session.
+        engine.set_layout(true);
+        assert!(engine.scroll_scale.is_none());
+        engine.set_layout(false);
+        assert!(engine.scroll_scale.is_none());
+
+        // Rotation invalidates the lock as well.
+        let _ = engine.scale_for(&portrait).unwrap();
+        engine.rotate(90);
+        assert!(engine.scroll_scale.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

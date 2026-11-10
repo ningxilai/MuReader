@@ -41,9 +41,9 @@ use activation::Activation;
 use clipboard::{ClipboardHandle, ClipboardNotice};
 use config::Config;
 use document::{
-    Fit, HighlightRect, LinkTarget, OutlineEntry, PageBitmap, RenderedLink, RenderedPage,
-    SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE, MIN_SCALE,
-    SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
+    scroll_side_margin, Fit, HighlightRect, LinkTarget, OutlineEntry, PageBitmap, RenderedLink,
+    RenderedPage, SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE,
+    MIN_SCALE, SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
@@ -486,6 +486,12 @@ struct App {
     /// the visual position instead of jumping to the page start.
     scroll_keep_anchor: bool,
     scroll_recenter_pending: Option<usize>,
+    /// Scroll distance requested past the current strip. It is replayed when a
+    /// strip with more pages arrives, so fast scrolling is never discarded.
+    scroll_pending: f32,
+    /// Last scroll direction: 1 down, -1 up. It decides how much lookahead the
+    /// next strip keeps above the anchor.
+    scroll_direction: i32,
     modifiers: ModifiersState,
     prompt: Prompt,
     command_menu: Option<CommandMenu>,
@@ -612,6 +618,8 @@ impl App {
             strip_scroll: false,
             scroll_keep_anchor: false,
             scroll_recenter_pending: None,
+            scroll_pending: 0.0,
+            scroll_direction: 1,
             modifiers: ModifiersState::empty(),
             prompt: Prompt::None,
             command_menu: None,
@@ -749,7 +757,17 @@ impl App {
         }
         let (viewport_w, _) = self.viewport();
         let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
-        (content_w / natural).clamp(0.1, 1.0)
+        // Keep the scroll column's side margins even when the outline borrows
+        // part of the window; the paged layout may still use the full width.
+        let target_w = if self.strip_scroll {
+            let content = content_w.round().max(1.0) as u32;
+            content
+                .saturating_sub(scroll_side_margin(content).saturating_mul(2))
+                .max(1) as f32
+        } else {
+            content_w
+        };
+        (target_w / natural).clamp(0.1, 1.0)
     }
 
     fn visible_page_count(&self) -> usize {
@@ -1019,24 +1037,39 @@ impl App {
         self.scroll_in_page = position - self.page_offsets.get(index).copied().unwrap_or(0) as f32;
     }
 
-    /// Scroll by device pixels. The strip is re-centered around the new top
-    /// page, but the visible position is preserved.
+    /// Scroll by device pixels. The position is continuous: when it runs past
+    /// the rendered strip the remainder is remembered and replayed as soon as
+    /// a strip with more pages arrives, so fast scrolling is never discarded.
     fn scroll_document(&mut self, delta: f32) {
         if !self.strip_scroll || self.pages.is_empty() {
             return;
         }
+        if delta > 0.0 {
+            self.scroll_direction = 1;
+        } else if delta < 0.0 {
+            self.scroll_direction = -1;
+        }
         let scale = self.display_scale().max(0.001);
-        let position = self.scroll_position() + delta / scale;
+        let position = self.scroll_position() + self.scroll_pending + delta / scale;
         let (_, viewport_h) = self.viewport();
         let view_h = viewport_h as f32 / scale;
-        // Clamp to the strip's actual extent so fast scrolling never lands in
-        // blank space past the last rendered page. Crossing a page boundary
-        // re-centers the strip and brings in the missing pages.
+        // Clamp the visible position to what is actually rendered, but keep the
+        // overshoot as pending input instead of dropping it.
         let strip_bottom = self.page_offsets.last().copied().unwrap_or(0) as f32
             + self.page_heights.last().copied().unwrap_or(0) as f32;
-        let position = position.clamp(0.0, (strip_bottom - view_h).max(0.0));
-        self.set_scroll_position(position);
-        self.maybe_recenter_scroll();
+        let clamped = position.clamp(0.0, (strip_bottom - view_h).max(0.0));
+        let mut pending = position - clamped;
+        // At a real document edge there is no strip that can consume the
+        // overshoot; drop it so reversing direction responds immediately.
+        let at_end =
+            self.pages.last().copied().unwrap_or(0) >= self.page_count.unwrap_or(usize::MAX);
+        let at_start = self.pages.first().copied().unwrap_or(1) <= 1;
+        if (pending > 0.0 && at_end) || (pending < 0.0 && at_start) {
+            pending = 0.0;
+        }
+        self.scroll_pending = pending;
+        self.set_scroll_position(clamped);
+        self.maybe_prefetch_scroll();
         let page = self.reading_page();
         if !self.outline_open && self.recorded_page != Some(page) {
             self.progress.record(&self.path, page);
@@ -1046,25 +1079,47 @@ impl App {
         self.request_redraw();
     }
 
-    /// Ask the worker for a strip centered on the new top page. The next
-    /// `Page` event keeps the anchor instead of jumping to the page start.
-    fn maybe_recenter_scroll(&mut self) {
+    /// Pages to render above the anchor for the current travel direction.
+    fn scroll_before(&self) -> usize {
+        if self.scroll_direction < 0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Ask the worker for a strip around the current anchor. The next `Page`
+    /// event keeps the visual position instead of jumping to a page start.
+    fn request_scroll_recenter(&mut self, before: usize) {
+        let anchor = self.scroll_anchor.max(1);
+        self.scroll_recenter_pending = Some(anchor);
+        self.scroll_keep_anchor = true;
+        self.send(Command::ScrollTo { anchor, before });
+    }
+
+    /// Slide the rendered window before the viewport reaches an edge. Doing it
+    /// a page early hides render latency so scrolling stays continuous, and
+    /// the guard against a non-moving window prevents a request loop when the
+    /// strip is already as large as the texture budget allows.
+    fn maybe_prefetch_scroll(&mut self) {
         if !self.strip_scroll || self.pages.len() < 2 {
             return;
         }
-        // Only one re-center may be in flight. Sending overlapping requests
-        // would let an older strip arrive after the anchor moved and snap the
-        // viewport back to a page top.
         if self.scroll_recenter_pending.is_some() {
             return;
         }
-        let anchor = self.scroll_anchor;
-        if anchor == self.page {
+        if !self.pages.contains(&self.scroll_anchor) {
+            self.request_scroll_recenter(self.scroll_before());
             return;
         }
-        self.scroll_recenter_pending = Some(anchor);
-        self.scroll_keep_anchor = true;
-        self.send(Command::ScrollTo(anchor));
+        if let Some(before) = scroll_prefetch_before(
+            &self.pages,
+            self.scroll_anchor,
+            self.scroll_direction,
+            self.page_count,
+        ) {
+            self.request_scroll_recenter(before);
+        }
     }
 
     fn clamp_scroll(&mut self) {
@@ -1469,6 +1524,8 @@ impl App {
         }
         self.scroll_anchor = page;
         self.scroll_in_page = 0.0;
+        self.scroll_pending = 0.0;
+        self.scroll_direction = 1;
         let reading = self.reading_page();
         if !self.outline_open && self.recorded_page != Some(reading) {
             self.progress.record(&self.path, reading);
@@ -1483,6 +1540,7 @@ impl App {
     fn clear_scroll_recenter(&mut self) {
         self.scroll_keep_anchor = false;
         self.scroll_recenter_pending = None;
+        self.scroll_pending = 0.0;
     }
 
     /// Record a destination jump. Page turns and scrolling do not call this;
@@ -2884,6 +2942,22 @@ impl App {
             self.pending_zooms.pop_front();
         }
 
+        // A stale scroll strip that no longer contains the anchor cannot
+        // represent the current position. Dropping it instead of snapping to
+        // its focus page keeps fast scrolling stable; ask for a fresh window
+        // that actually includes the anchor.
+        if self.strip_scroll
+            && page.scroll
+            && self.bitmap.is_some()
+            && self.scroll_keep_anchor
+            && !page.pages.is_empty()
+            && !page.pages.contains(&self.scroll_anchor)
+        {
+            self.scroll_recenter_pending = None;
+            self.request_scroll_recenter(self.scroll_before());
+            return;
+        }
+
         // Scroll positions are stored in bitmap pixels, which scale with the
         // window. Capture the old geometry so a resize can preserve the
         // fraction of the page that is scrolled past, not just the raw pixel
@@ -2976,16 +3050,21 @@ impl App {
             self.scroll_in_page = self.scroll_in_page.clamp(0.0, (next - start).max(0.0));
             self.scroll_keep_anchor = false;
             self.scroll_recenter_pending = None;
-            // The reader may have scrolled past this strip while it rendered.
-            // Catch the anchor up now that the previous request is complete.
-            if self.scroll_anchor != self.page {
-                self.maybe_recenter_scroll();
+            // Replay any scroll that arrived while this strip was rendering.
+            // If it still runs past the new strip, it stays pending and the
+            // prefetch below requests yet another window.
+            let pending = std::mem::take(&mut self.scroll_pending);
+            if pending.abs() > 0.01 {
+                self.scroll_document(pending * self.display_scale());
+            } else {
+                self.maybe_prefetch_scroll();
             }
         } else {
             self.scroll_anchor = self.page;
             self.scroll_in_page = 0.0;
             self.scroll_keep_anchor = false;
             self.scroll_recenter_pending = None;
+            self.scroll_pending = 0.0;
         }
         if self.pending_zooms.is_empty() {
             self.last_requested_scale = new_scale;
@@ -3476,7 +3555,13 @@ impl App {
                 // strip via the saved anchor.
                 let content_w = (vw - content_left).max(1);
                 let scale = if self.resize_preview {
-                    (content_w as f32 / page.width.max(1) as f32).max(0.01)
+                    // A preview also keeps the scroll column's side margins
+                    // instead of stretching the old bitmap edge to edge.
+                    let content = content_w.max(1) as u32;
+                    let target = content
+                        .saturating_sub(scroll_side_margin(content).saturating_mul(2))
+                        .max(1) as f32;
+                    (target / page.width.max(1) as f32).max(0.01)
                 } else {
                     self.display_scale()
                 };
@@ -3976,6 +4061,35 @@ fn window_index_for(pages: &[usize], page: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Decide whether the rendered scroll window should slide to keep lookahead in
+/// the direction of travel. Returns how many pages to render above the anchor.
+/// Returning `None` when the window would not move prevents a request loop at
+/// the start or end of the document and at the texture-size limit.
+fn scroll_prefetch_before(
+    pages: &[usize],
+    anchor: usize,
+    direction: i32,
+    page_count: Option<usize>,
+) -> Option<usize> {
+    if pages.len() < 2 {
+        return None;
+    }
+    let index = pages.iter().position(|&page| page == anchor)?;
+    let last = pages.len() - 1;
+    let current_start = pages.first().copied().unwrap_or(1).saturating_sub(1);
+    let count = page_count.unwrap_or(usize::MAX);
+    let can_go_forward = pages.last().copied().unwrap_or(0) < count;
+    let can_go_backward = pages.first().copied().unwrap_or(1) > 1;
+    let window_start = |before: usize| anchor.max(1).saturating_sub(1).saturating_sub(before);
+    if direction >= 0 {
+        // One page of lookahead is enough to hide the next render.
+        (can_go_forward && index + 1 >= last && window_start(1) > current_start).then_some(1)
+    } else {
+        // Moving up keeps two pages above the anchor, still one below it.
+        (can_go_backward && index == 0 && window_start(2) < current_start).then_some(2)
+    }
+}
+
 /// Bottom edge of a page inside a vertical scroll strip, used when the next
 /// page's offset is unavailable (the last page of the strip).
 fn page_offsets_end(offsets: &[u32], heights: &[u32], index: usize) -> u32 {
@@ -4166,6 +4280,49 @@ mod tests {
         let (css, theme) = configured_styles(&config);
         assert_eq!(css, config.reflowable_css());
         assert_eq!(theme, Theme::from_css(css.as_deref()));
+    }
+
+    #[test]
+    fn scroll_prefetch_slides_only_when_a_new_window_is_possible() {
+        // Downward: anchor is the third page, so one page of lookahead remains.
+        assert_eq!(
+            scroll_prefetch_before(&[10, 11, 12, 13], 12, 1, Some(200)),
+            Some(1)
+        );
+        // Anchor in the middle already has two pages ahead.
+        assert_eq!(
+            scroll_prefetch_before(&[10, 11, 12, 13], 11, 1, Some(200)),
+            None
+        );
+        // Nothing ahead at the end of the document.
+        assert_eq!(
+            scroll_prefetch_before(&[197, 198, 199, 200], 199, 1, Some(200)),
+            None
+        );
+        // Upward: anchor at the top edge slides two pages behind it.
+        assert_eq!(
+            scroll_prefetch_before(&[10, 11, 12, 13], 10, -1, Some(200)),
+            Some(2)
+        );
+        // Nothing behind at the start of the document.
+        assert_eq!(
+            scroll_prefetch_before(&[1, 2, 3, 4], 1, -1, Some(200)),
+            None
+        );
+        // A three-page zoom strip must not loop after sliding.
+        assert_eq!(
+            scroll_prefetch_before(&[10, 11, 12], 12, 1, Some(200)),
+            Some(1)
+        );
+        assert_eq!(
+            scroll_prefetch_before(&[11, 12, 13], 12, 1, Some(200)),
+            None
+        );
+        // An anchor outside the window is the caller's stale-strip case.
+        assert_eq!(
+            scroll_prefetch_before(&[10, 11, 12, 13], 20, 1, Some(200)),
+            None
+        );
     }
 
     #[test]

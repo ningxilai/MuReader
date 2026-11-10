@@ -152,8 +152,14 @@ window that cannot fit a comfortable pair uses continuous scroll automatically.
 Page numbers are the shared coordinate: switching modes and following outline,
 search, or link destinations lands at the start of that page, and while
 scrolling the title and progress report the page at the top of the viewport.
-Continuous scroll works for fixed-layout documents such as PDFs as well as
-reflowable ones.
+Continuous scroll is a sliding page window rather than a sequence of page
+jumps: the rendered window prefetches in the direction of travel, input that
+runs past it is replayed when new pages arrive, the viewport never snaps back
+to a worker focus page, and one scale stays locked for the session so pages of
+different sizes cannot re-zoom mid-scroll. The column also keeps side margins
+in every window geometry, including narrow windows and while the outline is
+open. Continuous scroll works for fixed-layout documents such as PDFs as well
+as reflowable ones.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -241,6 +247,13 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Continuous scroll now slides a prefetched page window instead of jumping
+  between fixed strips. Scroll input that runs past the rendered window is kept
+  and replayed when more pages arrive, the direction of travel decides how much
+  lookahead is kept, a stale strip can no longer re-base the viewport onto its
+  focus page, the column locks one scale for the whole scroll session so mixed
+  page sizes cannot re-zoom mid-scroll, and it always reserves side margins,
+  even in narrow windows and with the outline open.
 - The outline, command panel, prompts, loading card, and search/selection
   highlights now share one CSS-derived theme. `body`/`html`/`:root` background
   and color supply the base, with `--mureader-*` custom properties for

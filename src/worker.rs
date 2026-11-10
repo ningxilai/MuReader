@@ -43,8 +43,12 @@ pub enum Command {
     FirstPage,
     LastPage,
     GotoPage(usize),
-    /// Re-center a scroll strip without treating it as a page jump.
-    ScrollTo(usize),
+    /// Slide the scroll window around an anchor page without treating it as a
+    /// page jump. `before` is how many pages to render above the anchor.
+    ScrollTo {
+        anchor: usize,
+        before: usize,
+    },
     ZoomIn,
     ZoomOut,
     FontScale(f32),
@@ -213,11 +217,13 @@ fn run(
                     }
                 }
             }
-            Command::ScrollTo(page) => {
+            Command::ScrollTo { anchor, before } => {
                 if let Some(engine) = engine.as_mut() {
-                    if engine.scroll_to(page) {
-                        render_and_send(engine, &proxy);
-                    }
+                    engine.scroll_to(anchor, before);
+                    // Always answer: the UI drops strips that cannot represent
+                    // its current position, so a no-op change still needs a
+                    // fresh window around the anchor.
+                    render_and_send(engine, &proxy);
                 }
             }
             Command::ZoomIn => {
