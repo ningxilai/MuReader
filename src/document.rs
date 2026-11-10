@@ -10,8 +10,15 @@
 //! laid out once when it is opened, and its page count comes from that same
 //! layout. A two-page spread is rendered as one composite bitmap, with text,
 //! highlight, and link coordinates shifted into the composite space.
+//!
+//! MuPDF's reflow engine treats a standalone illustration like any other
+//! block, so it lands on a synthetic page with canvas around it. Continuous
+//! scroll instead crops such a page to its images and renders the plate at
+//! the reading-column width, which keeps the picture's aspect ratio and lets
+//! tall plates flow past the viewport. Pages that also contain text, paged
+//! layouts, and explicit zooms keep the whole synthetic page.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,6 +77,14 @@ const SCROLL_STRIP_PAGES: usize = 4;
 /// Cap the strip so it stays within common GPU texture limits. The automatic
 /// width fit shrinks slightly for extreme aspect ratios instead of failing.
 const SCROLL_STRIP_MAX_HEIGHT: f32 = 8192.0;
+/// A standalone illustration may extend past a synthesized reflow page, but
+/// keep one plate within a sane bitmap height so a pathological aspect ratio
+/// cannot allocate an enormous texture.
+const IMAGE_PAGE_MAX_HEIGHT: f32 = 4096.0;
+/// Do not blow a small image up beyond this multiple of the normal page fit.
+/// The reflow engine may already have scaled it down, so some upscaling is
+/// expected, but unbounded growth would only produce a blurry plate.
+const IMAGE_PAGE_MAX_UPSCALE: f32 = 4.0;
 
 /// Vertical breathing room between pages in the scroll strip.
 pub fn scroll_gap(page_width: u32) -> u32 {
@@ -124,6 +139,26 @@ pub struct HighlightRect {
     pub y0: u32,
     pub x1: u32,
     pub y1: u32,
+}
+
+/// Region of a rendered page bitmap to keep. Standalone illustrations are
+/// cropped out of the synthesized reflow page they were laid out on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BitmapCrop {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// How one page will be rasterized into the current strip.
+struct PagePlan {
+    scale: f32,
+    ctm: Matrix,
+    crop: Option<BitmapCrop>,
+    /// Full rendered page height before cropping, used to keep a scroll strip
+    /// within the GPU texture limit.
+    height: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +442,10 @@ pub struct RenderEngine {
     /// One canvas color interpolated from pages across the whole book. The UI
     /// derives a single palette from this instead of re-reading every page.
     book_background: u32,
+    /// Image bounds per reflow page. The reflow layout is fixed until the text
+    /// size changes, so extracting the text page once per page is enough to
+    /// keep repeated scroll renders from re-reading it.
+    image_bounds_cache: HashMap<usize, Option<Rect>>,
     /// Recently rendered pages for the spread strip. Consecutive page turns
     /// overlap three of the four pages, so reusing them avoids rasterizing
     /// the whole strip on every turn. Each entry records the scale it was
@@ -493,6 +532,7 @@ impl RenderEngine {
             font_size: LAYOUT_EM,
             background: DEFAULT_WINDOW,
             book_background: DEFAULT_WINDOW,
+            image_bounds_cache: HashMap::new(),
             page_cache: Vec::new(),
             #[cfg(test)]
             page_renders: 0,
@@ -518,6 +558,7 @@ impl RenderEngine {
             return Ok(false);
         }
         self.page_cache.clear();
+        self.image_bounds_cache.clear();
         self.scroll_scale = None;
         let old_page = self.page;
         let old_count = self.page_count.unwrap_or(1).max(1);
@@ -764,6 +805,51 @@ impl RenderEngine {
             }),
             _ => false,
         })
+    }
+
+    /// Bounds of the illustrations on a reflow page that contains no visible
+    /// text. Returns `None` for normal pages, so only standalone plates are
+    /// rendered as images instead of as synthetic pages.
+    fn image_page_bounds(&mut self, page_no: usize) -> Option<Rect> {
+        if !self.reflowable {
+            return None;
+        }
+        if let Some(cached) = self.image_bounds_cache.get(&page_no) {
+            return *cached;
+        }
+        let bounds = self.extract_image_page_bounds(page_no);
+        self.image_bounds_cache.insert(page_no, bounds);
+        bounds
+    }
+
+    fn extract_image_page_bounds(&self, page_no: usize) -> Option<Rect> {
+        let page = self.doc.load_page(page_no as i32).ok()?;
+        let text_page = page.to_text_page(TextPageFlags::PRESERVE_IMAGES).ok()?;
+        let mut bounds: Option<Rect> = None;
+        for block in text_page.blocks() {
+            match block.r#type() {
+                mupdf::text_page::TextBlockType::Image => {
+                    let rect = block.bounds();
+                    if rect.is_valid() && !rect.is_empty() {
+                        bounds = Some(match bounds {
+                            Some(current) => current.r#union(&rect),
+                            None => rect,
+                        });
+                    }
+                }
+                mupdf::text_page::TextBlockType::Text => {
+                    let has_text = block.lines().any(|line| {
+                        line.chars()
+                            .any(|ch| ch.char().is_some_and(|c| !c.is_whitespace()))
+                    });
+                    if has_text {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        bounds
     }
 
     /// Set the window color used behind the spread gutter.
@@ -1073,15 +1159,26 @@ impl RenderEngine {
             .map_err(|e| format!("search page {}: {e}", page_no + 1))
     }
 
+    /// Reading column width used by continuous scroll, excluding the side
+    /// margins that keep the page clear of the window edges.
+    fn scroll_available_width(&self) -> f32 {
+        self.viewport
+            .0
+            .saturating_sub(scroll_side_margin(self.viewport.0).saturating_mul(2))
+            .max(1) as f32
+    }
+
     fn scale_for(&mut self, bounds: &Rect) -> Result<f32, String> {
         let (rotated_w, rotated_h) = rotated_size(bounds, self.rotation);
 
-        let horizontal_inset = if self.scroll {
-            scroll_side_margin(self.viewport.0).saturating_mul(2)
+        let available_w = if self.scroll {
+            self.scroll_available_width()
         } else {
-            MARGIN.saturating_mul(2)
+            self.viewport
+                .0
+                .saturating_sub(MARGIN.saturating_mul(2))
+                .max(1) as f32
         };
-        let available_w = self.viewport.0.saturating_sub(horizontal_inset).max(1) as f32;
         let available_h = self
             .viewport
             .1
@@ -1156,10 +1253,69 @@ impl RenderEngine {
         base * Matrix::new_translate(-min_x, -min_y)
     }
 
+    /// Choose the render scale and transform for one page in the current strip.
+    ///
+    /// MuPDF's reflow engine places a standalone illustration on a synthetic
+    /// 612x792 page and pads the rest with canvas. Rendering that page as-is
+    /// shows the image inside a simulated page with white margins. In
+    /// continuous scroll, crop to the illustration and render it at the
+    /// reading column width instead, so tall plates keep their aspect ratio
+    /// and flow through the viewport instead of being forced into a page.
+    fn page_plan(
+        &mut self,
+        page_no: usize,
+        base_scale: f32,
+        max_image_height: f32,
+    ) -> Result<PagePlan, String> {
+        let bounds = self
+            .doc
+            .load_page(page_no as i32)
+            .and_then(|page| page.bounds())
+            .map_err(|e| format!("page bounds: {e}"))?;
+
+        if self.scroll && self.fit == Fit::Page {
+            if let Some(image) = self.image_page_bounds(page_no) {
+                let (rotated_w, rotated_h) = rotated_size(&image, self.rotation);
+                let (page_w, page_h) = rotated_size(&bounds, self.rotation);
+                if rotated_w > 0.0 && rotated_h > 0.0 && page_w > 0.0 && page_h > 0.0 {
+                    let scale = (self.scroll_available_width() / rotated_w)
+                        .min(base_scale * IMAGE_PAGE_MAX_UPSCALE)
+                        .min(MAX_SCALE)
+                        .min(MAX_DIMENSION / page_w)
+                        .min(MAX_DIMENSION / page_h)
+                        .min((MAX_PIXELS / (page_w * page_h)).sqrt())
+                        .min(max_image_height / page_h);
+                    if scale.is_finite() && scale > 0.0 {
+                        let ctm = self.ctm_for(&bounds, scale);
+                        if let Some(crop) = crop_for_image(&image, &ctm, page_w, page_h, scale) {
+                            return Ok(PagePlan {
+                                scale,
+                                ctm,
+                                crop: Some(crop),
+                                height: (page_h * scale).round().max(1.0),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(PagePlan {
+            scale: base_scale,
+            ctm: self.ctm_for(&bounds, base_scale),
+            crop: None,
+            height: {
+                let (_, page_h) = rotated_size(&bounds, self.rotation);
+                (page_h * base_scale).round().max(1.0)
+            },
+        })
+    }
+
     fn render_one(
         &self,
         page_no: usize,
         ctm: &Matrix,
+        crop: Option<BitmapCrop>,
         quads: &[Quad],
     ) -> Result<PageRender, String> {
         let page = self
@@ -1170,23 +1326,51 @@ impl RenderEngine {
             .to_pixmap(ctm, &Colorspace::device_rgb(), false, true)
             .map_err(|e| format!("render page {}: {e}", page_no + 1))?;
 
-        let bitmap = bitmap_from_pixmap(&pix);
+        // The pixmap may start at a non-zero device coordinate; bitmap index 0
+        // corresponds to `pix.x()`/`pix.y()`.
+        let crop_bitmap_region = crop.map(|crop| {
+            let x = crop.x as i64 - pix.x() as i64;
+            let y = crop.y as i64 - pix.y() as i64;
+            let x = x.clamp(0, pix.width().saturating_sub(1) as i64) as u32;
+            let y = y.clamp(0, pix.height().saturating_sub(1) as i64) as u32;
+            let width = crop.width.min(pix.width() - x).max(1);
+            let height = crop.height.min(pix.height() - y).max(1);
+            BitmapCrop {
+                x,
+                y,
+                width,
+                height,
+            }
+        });
+
+        let full = bitmap_from_pixmap(&pix);
+        let bitmap = match crop_bitmap_region {
+            Some(region) => crop_bitmap(&full, region),
+            None => full,
+        };
+        // Content coordinates follow the bitmap after a crop. Shifting the
+        // transform is equivalent to translating every finished rectangle,
+        // and keeps highlights, links, and text clipping in one place.
+        let content_ctm = match crop {
+            Some(crop) => ctm.clone() * Matrix::new_translate(-(crop.x as f32), -(crop.y as f32)),
+            None => ctm.clone(),
+        };
         let width = bitmap.width;
         let height = bitmap.height;
         let highlights = quads
             .iter()
-            .filter_map(|quad| highlight_from_quad(quad, ctm, width, height))
+            .filter_map(|quad| highlight_from_quad(quad, &content_ctm, width, height))
             .collect();
         let text = page
             .to_text_page(TextPageFlags::PRESERVE_WHITESPACE)
-            .map(|text_page| text_layer_from_page(&text_page, ctm, width, height))
+            .map(|text_page| text_layer_from_page(&text_page, &content_ctm, width, height))
             .unwrap_or_default();
         let links = page
             .links()
             .map(|links| {
                 links
                     .filter_map(|link| {
-                        let bounds = link_rect(&link.bounds, ctm, width, height)?;
+                        let bounds = link_rect(&link.bounds, &content_ctm, width, height)?;
                         let target = link
                             .dest
                             .and_then(|dest| usize::try_from(dest.loc.page_number).ok())
@@ -1289,47 +1473,63 @@ impl RenderEngine {
             .map_err(|e| format!("page bounds: {e}"))?;
         let scale = self.scale_for(&scale_bounds)?;
         self.scale = scale;
-        let first_bounds = if scale_no == first_no {
-            scale_bounds
-        } else {
-            self.doc
-                .load_page(first_no as i32)
-                .and_then(|page| page.bounds())
-                .map_err(|e| format!("page bounds: {e}"))?
-        };
-        let first_ctm = self.ctm_for(&first_bounds, scale);
 
         // Search highlights apply to the page being read, which may not be the
         // first page of a scroll strip. Normal reading reuses cached pages.
+        let mut plans = Vec::with_capacity(numbers.len());
+        for &page_no in &numbers {
+            plans.push(self.page_plan(page_no, scale, IMAGE_PAGE_MAX_HEIGHT)?);
+        }
+        // Illustrations are much taller than text pages. If a strip of them
+        // would exceed the texture height limit, shrink only the image pages
+        // so their total still fits; text pages keep the locked column scale.
+        if self.scroll && numbers.len() > 1 {
+            let gap = scroll_gap(self.scroll_available_width().round() as u32) as f32;
+            let total: f32 = plans.iter().map(|plan| plan.height).sum::<f32>()
+                + gap * (numbers.len() - 1) as f32;
+            if total > SCROLL_STRIP_MAX_HEIGHT {
+                let image_total: f32 = plans
+                    .iter()
+                    .filter(|plan| plan.crop.is_some())
+                    .map(|plan| plan.height)
+                    .sum();
+                if image_total > 0.0 {
+                    let other_total = total - image_total;
+                    let budget = (SCROLL_STRIP_MAX_HEIGHT - other_total).max(1.0);
+                    let factor = (budget / image_total).min(1.0);
+                    for (index, &page_no) in numbers.iter().enumerate() {
+                        if plans[index].crop.is_some() {
+                            let cap = plans[index].height * factor;
+                            plans[index] = self.page_plan(page_no, scale, cap)?;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut direct = Vec::new();
+        let mut page_scales = Vec::with_capacity(numbers.len());
         for (index, &page_no) in numbers.iter().enumerate() {
+            let plan = &plans[index];
+            let page_scale = plan.scale;
+            page_scales.push(page_scale);
             if cacheable
                 && self.page_cache.iter().any(|(cached, cached_scale, _)| {
-                    *cached == page_no && (*cached_scale - scale).abs() < 1.0e-4
+                    *cached == page_no && (*cached_scale - page_scale).abs() < 1.0e-4
                 })
             {
                 continue;
             }
-            let ctm = if index == 0 {
-                first_ctm.clone()
-            } else {
-                let bounds = self
-                    .doc
-                    .load_page(page_no as i32)
-                    .and_then(|page| page.bounds())
-                    .map_err(|e| format!("page bounds: {e}"))?;
-                self.ctm_for(&bounds, scale)
-            };
             let page_quads = if page_no == self.page { quads } else { &[] };
             #[cfg(test)]
             {
                 self.page_renders += 1;
             }
-            let rendered = self.render_one(page_no, &ctm, page_quads)?;
+            let rendered = self.render_one(page_no, &plan.ctm, plan.crop, page_quads)?;
             if cacheable {
                 self.page_cache.retain(|(cached, _, _)| *cached != page_no);
                 self.make_room_for_page(&numbers);
-                self.page_cache.push((page_no, scale, rendered));
+                self.page_cache.push((page_no, page_scale, rendered));
             } else {
                 direct.push(rendered);
             }
@@ -1337,10 +1537,11 @@ impl RenderEngine {
 
         let rendered: Vec<&PageRender> = if cacheable {
             let mut refs = Vec::with_capacity(numbers.len());
-            for page_no in &numbers {
+            for (index, page_no) in numbers.iter().enumerate() {
+                let page_scale = page_scales[index];
                 let Some((_, _, page)) =
                     self.page_cache.iter().find(|(cached, cached_scale, _)| {
-                        cached == page_no && (*cached_scale - scale).abs() < 1.0e-4
+                        cached == page_no && (*cached_scale - page_scale).abs() < 1.0e-4
                     })
                 else {
                     return Err("page cache missing a rendered page".to_string());
@@ -1812,6 +2013,58 @@ fn rotated_size(bounds: &Rect, rotation: u16) -> (f32, f32) {
         (width, height)
     } else {
         (height, width)
+    }
+}
+
+/// Map the illustration's page-space bounds into the rendered page bitmap and
+/// clamp them to its pixels. Returns `None` when rounding leaves no area.
+fn crop_for_image(
+    image: &Rect,
+    ctm: &Matrix,
+    page_w: f32,
+    page_h: f32,
+    scale: f32,
+) -> Option<BitmapCrop> {
+    let transformed = image.transform(ctm);
+    let page_px_w = (page_w * scale).round().max(1.0) as i64;
+    let page_px_h = (page_h * scale).round().max(1.0) as i64;
+    let x0 = transformed.x0.floor().max(0.0).min(page_px_w as f32) as i64;
+    let y0 = transformed.y0.floor().max(0.0).min(page_px_h as f32) as i64;
+    let x1 = transformed.x1.ceil().max(0.0).min(page_px_w as f32) as i64;
+    let y1 = transformed.y1.ceil().max(0.0).min(page_px_h as f32) as i64;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(BitmapCrop {
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    })
+}
+
+/// Keep only the crop region of a rendered page bitmap.
+fn crop_bitmap(bitmap: &PageBitmap, crop: BitmapCrop) -> PageBitmap {
+    if bitmap.width == 0 || bitmap.height == 0 {
+        return PageBitmap {
+            width: bitmap.width,
+            height: bitmap.height,
+            pixels: bitmap.pixels.clone(),
+        };
+    }
+    let x = crop.x.min(bitmap.width - 1);
+    let y = crop.y.min(bitmap.height - 1);
+    let width = crop.width.min(bitmap.width - x).max(1);
+    let height = crop.height.min(bitmap.height - y).max(1);
+    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+    for row in 0..height {
+        let start = ((y + row) * bitmap.width + x) as usize;
+        pixels.extend_from_slice(&bitmap.pixels[start..start + width as usize]);
+    }
+    PageBitmap {
+        width,
+        height,
+        pixels,
     }
 }
 
@@ -2626,6 +2879,98 @@ mod tests {
         assert_eq!(recentered.pages, vec![3, 4, 5, 6]);
         assert_eq!(recentered.page_offsets[0], 0);
         assert_eq!(recentered.book_background, book_background);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standalone_illustrations_flow_at_reading_width() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("image-layout");
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="600"><rect width="300" height="600" fill="#336699"/><circle cx="150" cy="300" r="120" fill="#ffcc00"/></svg>"##;
+        std::fs::write(dir.join("tall.svg"), svg).unwrap();
+        let path = dir.join("image.html");
+        std::fs::write(
+            &path,
+            r#"<!doctype html><html><body><img src="tall.svg"></body></html>"#,
+        )
+        .unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+
+        let strip = engine.render().unwrap();
+        let width = strip.page_widths[0];
+        let height = strip.page_heights[0];
+        let column = engine.scroll_available_width().round() as u32;
+        assert!(
+            width.abs_diff(column) <= 1,
+            "illustration width {width} should fill the {column}px reading column"
+        );
+        // A 300x600 illustration is 1:2, so the rendered plate must keep that
+        // aspect ratio instead of being forced into a 612x792 page.
+        let ratio = height as f32 / width as f32;
+        assert!(
+            (ratio - 2.0).abs() < 0.02,
+            "illustration aspect ratio {ratio} should stay close to 2.0"
+        );
+        // The page was cropped to the illustration, so the corners carry the
+        // image instead of the simulated page's white margins.
+        let corner = strip.bitmap.pixels[0];
+        let center = strip.bitmap.pixels
+            [(height as usize / 2) * strip.bitmap.width as usize + width as usize / 2];
+        assert_ne!(corner, 0x00ff_ffff, "cropped plate must not start white");
+        assert_eq!(
+            center, 0x00ff_cc00,
+            "the illustration disc should be visible"
+        );
+
+        // Rotation swaps the plate's axes and still fits the reading column.
+        engine.rotate(90);
+        let rotated = engine.render().unwrap();
+        let (rotated_w, rotated_h) = (rotated.page_widths[0], rotated.page_heights[0]);
+        assert!(
+            rotated_w > rotated_h,
+            "a quarter-turned portrait plate should become landscape"
+        );
+        assert!(
+            rotated_w.abs_diff(column) <= 1,
+            "a rotated plate should still fill the reading column"
+        );
+        engine.rotate(-90);
+
+        // Paged mode keeps whole synthetic pages: the image stays inside the
+        // page box rather than being cropped out of it.
+        engine.set_layout(true);
+        let paged = engine.render().unwrap();
+        let paged_ratio = paged.page_heights[0] as f32 / paged.page_widths[0] as f32;
+        assert!(
+            (paged_ratio - 792.0 / 612.0).abs() < 0.05,
+            "paged mode should render a whole 612x792 page, got {paged_ratio}"
+        );
+
+        // A page with a caption is not a standalone plate, so it keeps its
+        // page layout and must not be cropped to the image bounds.
+        engine.set_layout(false);
+        let mixed = dir.join("mixed.html");
+        std::fs::write(
+            &mixed,
+            r#"<!doctype html><html><body><img src="tall.svg"><p>A caption runs beneath the illustration and makes this a text page.</p></body></html>"#,
+        )
+        .unwrap();
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut mixed_engine = RenderEngine::open(&mixed, catalog, None, false).unwrap();
+        mixed_engine.set_viewport(900, 1200);
+        mixed_engine.set_layout(false);
+        let mixed_strip = mixed_engine.render().unwrap();
+        let mixed_ratio = mixed_strip.page_heights[0] as f32 / mixed_strip.page_widths[0] as f32;
+        assert!(
+            (mixed_ratio - 792.0 / 612.0).abs() < 0.05,
+            "a captioned image page should keep page proportions, got {mixed_ratio}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

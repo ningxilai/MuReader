@@ -159,7 +159,13 @@ to a worker focus page, and one scale stays locked for the session so pages of
 different sizes cannot re-zoom mid-scroll. The column also keeps side margins
 in every window geometry, including narrow windows and while the outline is
 open. Continuous scroll works for fixed-layout documents such as PDFs as well
-as reflowable ones.
+as reflowable ones. In a reflowable document, a page that holds only an
+illustration is drawn as the illustration itself: MuPDF still lays it out on
+its simulated page, but the reader crops to the picture and scales it to the
+reading-column width, keeping the picture's own aspect ratio so a tall plate
+flows past the viewport instead of sitting inside a page-shaped frame with
+white margins. Pages that also carry text, paged spreads, and an explicit zoom
+keep the whole page.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -247,6 +253,12 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Standalone illustrations in reflowable documents no longer sit on MuPDF's
+  simulated 612x792 reflow page. In continuous scroll the reader crops such a
+  page to its images and renders them at the reading-column width with their
+  natural aspect ratio, so tall plates flow through the viewport instead of
+  being framed by page margins. Captioned pages, paged spreads, and explicit
+  zoom still render whole pages.
 - Continuous scroll now slides a prefetched page window instead of jumping
   between fixed strips. Scroll input that runs past the rendered window is kept
   and replayed when more pages arrive, the direction of travel decides how much
