@@ -158,20 +158,26 @@ runs past it is replayed when new pages arrive, the viewport never snaps back
 to a worker focus page, and one scale stays locked for the session so pages of
 different sizes cannot re-zoom mid-scroll. The column also keeps side margins
 in every window geometry, including narrow windows and while the outline is
-open. Arrow keys move one line at a time, matching a mouse-wheel notch, while
-`Space`/`PageDown` and `PageUp` move most of a screen. Key steps and wheel
-notches glide smoothly over a few frames, following the same idea as CSSOM
-View's `scroll-behavior: smooth` and EPUB's scrolled-continuous flow, so
-holding an arrow key carries the column forward instead of stepping it page by
-page. Trackpad pixel deltas stay direct. Continuous scroll works for
-fixed-layout documents such as PDFs as well
+open. Reflowable pages are cropped at a shared page-margin baseline measured
+across the roll, so the simulated page chrome never appears between paragraphs,
+lines, or illustrations: the story reads as one continuous roll with no
+page-break gaps. Real paragraph and chapter margins survive at a seam, so a new
+chapter keeps its breathing room instead of butting against the previous text.
+Arrow keys move one line at a time, matching a mouse-wheel notch, and the step
+follows the line spacing the document's CSS asks for, while `Space`/`PageDown`
+and `PageUp` move most of a screen. Key steps and wheel notches glide smoothly over a few frames,
+following the same idea as CSSOM View's `scroll-behavior: smooth` and EPUB's
+scrolled-continuous flow, so holding an arrow key carries the column forward
+instead of stepping it page by page. Trackpad pixel deltas stay direct.
+Continuous scroll works for fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
 its simulated page, but the reader crops to the picture and scales it to the
 reading-column width, keeping the picture's own aspect ratio so a tall plate
 flows past the viewport instead of sitting inside a page-shaped frame with
-white margins. Pages that also carry text, paged spreads, and an explicit zoom
-keep the whole page.
+white margins. A page that carries an illustration together with text keeps
+that text in the same flow. Paged spreads, quarter-turned pages, and an
+explicit zoom keep the whole page.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -267,17 +273,30 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   high-resolution trackpad deltas remain direct, and a prefetched window can
   re-center underneath the glide without a visual jump. Paged and explicit-zoom
   modes keep their page-shaped scrolling.
+- Continuous scroll now renders reflowable pages as one unbroken roll instead
+  of a stack of page-shaped blocks. The roll learns the simulated page margin
+  shared by the document's pages and crops every page at that baseline, so
+  fully blank pages disappear and adjacent pages touch with no page chrome or
+  strip gap; text, captions, and illustrations meet naturally across page
+  boundaries. Real paragraph and chapter margins sit below the baseline and
+  survive, so a chapter heading keeps its space instead of butting against the
+  previous chapter. Page numbers remain the shared coordinate with spread mode,
+  outline jumps, and links. Pixel-level regression tests check both that no
+  blank band appears at a normal seam and that a chapter margin is preserved.
 - Arrow keys now move the continuous scroll by one line instead of nearly a
-  full screen. `Down`/`Up` and the mouse wheel share a single-line step, while
-  `Space`, `PageUp`/`PageDown`, and `C-n`/`C-p` keep the larger screen step, so
-  holding an arrow key glides through the column instead of jumping page-sized
-  distances.
+  full screen. `Down`/`Up` and the mouse wheel share a single-line step, and
+  the step is measured from the line spacing the document's CSS produces
+  rather than a fixed pixel guess, so it follows the current text size and
+  zoom. `Space`, `PageUp`/`PageDown`, and `C-n`/`C-p` keep the larger screen
+  step, so holding an arrow key glides through the column instead of jumping
+  page-sized distances.
 - Standalone illustrations in reflowable documents no longer sit on MuPDF's
   simulated 612x792 reflow page. In continuous scroll the reader crops such a
   page to its images and renders them at the reading-column width with their
   natural aspect ratio, so tall plates flow through the viewport instead of
-  being framed by page margins. Captioned pages, paged spreads, and explicit
-  zoom still render whole pages.
+  being framed by page margins. Captioned pages now flow with the same roll;
+  paged spreads, quarter-turned pages, and explicit zoom still render whole
+  pages.
 - Continuous scroll now slides a prefetched page window instead of jumping
   between fixed strips. Scroll input that runs past the rendered window is kept
   and replayed when more pages arrive, the direction of travel decides how much

@@ -89,8 +89,8 @@ const OUTLINE_PREVIEW_DELAY: Duration = Duration::from_millis(90);
 /// exceeds this many pixels so outline browsing cannot stall the UI on an
 /// expensive render/upload.
 const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
-/// One arrow-key press or wheel notch moves the viewport by about one text
-/// line. Page keys keep their full-screen step.
+/// Fallback for the one-line step, used until the first strip reports the
+/// line spacing the document's CSS asks for.
 const SCROLL_LINE_PIXELS: f32 = 60.0;
 /// CSSOM View leaves the smooth-scroll curve to the user agent (`scroll-behavior:
 /// smooth`). Use an exponential ease-out with a short time constant: key
@@ -491,6 +491,9 @@ struct App {
     page_fit: Fit,
     font_scale: f32,
     reflowable: bool,
+    /// Typical line spacing of the reflowable CSS, in layout points. Feeds
+    /// the one-line scroll step.
+    line_height: Option<f32>,
     rotation: u16,
     scroll_x: f32,
     scroll_y: f32,
@@ -630,6 +633,7 @@ impl App {
             page_fit: Fit::Page,
             font_scale: 1.0,
             reflowable: false,
+            line_height: None,
             rotation: 0,
             scroll_x: 0.0,
             scroll_y: 0.0,
@@ -1220,19 +1224,30 @@ impl App {
     }
 
     fn scroll_line_down(&mut self) {
+        let step = self.scroll_line_step();
         if self.scroll_mode() {
-            self.scroll_smoothly(SCROLL_LINE_PIXELS);
+            self.scroll_smoothly(step);
         } else {
-            self.scroll_page_step(SCROLL_LINE_PIXELS);
+            self.scroll_page_step(step);
         }
     }
 
     fn scroll_line_up(&mut self) {
+        let step = self.scroll_line_step();
         if self.scroll_mode() {
-            self.scroll_smoothly(-SCROLL_LINE_PIXELS);
+            self.scroll_smoothly(-step);
         } else {
-            self.scroll_page_step(-SCROLL_LINE_PIXELS);
+            self.scroll_page_step(-step);
         }
+    }
+
+    /// The height of one line, in device pixels. Follows the line spacing
+    /// the reflow layout measures from the document's CSS; falls back to a
+    /// fixed default until the first strip reports it.
+    fn scroll_line_step(&self) -> f32 {
+        self.line_height
+            .map(|line_height| (line_height * self.scale * self.display_scale()).clamp(8.0, 256.0))
+            .unwrap_or(SCROLL_LINE_PIXELS)
     }
 
     /// Scroll inside a page that is taller than the viewport, then turn the
@@ -3123,6 +3138,7 @@ impl App {
         self.page_fit = page.fit;
         self.font_scale = page.font_scale;
         self.reflowable = page.reflowable;
+        self.line_height = page.line_height;
         self.rotation = page.rotation;
         self.highlights = page.highlights;
         self.links = page.links;
@@ -3575,10 +3591,9 @@ impl App {
             return;
         }
         self.finish_animation();
+        let line_step = self.scroll_line_step();
         let (dx, dy, smooth) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => {
-                (x * SCROLL_LINE_PIXELS, y * SCROLL_LINE_PIXELS, true)
-            }
+            MouseScrollDelta::LineDelta(x, y) => (x * line_step, y * line_step, true),
             MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32, false),
         };
         if self.outline_open {

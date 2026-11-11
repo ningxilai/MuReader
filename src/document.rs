@@ -11,12 +11,11 @@
 //! layout. A two-page spread is rendered as one composite bitmap, with text,
 //! highlight, and link coordinates shifted into the composite space.
 //!
-//! MuPDF's reflow engine treats a standalone illustration like any other
-//! block, so it lands on a synthetic page with canvas around it. Continuous
-//! scroll instead crops such a page to its images and renders the plate at
-//! the reading-column width, which keeps the picture's aspect ratio and lets
-//! tall plates flow past the viewport. Pages that also contain text, paged
-//! layouts, and explicit zooms keep the whole synthetic page.
+//! Continuous scroll treats the story as one flow rather than a stack of
+//! simulated pages: every reflowable page is rendered cropped to its content
+//! box (text baselines plus embedded images), blank pages are skipped, and
+//! adjacent blocks touch with no visible gap. Page numbers stay as the shared
+//! coordinate for spread mode, but scrolling itself is page-free.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -151,6 +150,29 @@ struct BitmapCrop {
     height: u32,
 }
 
+/// Vertical content box of a reflowable page, measured from the laid-out
+/// story. Continuous scroll renders only this region, so the synthetic
+/// page margins never appear as gaps between content blocks.
+#[derive(Debug, Clone, Copy)]
+struct RollMetrics {
+    /// Content top in page points: text lines, images, and vector art. This is
+    /// the crop edge after the strip's shared page-margin baseline is applied.
+    top: f32,
+    /// Crop top derived from text lines alone, before images or the strip
+    /// baseline. The document-wide minimum of this value is the simulated page
+    /// margin that continuous scroll removes at every seam.
+    text_top: Option<f32>,
+    /// Content bottom in page points, exclusive.
+    bottom: f32,
+    /// Median distance between consecutive text lines, in page points.
+    line_height: Option<f32>,
+    /// Number of text lines on the page; image-only pages are scaled to the
+    /// reading column like a plate.
+    text_lines: usize,
+    /// Bounds of the image union, set only for image-only pages.
+    plate_bounds: Option<Rect>,
+}
+
 /// How one page will be rasterized into the current strip.
 struct PagePlan {
     scale: f32,
@@ -159,6 +181,10 @@ struct PagePlan {
     /// Full rendered page height before cropping, used to keep a scroll strip
     /// within the GPU texture limit.
     height: f32,
+    /// A standalone illustration rendered at the reading-column width. Only
+    /// these may be shrunk to keep a strip within the texture limit; text
+    /// pages must keep the locked column scale.
+    plate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +400,10 @@ pub struct RenderedPage {
     /// documents this stays at 1.0; page zoom is used instead.
     pub font_scale: f32,
     pub reflowable: bool,
+    /// Typical distance between consecutive text lines, in layout points.
+    /// Continuous scroll uses it as the height of one line step, so the
+    /// step follows the CSS the document asks for instead of a fixed guess.
+    pub line_height: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,10 +472,13 @@ pub struct RenderEngine {
     /// One canvas color interpolated from pages across the whole book. The UI
     /// derives a single palette from this instead of re-reading every page.
     book_background: u32,
-    /// Image bounds per reflow page. The reflow layout is fixed until the text
-    /// size changes, so extracting the text page once per page is enough to
-    /// keep repeated scroll renders from re-reading it.
-    image_bounds_cache: HashMap<usize, Option<Rect>>,
+    /// Vertical content box of a reflowable page, plus its line spacing.
+    /// Used to pack continuous scroll without the simulated page margins.
+    roll_metrics_cache: HashMap<usize, Option<RollMetrics>>,
+    /// Smallest text crop top seen in the roll. This is the simulated page
+    /// margin shared by every page; pages are cropped here so real paragraph
+    /// and chapter margins survive while page chrome disappears.
+    roll_top_baseline: Option<f32>,
     /// Recently rendered pages for the spread strip. Consecutive page turns
     /// overlap three of the four pages, so reusing them avoids rasterizing
     /// the whole strip on every turn. Each entry records the scale it was
@@ -532,7 +565,8 @@ impl RenderEngine {
             font_size: LAYOUT_EM,
             background: DEFAULT_WINDOW,
             book_background: DEFAULT_WINDOW,
-            image_bounds_cache: HashMap::new(),
+            roll_metrics_cache: HashMap::new(),
+            roll_top_baseline: None,
             page_cache: Vec::new(),
             #[cfg(test)]
             page_renders: 0,
@@ -558,7 +592,8 @@ impl RenderEngine {
             return Ok(false);
         }
         self.page_cache.clear();
-        self.image_bounds_cache.clear();
+        self.roll_metrics_cache.clear();
+        self.roll_top_baseline = None;
         self.scroll_scale = None;
         let old_page = self.page;
         let old_count = self.page_count.unwrap_or(1).max(1);
@@ -798,58 +833,176 @@ impl RenderEngine {
             return false;
         };
         !text_page.blocks().any(|block| match block.r#type() {
-            mupdf::text_page::TextBlockType::Image => true,
+            mupdf::text_page::TextBlockType::Image
+            | mupdf::text_page::TextBlockType::Vector
+            | mupdf::text_page::TextBlockType::Grid
+            | mupdf::text_page::TextBlockType::Struct => true,
             mupdf::text_page::TextBlockType::Text => block.lines().any(|line| {
                 line.chars()
                     .any(|ch| ch.char().is_some_and(|c| !c.is_whitespace()))
             }),
-            _ => false,
         })
     }
 
-    /// Bounds of the illustrations on a reflow page that contains no visible
-    /// text. Returns `None` for normal pages, so only standalone plates are
-    /// rendered as images instead of as synthetic pages.
-    fn image_page_bounds(&mut self, page_no: usize) -> Option<Rect> {
-        if !self.reflowable {
-            return None;
-        }
-        if let Some(cached) = self.image_bounds_cache.get(&page_no) {
-            return *cached;
-        }
-        let bounds = self.extract_image_page_bounds(page_no);
-        self.image_bounds_cache.insert(page_no, bounds);
-        bounds
+    /// Continuous scroll means the reflowable story flows as one column with
+    /// no simulated page chrome. Content is laid out by MuPDF in paginated
+    /// pages underneath (the spread mode and page numbers stay consistent
+    /// with it), but the pages are rendered cropped to their content so no
+    /// gap ever shows between blocks, lines, or illustrations. An explicit
+    /// zoom keeps the page-shaped view so the reader can inspect the page as
+    /// laid out.
+    fn roll(&self) -> bool {
+        self.scroll && self.reflowable && self.fit == Fit::Page && self.rotation.is_multiple_of(180)
     }
 
-    fn extract_image_page_bounds(&self, page_no: usize) -> Option<Rect> {
-        let page = self.doc.load_page(page_no as i32).ok()?;
-        let text_page = page.to_text_page(TextPageFlags::PRESERVE_IMAGES).ok()?;
-        let mut bounds: Option<Rect> = None;
-        for block in text_page.blocks() {
-            match block.r#type() {
-                mupdf::text_page::TextBlockType::Image => {
-                    let rect = block.bounds();
-                    if rect.is_valid() && !rect.is_empty() {
-                        bounds = Some(match bounds {
-                            Some(current) => current.r#union(&rect),
-                            None => rect,
-                        });
-                    }
-                }
-                mupdf::text_page::TextBlockType::Text => {
-                    let has_text = block.lines().any(|line| {
-                        line.chars()
-                            .any(|ch| ch.char().is_some_and(|c| !c.is_whitespace()))
-                    });
-                    if has_text {
-                        return None;
-                    }
-                }
-                _ => {}
+    /// Measure the vertical content box and the line spacing of one reflowable
+    /// page. Returns `None` for a fully blank page, which continuous scroll
+    /// skips entirely instead of drawing a blank band.
+    fn roll_metrics(&mut self, page_no: usize) -> Option<RollMetrics> {
+        if let Some(cached) = self.roll_metrics_cache.get(&page_no) {
+            return *cached;
+        }
+        let computed = self.extract_roll_metrics(page_no);
+        self.roll_metrics_cache.insert(page_no, computed);
+        computed
+    }
+
+    /// Learn the simulated page margin from the pages in the strip. The
+    /// smallest text top is the blank band every page carries above its first
+    /// line; anything larger is a paragraph or chapter margin the reader
+    /// should see. The baseline only ever decreases, so a strip that happens
+    /// to begin with a heading cannot widen the gap between pages.
+    fn observe_roll_baseline(&mut self, pages: &[usize]) {
+        let mut baseline = self.roll_top_baseline;
+        for &page_no in pages {
+            let Some(text_top) = self
+                .roll_metrics(page_no)
+                .and_then(|metrics| metrics.text_top)
+            else {
+                continue;
+            };
+            if !baseline.is_some_and(|current| text_top >= current - 0.01) {
+                baseline = Some(text_top);
             }
         }
-        bounds
+        if baseline != self.roll_top_baseline {
+            self.roll_top_baseline = baseline;
+            // Cached pages were cropped with the previous baseline.
+            self.page_cache.clear();
+        }
+    }
+
+    fn extract_roll_metrics(&self, page_no: usize) -> Option<RollMetrics> {
+        let page = self.doc.load_page(page_no as i32).ok()?;
+        let text_page = page
+            .to_text_page(TextPageFlags::PRESERVE_WHITESPACE | TextPageFlags::PRESERVE_IMAGES)
+            .ok()?;
+        let mut lines: Vec<Rect> = Vec::new();
+        let mut images: Vec<Rect> = Vec::new();
+        let mut shapes: Vec<Rect> = Vec::new();
+        for block in text_page.blocks() {
+            match block.r#type() {
+                mupdf::text_page::TextBlockType::Text => {
+                    for line in block.lines() {
+                        let bounds = line.bounds();
+                        if bounds.is_valid() && !bounds.is_empty() {
+                            lines.push(bounds);
+                        }
+                    }
+                }
+                mupdf::text_page::TextBlockType::Image => {
+                    let bounds = block.bounds();
+                    if bounds.is_valid() && !bounds.is_empty() {
+                        images.push(bounds);
+                    }
+                }
+                _ => {
+                    // Vector, Grid, and Struct blocks carry drawing operations:
+                    // inline SVG plates, ornaments, rules. A page holding only
+                    // vector art is content, not a blank page.
+                    let bounds = block.bounds();
+                    if bounds.is_valid() && !bounds.is_empty() {
+                        shapes.push(bounds);
+                    }
+                }
+            }
+        }
+        if lines.is_empty() && images.is_empty() && shapes.is_empty() {
+            return None;
+        }
+        // The laid-out story already obeys the document's CSS, including its
+        // line spacing. Measure it from one line to the next rather than
+        // guessing from the root font size.
+        let mut ys: Vec<f32> = lines.iter().map(|rect| rect.y0).collect();
+        ys.sort_by(f32::total_cmp);
+        let mut deltas: Vec<f32> = ys
+            .windows(2)
+            .filter_map(|pair| {
+                let delta = pair[1] - pair[0];
+                (delta > 0.25).then_some(delta)
+            })
+            .collect();
+        deltas.sort_by(f32::total_cmp);
+        let line_height = (!deltas.is_empty()).then(|| deltas[deltas.len() / 2]);
+        let base = line_height.unwrap_or(self.font_size * 1.2);
+        let mid_min = lines
+            .iter()
+            .map(|rect| (rect.y0 + rect.y1) * 0.5)
+            .fold(f32::INFINITY, f32::min);
+        let mid_max = lines
+            .iter()
+            .map(|rect| (rect.y0 + rect.y1) * 0.5)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let ink_top = lines
+            .iter()
+            .map(|rect| rect.y0)
+            .fold(f32::INFINITY, f32::min);
+        let ink_bottom = lines
+            .iter()
+            .map(|rect| rect.y1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bounds = page.bounds().ok()?;
+        // Leading above the first line: half a line from the line-box centre,
+        // but never less than one point above the glyph ink. The smallest
+        // such top across the strip is the simulated page margin, which the
+        // roll removes at every seam. A larger top is a real paragraph or
+        // chapter margin, so it survives.
+        let text_top = if lines.is_empty() {
+            None
+        } else {
+            Some((mid_min - base * 0.5).min(ink_top - 1.0))
+        };
+        // Without text, the crop is decided by the images and vector art
+        // alone, so start above the page and let those bounds pull it down.
+        let mut top = text_top.unwrap_or(f32::INFINITY);
+        let mut bottom = mid_max + base * 0.5;
+        bottom = bottom.max(ink_bottom + 1.0);
+        for rect in images.iter().chain(&shapes) {
+            top = top.min(rect.y0);
+            bottom = bottom.max(rect.y1);
+        }
+        top = top.max(bounds.y0);
+        bottom = bottom.min(bounds.y1);
+        if bottom - top < 1.0 {
+            return None;
+        }
+        let plate_bounds = if lines.is_empty() && (!images.is_empty() || !shapes.is_empty()) {
+            images
+                .iter()
+                .chain(&shapes)
+                .copied()
+                .reduce(|union, rect| union.r#union(&rect))
+        } else {
+            None
+        };
+        Some(RollMetrics {
+            top,
+            text_top,
+            bottom,
+            line_height,
+            text_lines: lines.len(),
+            plate_bounds,
+        })
     }
 
     /// Set the window color used behind the spread gutter.
@@ -1273,27 +1426,97 @@ impl RenderEngine {
             .and_then(|page| page.bounds())
             .map_err(|e| format!("page bounds: {e}"))?;
 
-        if self.scroll && self.fit == Fit::Page {
-            if let Some(image) = self.image_page_bounds(page_no) {
-                let (rotated_w, rotated_h) = rotated_size(&image, self.rotation);
-                let (page_w, page_h) = rotated_size(&bounds, self.rotation);
-                if rotated_w > 0.0 && rotated_h > 0.0 && page_w > 0.0 && page_h > 0.0 {
-                    let scale = (self.scroll_available_width() / rotated_w)
-                        .min(base_scale * IMAGE_PAGE_MAX_UPSCALE)
-                        .min(MAX_SCALE)
-                        .min(MAX_DIMENSION / page_w)
-                        .min(MAX_DIMENSION / page_h)
-                        .min((MAX_PIXELS / (page_w * page_h)).sqrt())
-                        .min(max_image_height / page_h);
+        // In continuous scroll the reflowable story is rendered cropped to its
+        // content: synthetic page margins never become visible gaps, and image
+        // plates keep the reading-column width of the roll.
+        if self.roll() {
+            if let Some(metrics) = self.roll_metrics(page_no) {
+                // Crop text pages at the shared page-margin baseline, but
+                // never below content that starts higher (an illustration at
+                // the page top). Real paragraph and chapter margins sit below
+                // the baseline and therefore remain visible. A standalone
+                // plate keeps its own bounds so its aspect ratio stays true.
+                let top = if metrics.text_lines == 0 {
+                    metrics.top
+                } else {
+                    self.roll_top_baseline
+                        .map_or(metrics.top, |baseline| metrics.top.min(baseline))
+                };
+                let (rotated_w, rotated_h) = rotated_size(&bounds, self.rotation);
+                let content_w = (bounds.x1 - bounds.x0).max(1.0);
+                let content_h = (metrics.bottom - top).max(1.0);
+                if rotated_w > 0.0 && rotated_h > 0.0 {
+                    let scale = if metrics.text_lines == 0 && self.fit == Fit::Page {
+                        // An image-only page: fill the reading column like a
+                        // plate while keeping the locked text scale as a floor.
+                        let plate_w = metrics
+                            .plate_bounds
+                            .map(|rect| rect.width().max(1.0))
+                            .unwrap_or(content_w);
+                        (self.scroll_available_width() / plate_w)
+                            .min(base_scale * IMAGE_PAGE_MAX_UPSCALE)
+                    } else {
+                        base_scale
+                    }
+                    .min(MAX_SCALE)
+                    .min(MAX_DIMENSION / content_w)
+                    .min(MAX_DIMENSION / content_h)
+                    .min((MAX_PIXELS / (content_w * content_h)).sqrt())
+                    .min(max_image_height / content_h);
+                    let (rect_x0, rect_x1) = metrics
+                        .plate_bounds
+                        .map(|rect| (rect.x0, rect.x1))
+                        .unwrap_or((bounds.x0, bounds.x1));
                     if scale.is_finite() && scale > 0.0 {
                         let ctm = self.ctm_for(&bounds, scale);
-                        if let Some(crop) = crop_for_image(&image, &ctm, page_w, page_h, scale) {
+                        let rect = Rect::new(rect_x0, top, rect_x1, metrics.bottom);
+                        if let Some(crop) = crop_for_image(&rect, &ctm, rotated_w, rotated_h, scale)
+                        {
                             return Ok(PagePlan {
                                 scale,
                                 ctm,
                                 crop: Some(crop),
-                                height: (page_h * scale).round().max(1.0),
+                                height: (content_h * scale).round().max(1.0),
+                                plate: metrics.text_lines == 0,
                             });
+                        }
+                    }
+                }
+            }
+        }
+
+        // A quarter-turned plate keeps the original behavior: fit the reading
+        // column, cropped to the picture, because rotating swaps the axes and
+        // vertical trim no longer matches the scroll direction.
+        if self.scroll && self.reflowable && self.fit == Fit::Page && !self.roll() {
+            if let Some(metrics) = self.roll_metrics(page_no) {
+                if metrics.text_lines == 0 {
+                    let image = metrics.plate_bounds.unwrap_or_else(|| {
+                        Rect::new(bounds.x0, metrics.top, bounds.x1, metrics.bottom)
+                    });
+                    let (rotated_w, rotated_h) = rotated_size(&bounds, self.rotation);
+                    let (image_w, image_h) = rotated_size(&image, self.rotation);
+                    if image_w > 0.0 && image_h > 0.0 && rotated_w > 0.0 && rotated_h > 0.0 {
+                        let scale = (self.scroll_available_width() / image_w)
+                            .min(base_scale * IMAGE_PAGE_MAX_UPSCALE)
+                            .min(MAX_SCALE)
+                            .min(MAX_DIMENSION / rotated_w)
+                            .min(MAX_DIMENSION / rotated_h)
+                            .min((MAX_PIXELS / (rotated_w * rotated_h)).sqrt())
+                            .min(max_image_height / rotated_h);
+                        if scale.is_finite() && scale > 0.0 {
+                            let ctm = self.ctm_for(&bounds, scale);
+                            if let Some(crop) =
+                                crop_for_image(&image, &ctm, rotated_w, rotated_h, scale)
+                            {
+                                return Ok(PagePlan {
+                                    scale,
+                                    ctm,
+                                    crop: Some(crop),
+                                    height: (image_h * scale).round().max(1.0),
+                                    plate: true,
+                                });
+                            }
                         }
                     }
                 }
@@ -1308,6 +1531,7 @@ impl RenderEngine {
                 let (_, page_h) = rotated_size(&bounds, self.rotation);
                 (page_h * base_scale).round().max(1.0)
             },
+            plate: false,
         })
     }
 
@@ -1424,14 +1648,24 @@ impl RenderEngine {
         let page_numbers = self.page_numbers_for();
         let cacheable = quads.is_empty() && self.search_query.is_none();
         // Blank reflow pages are skipped in paged layouts, but a scroll strip
-        // must stay contiguous so its page offsets match the page numbers.
-        if self.reflowable && !self.scroll {
-            let mut filtered = Vec::with_capacity(page_numbers.len());
-            for &page_no in &page_numbers {
-                if !self.page_is_blank(page_no) {
-                    filtered.push(page_no);
-                }
+        // used to keep them as contiguous viewport chunks. Continuous scroll
+        // instead treats the chapter as one flow, so blank pages disappear
+        // from the strip entirely and no blank band appears between blocks.
+        if self.roll() {
+            let filtered: Vec<usize> = page_numbers
+                .iter()
+                .copied()
+                .filter(|&page_no| self.roll_metrics(page_no).is_some())
+                .collect();
+            if !filtered.is_empty() {
+                return self.render_pages(&filtered, quads, cacheable);
             }
+        } else if self.reflowable && !self.scroll {
+            let filtered: Vec<usize> = page_numbers
+                .iter()
+                .copied()
+                .filter(|&page_no| !self.page_is_blank(page_no))
+                .collect();
             if !filtered.is_empty() {
                 return self.render_pages(&filtered, quads, cacheable);
             }
@@ -1474,6 +1708,12 @@ impl RenderEngine {
         let scale = self.scale_for(&scale_bounds)?;
         self.scale = scale;
 
+        // The roll removes one shared band of simulated page margin. Measure
+        // it from this strip before planning any page.
+        if self.roll() {
+            self.observe_roll_baseline(&numbers);
+        }
+
         // Search highlights apply to the page being read, which may not be the
         // first page of a scroll strip. Normal reading reuses cached pages.
         let mut plans = Vec::with_capacity(numbers.len());
@@ -1484,13 +1724,17 @@ impl RenderEngine {
         // would exceed the texture height limit, shrink only the image pages
         // so their total still fits; text pages keep the locked column scale.
         if self.scroll && numbers.len() > 1 {
-            let gap = scroll_gap(self.scroll_available_width().round() as u32) as f32;
+            let gap = if self.roll() {
+                0.0
+            } else {
+                scroll_gap(self.scroll_available_width().round() as u32) as f32
+            };
             let total: f32 = plans.iter().map(|plan| plan.height).sum::<f32>()
                 + gap * (numbers.len() - 1) as f32;
             if total > SCROLL_STRIP_MAX_HEIGHT {
                 let image_total: f32 = plans
                     .iter()
-                    .filter(|plan| plan.crop.is_some())
+                    .filter(|plan| plan.plate)
                     .map(|plan| plan.height)
                     .sum();
                 if image_total > 0.0 {
@@ -1498,7 +1742,7 @@ impl RenderEngine {
                     let budget = (SCROLL_STRIP_MAX_HEIGHT - other_total).max(1.0);
                     let factor = (budget / image_total).min(1.0);
                     for (index, &page_no) in numbers.iter().enumerate() {
-                        if plans[index].crop.is_some() {
+                        if plans[index].plate {
                             let cap = plans[index].height * factor;
                             plans[index] = self.page_plan(page_no, scale, cap)?;
                         }
@@ -1561,7 +1805,13 @@ impl RenderEngine {
             .position(|&page| page == self.page + 1)
             .unwrap_or(0);
         let (bitmap, page_offsets, page_heights, gap) = if self.scroll {
-            let gap = scroll_gap(page_widths.get(focus_index).copied().unwrap_or(1));
+            // Continuous scroll packs the reflowable story tightly; paged
+            // spreads and fixed-layout documents keep a small strip gap.
+            let gap = if self.roll() {
+                0
+            } else {
+                scroll_gap(page_widths.get(focus_index).copied().unwrap_or(1))
+            };
             let strip = compose_pages_vertical(&rendered, gap, self.background);
             (strip.page, strip.offsets, strip.heights, gap)
         } else {
@@ -1576,6 +1826,23 @@ impl RenderEngine {
                 rendered.iter().map(|page| page.bitmap.height).collect(),
                 gap,
             )
+        };
+
+        // The roll measures the document's own line rhythm so the UI can
+        // step it one line at a time. This is a property of the reflow layout,
+        // so it also applies to an explicit zoom where pages stay page-shaped.
+        let line_height = if self.scroll && self.reflowable {
+            let mut heights: Vec<f32> = numbers
+                .iter()
+                .filter_map(|&page_no| {
+                    self.roll_metrics(page_no)
+                        .and_then(|metrics| metrics.line_height)
+                })
+                .collect();
+            heights.sort_by(f32::total_cmp);
+            (!heights.is_empty()).then(|| heights[heights.len() / 2])
+        } else {
+            None
         };
 
         Ok(RenderedPage {
@@ -1597,6 +1864,7 @@ impl RenderEngine {
             page_heights,
             font_scale: self.font_scale(),
             reflowable: self.reflowable,
+            line_height,
         })
     }
 
@@ -2801,6 +3069,212 @@ mod tests {
     }
 
     #[test]
+    fn roll_measures_the_css_line_height() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-line-height");
+
+        let render = |name: &str, line_height: u32| -> f32 {
+            let path = dir.join(format!("{name}.html"));
+            let mut html = String::from("<!doctype html><html><head><style>");
+            html.push_str(&format!(
+                "body {{ font-size: 16px; line-height: {line_height}px; }} p {{ margin: 0; }}"
+            ));
+            html.push_str("</style></head><body>");
+            for i in 0..120 {
+                html.push_str(&format!(
+                    "<p>Line height sample {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+                ));
+            }
+            html.push_str("</body></html>");
+            std::fs::write(&path, html).unwrap();
+
+            let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+            mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+            let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+            engine.set_viewport(900, 1200);
+            engine.set_layout(false);
+            let strip = engine.render().unwrap();
+            strip
+                .line_height
+                .expect("continuous scroll reports the line rhythm")
+        };
+
+        let tight = render("tight", 18);
+        let loose = render("loose", 36);
+        assert!(
+            (loose / tight - 2.0).abs() < 0.15,
+            "the line step must follow the CSS line-height, got {tight} vs {loose}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_pages_meet_without_blank_bands() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-seams");
+        let path = dir.join("sample.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        let line = strip.line_height.expect("line rhythm") * strip.scale;
+        let width = strip.bitmap.width as usize;
+        let pixels = &strip.bitmap.pixels;
+        let blank_run = |mut y: usize, step: isize| -> usize {
+            let mut run = 0;
+            loop {
+                let row = &pixels[y * width..(y + 1) * width];
+                if row.iter().any(|&pixel| pixel != row[0]) {
+                    break;
+                }
+                run += 1;
+                if (step < 0 && y == 0) || (step > 0 && y + 1 >= strip.bitmap.height as usize) {
+                    break;
+                }
+                y = (y as isize + step) as usize;
+            }
+            run
+        };
+        for &offset in &strip.page_offsets[1..] {
+            let seam = offset as usize;
+            let blank = blank_run(seam, -1) + blank_run(seam, 1);
+            assert!(
+                blank as f32 <= line * 2.5 + 2.0,
+                "page seam at {seam}px leaves a {blank}px blank band (one line is {line:.1}px)"
+            );
+        }
+
+        // An explicit zoom keeps the page-shaped view, but the CSS line rhythm
+        // is still reported so arrow-key steps stay proportional to the text.
+        engine.set_scale(2.0);
+        let zoomed = engine.render().unwrap();
+        assert!(zoomed.gap > 0, "explicit zoom keeps the page gap");
+        let ratio = zoomed.page_heights[0] as f32 / zoomed.page_widths[0] as f32;
+        assert!(
+            (ratio - 792.0 / 612.0).abs() < 0.05,
+            "explicit zoom stays page-shaped, got {ratio}"
+        );
+        assert!(
+            zoomed.line_height.is_some(),
+            "the CSS line rhythm survives an explicit zoom"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_keeps_a_chapter_margin_above_the_heading() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-chapter-margin");
+        let path = dir.join("chapter.html");
+        let mut html = String::from(
+            "<!doctype html><html><head><style>\
+             @page { margin: 10px; }\
+             html, body { margin: 0; }\
+             p { margin: 0; font-size: 12px; line-height: 16px; }\
+             h1 { margin: 72px 0 0 0; font-size: 24px; line-height: 36px; }\
+             </style></head><body><h1>Chapter heading</h1>",
+        );
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        let line = strip.line_height.expect("line rhythm") * strip.scale;
+        let width = strip.bitmap.width as usize;
+        let pixels = &strip.bitmap.pixels;
+        let blank_run = |mut y: usize, step: isize| -> usize {
+            let mut run = 0;
+            loop {
+                let row = &pixels[y * width..(y + 1) * width];
+                if row.iter().any(|&pixel| pixel != row[0]) {
+                    break;
+                }
+                run += 1;
+                if (step < 0 && y == 0) || (step > 0 && y + 1 >= strip.bitmap.height as usize) {
+                    break;
+                }
+                y = (y as isize + step) as usize;
+            }
+            run
+        };
+
+        // The chapter margin is a real block margin. A new chapter starts its
+        // flow (an EPUB chapter is a separate document), so the roll must keep
+        // the space above the heading instead of cropping to the glyph ink.
+        let text: String = strip.text.chars.iter().map(|ch| ch.ch).collect();
+        let heading_byte = text.find("Chapter heading").expect("heading text");
+        let heading = text[..heading_byte].chars().count();
+        let heading_y = strip.text.chars[heading].rect.y0 as usize;
+        let above = blank_run(heading_y, -1);
+        assert!(
+            above as f32 >= line * 3.0,
+            "chapter margin collapsed: only {above}px of {line:.1}px-line space \
+             above the heading"
+        );
+
+        // Text seams stay about one line: the shared page margin is removed
+        // everywhere else.
+        for &offset in &strip.page_offsets[1..] {
+            let seam = offset as usize;
+            let blank = blank_run(seam, -1) + blank_run(seam, 1);
+            assert!(
+                blank as f32 <= line * 1.5 + 2.0,
+                "page seam at {seam}px leaves a {blank}px blank band (one line is {line:.1}px)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vector_only_pages_are_not_blank_in_the_roll() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("vector-roll");
+        let path = dir.join("vector.html");
+        std::fs::write(
+            &path,
+            r##"<!doctype html><html><body><svg width="300" height="600" viewBox="0 0 300 600" xmlns="http://www.w3.org/2000/svg"><rect width="300" height="600" fill="#336699"/></svg></body></html>"##,
+        )
+        .unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        assert!(
+            strip.pages.contains(&1),
+            "the vector-only page must appear in the roll: {:?}",
+            strip.pages
+        );
+        assert!(
+            strip.page_heights.iter().all(|&height| height > 0),
+            "vector-only pages report a content height"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn scroll_renders_a_vertical_strip() {
         let _guard = doc_test_guard();
         let dir = test_dir("scroll");
@@ -2825,11 +3299,19 @@ mod tests {
         assert_eq!(strip.pages, vec![1, 2, 3, 4]);
         let book_background = strip.book_background;
         let first_height = strip.page_heights[0];
-        let gap = scroll_gap(strip.page_widths[0]);
-        assert_eq!(strip.gap, gap);
-        assert!(gap > 0);
+        // The roll packs content blocks with no simulated page chrome:
+        // pages touch and a fully blank reflow page never shows up.
+        assert_eq!(strip.gap, 0);
         assert_eq!(strip.page_offsets[0], 0);
-        assert_eq!(strip.page_offsets[1], first_height + gap);
+        assert_eq!(strip.page_offsets[1], first_height);
+        assert!(
+            strip.page_heights.iter().all(|&height| height > 0),
+            "every page in the roll reports a content height"
+        );
+        assert!(
+            strip.line_height.is_some_and(|height| height > 0.0),
+            "continuous scroll reports the CSS line rhythm"
+        );
         assert_eq!(
             strip.bitmap.width,
             strip.page_widths.iter().copied().max().unwrap(),
@@ -2843,11 +3325,7 @@ mod tests {
             "scroll fits the page width inside the viewport margins"
         );
         assert!(
-            strip
-                .text
-                .chars
-                .iter()
-                .any(|ch| ch.rect.y0 >= first_height + gap),
+            strip.text.chars.iter().any(|ch| ch.rect.y0 >= first_height),
             "later pages are shifted into vertical strip coordinates"
         );
 
@@ -2951,8 +3429,9 @@ mod tests {
             "paged mode should render a whole 612x792 page, got {paged_ratio}"
         );
 
-        // A page with a caption is not a standalone plate, so it keeps its
-        // page layout and must not be cropped to the image bounds.
+        // A page with a caption flows with the roll as well: it is cropped to
+        // its content instead of keeping the synthetic page chrome, and the
+        // caption text is part of the flowing story.
         engine.set_layout(false);
         let mixed = dir.join("mixed.html");
         std::fs::write(
@@ -2967,9 +3446,24 @@ mod tests {
         mixed_engine.set_layout(false);
         let mixed_strip = mixed_engine.render().unwrap();
         let mixed_ratio = mixed_strip.page_heights[0] as f32 / mixed_strip.page_widths[0] as f32;
+        let column = mixed_engine.scroll_available_width().round() as u32;
         assert!(
-            (mixed_ratio - 792.0 / 612.0).abs() < 0.05,
-            "a captioned image page should keep page proportions, got {mixed_ratio}"
+            mixed_strip.page_widths[0].abs_diff(column) <= 1,
+            "a captioned plate keeps the reading column width"
+        );
+        assert!(
+            (mixed_ratio - 792.0 / 612.0).abs() > 0.05,
+            "a captioned plate flows with the roll, not page-shaped"
+        );
+        assert!(
+            mixed_strip
+                .text
+                .chars
+                .iter()
+                .map(|ch| ch.ch)
+                .collect::<String>()
+                .contains("caption"),
+            "the caption text is part of the flowing story"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
