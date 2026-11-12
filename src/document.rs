@@ -1716,23 +1716,18 @@ impl RenderEngine {
                 let content_w = (bounds.x1 - bounds.x0).max(1.0);
                 let content_h = (metrics.bottom - top).max(1.0);
                 if rotated_w > 0.0 && rotated_h > 0.0 {
-                    let scale = if metrics.text_lines == 0 && self.fit == Fit::Page {
-                        // An image-only page: fill the reading column like a
-                        // plate while keeping the locked text scale as a floor.
-                        let plate_w = metrics
-                            .plate_bounds
-                            .map(|rect| rect.width().max(1.0))
-                            .unwrap_or(content_w);
-                        (self.scroll_available_width() / plate_w)
-                            .min(base_scale * IMAGE_PAGE_MAX_UPSCALE)
-                    } else {
-                        base_scale
-                    }
-                    .min(MAX_SCALE)
-                    .min(MAX_DIMENSION / content_w)
-                    .min(MAX_DIMENSION / content_h)
-                    .min((MAX_PIXELS / (content_w * content_h)).sqrt())
-                    .min(max_image_height / content_h);
+                    // An image-only page is cropped to the plate, but it keeps
+                    // the text flow's scale. Scaling it to the reading column
+                    // would enlarge a small bitmap and give the same image one
+                    // size when it shares a page with text and another when it
+                    // lands alone, which is exactly the jump that made a run
+                    // of adjacent pictures disagree while scrolling.
+                    let scale = base_scale
+                        .min(MAX_SCALE)
+                        .min(MAX_DIMENSION / content_w)
+                        .min(MAX_DIMENSION / content_h)
+                        .min((MAX_PIXELS / (content_w * content_h)).sqrt())
+                        .min(max_image_height / content_h);
                     let (rect_x0, rect_x1) = metrics
                         .plate_bounds
                         .map(|rect| (rect.x0, rect.x1))
@@ -3905,7 +3900,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_illustrations_flow_at_reading_width() {
+    fn standalone_illustrations_keep_their_bitmap_scale() {
         let _guard = doc_test_guard();
         let dir = test_dir("image-layout");
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="600"><rect width="300" height="600" fill="#336699"/><circle cx="150" cy="300" r="120" fill="#ffcc00"/></svg>"##;
@@ -3927,9 +3922,14 @@ mod tests {
         let width = strip.page_widths[0];
         let height = strip.page_heights[0];
         let column = engine.scroll_available_width().round() as u32;
+        // The plate keeps the text flow's scale, so a 300pt-wide bitmap stays
+        // 300pt wide instead of being blown up to the reading column. This is
+        // what makes an image the same size whether it shares a page with text
+        // or lands alone, and it avoids upscaling a small bitmap.
+        let expected = 300.0 * strip.scale;
         assert!(
-            width.abs_diff(column) <= 1,
-            "illustration width {width} should fill the {column}px reading column"
+            (width as f32 - expected).abs() <= 2.0,
+            "illustration width {width} should follow its 300pt bitmap at the text scale ({expected})"
         );
         // A 300x600 illustration is 1:2, so the rendered plate must keep that
         // aspect ratio instead of being forced into a 612x792 page.
@@ -4008,6 +4008,65 @@ mod tests {
                 .collect::<String>()
                 .contains("caption"),
             "the caption text is part of the flowing story"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_adjacent_images_keep_the_text_scale_in_the_roll() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("adjacent-images");
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="450"><rect width="600" height="450" fill="#336699"/></svg>"##;
+        std::fs::write(dir.join("plate.svg"), svg).unwrap();
+        let path = dir.join("adjacent.html");
+        std::fs::write(
+            &path,
+            r#"<!doctype html><html><body><div style="height:450pt;margin:0;padding:0;border:0"></div><div><img src="plate.svg" width="600" height="450"></div><div><img src="plate.svg" width="600" height="450"></div></body></html>"#,
+        )
+        .unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+
+        let strip = engine.render().unwrap();
+        let base = strip.scale;
+        let mut image_pages = Vec::new();
+        for page_no in 0..engine.doc.page_count().unwrap() {
+            if let Some(metrics) = engine.roll_metrics(page_no as usize) {
+                if metrics.text_lines == 0 && metrics.plate_bounds.is_some() {
+                    image_pages.push(page_no as usize);
+                }
+            }
+        }
+        assert_eq!(
+            image_pages.len(),
+            2,
+            "the two picture blocks should occupy two image pages"
+        );
+
+        let plans: Vec<PagePlan> = image_pages
+            .iter()
+            .map(|&page_no| {
+                engine
+                    .page_plan(page_no, base, IMAGE_PAGE_MAX_HEIGHT)
+                    .unwrap()
+            })
+            .collect();
+        for plan in &plans {
+            assert!(
+                (plan.scale - base).abs() < 1.0e-4,
+                "an image page must keep the text scale, got {} vs {base}",
+                plan.scale
+            );
+        }
+        assert!(
+            (plans[0].height - plans[1].height).abs() <= 1.0,
+            "the split images should render at one height, got {} and {}",
+            plans[0].height,
+            plans[1].height
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

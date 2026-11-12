@@ -182,12 +182,13 @@ scrolling entirely; there, wheel, key, and screen steps turn whole pages.
 Continuous scroll works for fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
-its simulated page, but the reader crops to the picture and scales it to the
-reading-column width, keeping the picture's own aspect ratio so a tall plate
-flows past the viewport instead of sitting inside a page-shaped frame with
-white margins. A page that carries an illustration together with text keeps
-that text in the same flow. Paged spreads, quarter-turned pages, and an
-explicit zoom keep the whole page.
+its simulated page, but the reader crops to the picture and renders it at the
+text flow's scale, keeping the picture's actual bitmap size and aspect ratio.
+A tall plate therefore flows past the viewport instead of sitting inside a
+page-shaped frame with white margins, and a small bitmap is not blown up into
+a blurry column-width plate. A page that carries an illustration together with
+text keeps that text in the same flow. Paged spreads, quarter-turned pages, and
+an explicit zoom keep the whole page.
 
 `[reflowable]` CSS is applied to reflowable documents. The first `font-family`
 declared there is also used by the outline, command menu, and other UI text;
@@ -312,11 +313,19 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   page-sized distances.
 - Standalone illustrations in reflowable documents no longer sit on MuPDF's
   simulated 612x792 reflow page. In continuous scroll the reader crops such a
-  page to its images and renders them at the reading-column width with their
-  natural aspect ratio, so tall plates flow through the viewport instead of
-  being framed by page margins. Captioned pages now flow with the same roll;
+  page to its images and renders them at the text flow's scale with their
+  actual bitmap size and aspect ratio, so tall plates flow through the viewport
+  instead of being framed by page margins and small bitmaps stay sharp instead
+  of being upscaled to the column. Captioned pages now flow with the same roll;
   paged spreads, quarter-turned pages, and explicit zoom still render whole
   pages.
+- Reflow images are atomic at page breaks: an image that does not fit the
+  space left on a page moves to the next page at its measured size instead of
+  being shrunk into the remainder. Two adjacent pictures split by pagination
+  keep one scale, so a spread no longer shows one large and one small plate,
+  and continuous scroll does not resize a picture as it slides into view. An
+  image taller than a page is capped to the page once and placed on a fresh
+  page.
 - Continuous scroll now slides a prefetched page window instead of jumping
   between fixed strips. Scroll input that runs past the rendered window is kept
   and replayed when more pages arrive, the direction of travel decides how much

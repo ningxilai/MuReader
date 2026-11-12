@@ -1019,7 +1019,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mupdf"
 version = "0.8.0"
-source = "git+https://github.com/ningxilai/mupdf-rs?rev=53a5bb885e7c29f9a8905a6b66c6cec28aa9c7c6#53a5bb885e7c29f9a8905a6b66c6cec28aa9c7c6"
+source = "git+https://github.com/ningxilai/mupdf-rs?rev=2ef6546212aac92efe709c2e8f16c0aca4ed20ba#2ef6546212aac92efe709c2e8f16c0aca4ed20ba"
 dependencies = [
  "bitflags 2.13.2",
  "font-kit",
@@ -1043,7 +1043,7 @@ checksum = "475b055857dac04595f4814fff9cccc642c3a6a77b808cb3c3d73305780b6f75"
 [[package]]
 name = "mupdf-sys"
 version = "0.8.0"
-source = "git+https://github.com/ningxilai/mupdf-rs?rev=53a5bb885e7c29f9a8905a6b66c6cec28aa9c7c6#53a5bb885e7c29f9a8905a6b66c6cec28aa9c7c6"
+source = "git+https://github.com/ningxilai/mupdf-rs?rev=2ef6546212aac92efe709c2e8f16c0aca4ed20ba#2ef6546212aac92efe709c2e8f16c0aca4ed20ba"
 dependencies = [
  "bindgen",
  "cc",
