@@ -161,8 +161,11 @@ in every window geometry, including narrow windows and while the outline is
 open. Reflowable pages are cropped at a shared page-margin baseline measured
 across the roll, so the simulated page chrome never appears between paragraphs,
 lines, or illustrations: the story reads as one continuous roll with no
-page-break gaps. Real paragraph and chapter margins survive at a seam, so a new
-chapter keeps its breathing room instead of butting against the previous text.
+page-break gaps. The document's real spacing survives at a seam because a
+second, unpaginated layout measures the true distance between the blocks
+pagination split, including paragraph margins and the space around
+illustrations; a new chapter keeps its breathing room instead of butting
+against the previous text.
 Arrow keys move one line at a time, matching a mouse-wheel notch, and the step
 follows the line spacing the document's CSS asks for, while `Space`/`PageDown`
 and `PageUp` move most of a screen. Key steps and wheel notches glide smoothly over a few frames,
@@ -276,13 +279,17 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 - Continuous scroll now renders reflowable pages as one unbroken roll instead
   of a stack of page-shaped blocks. The roll learns the simulated page margin
   shared by the document's pages and crops every page at that baseline, so
-  fully blank pages disappear and adjacent pages touch with no page chrome or
-  strip gap; text, captions, and illustrations meet naturally across page
-  boundaries. Real paragraph and chapter margins sit below the baseline and
-  survive, so a chapter heading keeps its space instead of butting against the
-  previous chapter. Page numbers remain the shared coordinate with spread mode,
-  outline jumps, and links. Pixel-level regression tests check both that no
-  blank band appears at a normal seam and that a chapter margin is preserved.
+  fully blank pages disappear and adjacent pages carry no page chrome or
+  strip gap. The document's real spacing is restored at every seam: a second,
+  unpaginated layout measures the true distance between the blocks that
+  pagination split, so paragraph margins and the space around illustrations
+  survive text-to-text, text-to-image, and image-to-text seams instead of the
+  two pages being stitched together. A chapter heading keeps its space instead
+  of butting against the previous chapter. Page numbers remain the shared
+  coordinate with spread mode, outline jumps, and links. Pixel-level
+  regression tests check that no blank band appears at a normal seam, that a
+  chapter margin is preserved, and that paragraph and image margins return at
+  both text and mixed text/image seams.
 - Arrow keys now move the continuous scroll by one line instead of nearly a
   full screen. `Down`/`Up` and the mouse wheel share a single-line step, and
   the step is measured from the line spacing the document's CSS produces

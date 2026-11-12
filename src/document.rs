@@ -13,9 +13,12 @@
 //!
 //! Continuous scroll treats the story as one flow rather than a stack of
 //! simulated pages: every reflowable page is rendered cropped to its content
-//! box (text baselines plus embedded images), blank pages are skipped, and
-//! adjacent blocks touch with no visible gap. Page numbers stay as the shared
-//! coordinate for spread mode, but scrolling itself is page-free.
+//! box (text baselines plus embedded images) and blank pages are skipped.
+//! Page chrome never shows, but the document's own spacing does: a second,
+//! unpaginated layout measures the true distance between the blocks that
+//! pagination split, so paragraph and figure margins survive at every seam.
+//! Page numbers stay as the shared coordinate for spread mode, but scrolling
+//! itself is page-free.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -52,6 +55,12 @@ const MAX_PIXELS: f32 = 40_000_000.0;
 const LAYOUT_WIDTH: f32 = 612.0;
 const LAYOUT_HEIGHT: f32 = 792.0;
 const LAYOUT_EM: f32 = 12.0;
+/// Height used for the second, unpaginated layout that continuous scroll
+/// measures real inter-block spacing from. MuPDF clamps a margin that crosses
+/// a page boundary, so the paginated story loses paragraph and image spacing
+/// exactly at its page seams. A page tall enough to never break keeps the
+/// document's own spacing intact; text is extracted from it, never rendered.
+const TALL_LAYOUT_HEIGHT: f32 = 10_000_000.0;
 const FONT_SIZE_MIN: f32 = 8.0;
 const FONT_SIZE_MAX: f32 = 24.0;
 pub const FONT_SIZE_STEP: f32 = 1.1;
@@ -171,6 +180,52 @@ struct RollMetrics {
     text_lines: usize,
     /// Bounds of the image union, set only for image-only pages.
     plate_bounds: Option<Rect>,
+}
+
+/// One block of content in the document's continuous flow. Text keeps its
+/// characters so paginated pages can be aligned with the tall layout; images
+/// and vector art are matched by kind because pagination may rescale an image
+/// that sits at the bottom of a page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlowElement {
+    Text(String),
+    Image,
+    Shape,
+}
+
+impl FlowElement {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Image, Self::Image) | (Self::Shape, Self::Shape) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FlowItem {
+    kind: FlowElement,
+    rect: Rect,
+    /// Index of the tall-layout page (an EPUB chapter) holding this block.
+    chapter: usize,
+}
+
+/// The tall, unpaginated layout of the story, used only to measure the true
+/// distance between blocks that pagination split across a page boundary.
+struct TallFlow {
+    elements: Vec<FlowItem>,
+}
+
+/// Where one paginated page's content sits in the tall flow.
+#[derive(Debug, Clone, Copy)]
+struct PageFlow {
+    first_tall: usize,
+    last_tall: usize,
+    /// First and last content rectangles in page points, used to subtract the
+    /// blank padding the roll already carries at the seam.
+    first_rect: Rect,
+    last_rect: Rect,
 }
 
 /// How one page will be rasterized into the current strip.
@@ -479,6 +534,12 @@ pub struct RenderEngine {
     /// margin shared by every page; pages are cropped here so real paragraph
     /// and chapter margins survive while page chrome disappears.
     roll_top_baseline: Option<f32>,
+    /// The unpaginated layout used to recover spacing at page seams. Built on
+    /// the first roll render; an empty flow means the tall layout failed.
+    tall_flow: Option<TallFlow>,
+    /// Paginated page -> position in the tall flow. `None` marks a page whose
+    /// content could not be aligned (a blank page, for example).
+    page_flow: HashMap<usize, Option<PageFlow>>,
     /// Recently rendered pages for the spread strip. Consecutive page turns
     /// overlap three of the four pages, so reusing them avoids rasterizing
     /// the whole strip on every turn. Each entry records the scale it was
@@ -567,6 +628,8 @@ impl RenderEngine {
             book_background: DEFAULT_WINDOW,
             roll_metrics_cache: HashMap::new(),
             roll_top_baseline: None,
+            tall_flow: None,
+            page_flow: HashMap::new(),
             page_cache: Vec::new(),
             #[cfg(test)]
             page_renders: 0,
@@ -594,6 +657,8 @@ impl RenderEngine {
         self.page_cache.clear();
         self.roll_metrics_cache.clear();
         self.roll_top_baseline = None;
+        self.tall_flow = None;
+        self.page_flow.clear();
         self.scroll_scale = None;
         let old_page = self.page;
         let old_count = self.page_count.unwrap_or(1).max(1);
@@ -847,10 +912,11 @@ impl RenderEngine {
     /// Continuous scroll means the reflowable story flows as one column with
     /// no simulated page chrome. Content is laid out by MuPDF in paginated
     /// pages underneath (the spread mode and page numbers stay consistent
-    /// with it), but the pages are rendered cropped to their content so no
-    /// gap ever shows between blocks, lines, or illustrations. An explicit
-    /// zoom keeps the page-shaped view so the reader can inspect the page as
-    /// laid out.
+    /// with it), but the pages are rendered cropped to their content so page
+    /// chrome never shows between blocks, lines, or illustrations. The
+    /// document's real inter-block spacing is measured from an unpaginated
+    /// layout and restored at each seam. An explicit zoom keeps the
+    /// page-shaped view so the reader can inspect the page as laid out.
     fn roll(&self) -> bool {
         self.scroll && self.reflowable && self.fit == Fit::Page && self.rotation.is_multiple_of(180)
     }
@@ -1003,6 +1069,210 @@ impl RenderEngine {
             text_lines: lines.len(),
             plate_bounds,
         })
+    }
+
+    /// Build the tall layout on first use. Failure is not fatal: the roll
+    /// still renders, it just cannot recover margins that pagination dropped.
+    fn ensure_tall_flow(&mut self) {
+        if self.tall_flow.is_some() {
+            return;
+        }
+        let flow = match self.build_tall_flow() {
+            Ok(flow) => flow,
+            Err(error) => {
+                eprintln!("MuReader: continuous flow unavailable: {error}");
+                TallFlow {
+                    elements: Vec::new(),
+                }
+            }
+        };
+        self.tall_flow = Some(flow);
+    }
+
+    fn build_tall_flow(&self) -> Result<TallFlow, String> {
+        let mut doc = if self.pretty_text {
+            let html = crate::pretty_text::html_for_path_at(
+                &self.source_path,
+                &self.fonts,
+                self.font_size,
+            )?;
+            Document::from_copied_bytes(html.as_bytes(), "text/html")
+                .map_err(|e| format!("tall pretty text: {e}"))?
+        } else {
+            Document::open(self.source_path.as_path())
+                .map_err(|e| format!("tall layout: open {}: {e}", self.source_path.display()))?
+        };
+        doc.layout(LAYOUT_WIDTH, TALL_LAYOUT_HEIGHT, self.font_size)
+            .map_err(|e| format!("tall layout: {e}"))?;
+        let count = doc.page_count().map_err(|e| format!("tall layout: {e}"))?;
+        let mut elements = Vec::new();
+        for chapter in 0..count {
+            let page = doc
+                .load_page(chapter)
+                .map_err(|e| format!("tall layout page: {e}"))?;
+            let text_page = page
+                .to_text_page(TextPageFlags::PRESERVE_WHITESPACE | TextPageFlags::PRESERVE_IMAGES)
+                .map_err(|e| format!("tall layout text: {e}"))?;
+            for (kind, rect) in flow_elements(&text_page) {
+                elements.push(FlowItem {
+                    kind,
+                    rect,
+                    chapter: chapter as usize,
+                });
+            }
+        }
+        Ok(TallFlow { elements })
+    }
+
+    /// Place one paginated page in the tall flow. Pages are matched by their
+    /// block sequence, not by a page number API: the tall layout has no page
+    /// breaks to ask about. A page's text and images must be a contiguous run
+    /// of the tall flow, which is guaranteed because both layouts use the same
+    /// width and therefore the same line breaks.
+    fn map_page(&mut self, page_no: usize) -> Option<PageFlow> {
+        if let Some(cached) = self.page_flow.get(&page_no) {
+            return *cached;
+        }
+        let flow = self.map_page_uncached(page_no);
+        self.page_flow.insert(page_no, flow);
+        flow
+    }
+
+    fn map_page_uncached(&mut self, page_no: usize) -> Option<PageFlow> {
+        let page = self.doc.load_page(page_no as i32).ok()?;
+        let text_page = page
+            .to_text_page(TextPageFlags::PRESERVE_WHITESPACE | TextPageFlags::PRESERVE_IMAGES)
+            .ok()?;
+        let items = flow_elements(&text_page);
+        if items.is_empty() {
+            return None;
+        }
+        self.ensure_tall_flow();
+        let tall = self.tall_flow.as_ref()?;
+        let len = items.len();
+        if len > tall.elements.len() {
+            return None;
+        }
+        // Already-mapped neighbours bound the search, so a page is never
+        // matched to content that belongs before or after it.
+        let previous = self
+            .page_flow
+            .iter()
+            .filter(|(mapped, flow)| **mapped < page_no && flow.is_some())
+            .map(|(mapped, flow)| (*mapped, flow.unwrap().last_tall))
+            .max_by_key(|(mapped, _)| *mapped);
+        let next = self
+            .page_flow
+            .iter()
+            .filter(|(mapped, flow)| **mapped > page_no && flow.is_some())
+            .map(|(mapped, flow)| (*mapped, flow.unwrap().first_tall))
+            .min_by_key(|(mapped, _)| *mapped);
+        let start = previous.map_or(0, |(_, last)| last + 1);
+        let end = next.map_or(tall.elements.len(), |(_, first)| first);
+        if start >= end {
+            return None;
+        }
+        // A short page, especially an image-only one, can match several runs
+        // of the tall flow. Prefer the run nearest where this page should sit:
+        // neighbours interpolate the tightest estimate, and a cold jump falls
+        // back to the page's proportional position in the document.
+        let expected = match (previous, next) {
+            (Some((previous_page, previous_last)), Some((next_page, next_first))) => {
+                let span = next_first.saturating_sub(previous_last + 1) as f64;
+                let pages = next_page.saturating_sub(previous_page).max(1) as f64;
+                previous_last as f64
+                    + 1.0
+                    + span * (page_no.saturating_sub(previous_page) as f64 / pages)
+            }
+            (Some((_, previous_last)), None) => previous_last as f64 + 1.0,
+            (None, Some((_, next_first))) => next_first.saturating_sub(len) as f64,
+            (None, None) => {
+                let count = self.page_count.unwrap_or(page_no + 1).max(1) as f64;
+                (page_no as f64 + 0.5) / count * tall.elements.len() as f64
+            }
+        };
+        let mut best: Option<(usize, f64)> = None;
+        for index in start..end {
+            if index + len > tall.elements.len() || index + len > end {
+                break;
+            }
+            if !tall.elements[index].kind.matches(&items[0].0) {
+                continue;
+            }
+            let aligned = tall.elements[index..index + len]
+                .iter()
+                .zip(&items)
+                .all(|(item, (kind, _))| item.kind.matches(kind));
+            if !aligned {
+                continue;
+            }
+            // A page never spans a chapter boundary in the paginated layout.
+            if tall.elements[index].chapter != tall.elements[index + len - 1].chapter {
+                continue;
+            }
+            let distance = (index as f64 - expected).abs();
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+                best = Some((index, distance));
+            }
+        }
+        best.map(|(index, _)| PageFlow {
+            first_tall: index,
+            last_tall: index + len - 1,
+            first_rect: items[0].1,
+            last_rect: items[len - 1].1,
+        })
+    }
+
+    /// Extra blank rows to insert between two consecutive roll pages so the
+    /// seam carries the document's real spacing. The roll already includes the
+    /// leading above and below the page's own content, so only the difference
+    /// between the true block spacing and that padding is added.
+    fn seam_gap(&mut self, previous: usize, next: usize, baseline: Option<f32>, scale: f32) -> u32 {
+        let Some(previous_flow) = self.map_page(previous) else {
+            return 0;
+        };
+        let Some(next_flow) = self.map_page(next) else {
+            return 0;
+        };
+        if previous_flow.last_tall + 1 != next_flow.first_tall {
+            return 0;
+        }
+        let (Some(previous_metrics), Some(next_metrics)) =
+            (self.roll_metrics(previous), self.roll_metrics(next))
+        else {
+            return 0;
+        };
+        let Some(tall) = self.tall_flow.as_ref() else {
+            return 0;
+        };
+        let last = &tall.elements[previous_flow.last_tall];
+        let first = &tall.elements[next_flow.first_tall];
+        // A chapter starts a fresh tall page, so its top margin is already
+        // visible in the cropped page and the two layouts share no coordinate
+        // system to measure across.
+        if last.chapter != first.chapter {
+            return 0;
+        }
+        let true_gap = first.rect.y0 - last.rect.y1;
+        if !true_gap.is_finite() {
+            return 0;
+        }
+        let bottom_pad = (previous_metrics.bottom - previous_flow.last_rect.y1).max(0.0);
+        let crop_top = if next_metrics.text_lines == 0 {
+            next_metrics.top
+        } else {
+            baseline.map_or(next_metrics.top, |baseline| next_metrics.top.min(baseline))
+        };
+        let top_pad = (next_flow.first_rect.y0 - crop_top).max(0.0);
+        let extra = (true_gap - bottom_pad - top_pad).max(0.0);
+        // A real paragraph or figure margin is a few lines at most. Bound a
+        // misaligned seam so it can never insert a page-sized blank band.
+        let line = previous_metrics
+            .line_height
+            .or(next_metrics.line_height)
+            .unwrap_or(self.font_size * 1.2);
+        let extra = extra.min(line * 8.0);
+        (extra * scale).round().max(0.0) as u32
     }
 
     /// Set the window color used behind the spread gutter.
@@ -1720,6 +1990,18 @@ impl RenderEngine {
         for &page_no in &numbers {
             plans.push(self.page_plan(page_no, scale, IMAGE_PAGE_MAX_HEIGHT)?);
         }
+        // The roll's seam bands are measured before the texture budget is
+        // checked: they are real content spacing, not slack that may be
+        // dropped. Paged strips keep one uniform gutter instead.
+        let seam_gaps: Vec<u32> = if self.roll() {
+            let baseline = self.roll_top_baseline;
+            numbers
+                .windows(2)
+                .map(|pair| self.seam_gap(pair[0], pair[1], baseline, scale))
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Illustrations are much taller than text pages. If a strip of them
         // would exceed the texture height limit, shrink only the image pages
         // so their total still fits; text pages keep the locked column scale.
@@ -1729,8 +2011,12 @@ impl RenderEngine {
             } else {
                 scroll_gap(self.scroll_available_width().round() as u32) as f32
             };
-            let total: f32 = plans.iter().map(|plan| plan.height).sum::<f32>()
-                + gap * (numbers.len() - 1) as f32;
+            let seam_total = if self.roll() {
+                seam_gaps.iter().sum::<u32>() as f32
+            } else {
+                gap * (numbers.len() - 1) as f32
+            };
+            let total: f32 = plans.iter().map(|plan| plan.height).sum::<f32>() + seam_total;
             if total > SCROLL_STRIP_MAX_HEIGHT {
                 let image_total: f32 = plans
                     .iter()
@@ -1812,7 +2098,12 @@ impl RenderEngine {
             } else {
                 scroll_gap(page_widths.get(focus_index).copied().unwrap_or(1))
             };
-            let strip = compose_pages_vertical(&rendered, gap, self.background);
+            let seam_gaps: Vec<u32> = if self.roll() {
+                seam_gaps
+            } else {
+                vec![gap; rendered.len().saturating_sub(1)]
+            };
+            let strip = compose_pages_vertical(&rendered, &seam_gaps, self.background);
             (strip.page, strip.offsets, strip.heights, gap)
         } else {
             let gap = if page_widths.len() > 1 {
@@ -2051,7 +2342,11 @@ struct TranslatedPage {
 /// Stack pages vertically with a gap. Every page is centered in the strip
 /// width, and all geometry is translated so highlights, links, and text hit
 /// testing keep working in strip coordinates.
-fn compose_pages_vertical(pages: &[&PageRender], gap: u32, background: u32) -> VerticalStrip {
+///
+/// `gaps` holds one blank band per seam (`pages.len() - 1` entries). The roll
+/// uses a measured band at each seam so paragraph and figure margins survive
+/// pagination; paged strips pass one uniform gutter.
+fn compose_pages_vertical(pages: &[&PageRender], gaps: &[u32], background: u32) -> VerticalStrip {
     let width = pages
         .iter()
         .map(|page| page.bitmap.width)
@@ -2061,13 +2356,19 @@ fn compose_pages_vertical(pages: &[&PageRender], gap: u32, background: u32) -> V
     let mut lefts = Vec::with_capacity(pages.len());
     let mut heights = Vec::with_capacity(pages.len());
     let mut y = 0u32;
-    for page in pages {
+    for (index, page) in pages.iter().enumerate() {
         offsets.push(y);
         lefts.push((width.saturating_sub(page.bitmap.width)) / 2);
         heights.push(page.bitmap.height);
-        y = y.saturating_add(page.bitmap.height).saturating_add(gap);
+        y = y
+            .saturating_add(page.bitmap.height)
+            .saturating_add(gaps.get(index).copied().unwrap_or(0));
     }
-    let height = y.saturating_sub(gap);
+    let height = y.saturating_sub(
+        gaps.get(pages.len().saturating_sub(1))
+            .copied()
+            .unwrap_or(0),
+    );
     let mut pixels = vec![background; width as usize * height as usize];
 
     let mut highlights = Vec::new();
@@ -2116,6 +2417,42 @@ fn blit_bitmap(dst: &mut [u32], dst_width: u32, src: &PageBitmap, x: u32, y: u32
         dst[dst_start..dst_start + src_width]
             .copy_from_slice(&src.pixels[src_start..src_start + src_width]);
     }
+}
+
+/// Flatten a structured text page into the document's reading order. This is
+/// the common vocabulary used to align a paginated page with the tall flow.
+fn flow_elements(page: &TextPage) -> Vec<(FlowElement, Rect)> {
+    let mut items = Vec::new();
+    for block in page.blocks() {
+        match block.r#type() {
+            mupdf::text_page::TextBlockType::Text => {
+                for line in block.lines() {
+                    let text: String = line.chars().filter_map(|ch| ch.char()).collect();
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let bounds = line.bounds();
+                    if bounds.is_valid() && !bounds.is_empty() {
+                        items.push((FlowElement::Text(text.to_string()), bounds));
+                    }
+                }
+            }
+            mupdf::text_page::TextBlockType::Image => {
+                let bounds = block.bounds();
+                if bounds.is_valid() && !bounds.is_empty() {
+                    items.push((FlowElement::Image, bounds));
+                }
+            }
+            _ => {
+                let bounds = block.bounds();
+                if bounds.is_valid() && !bounds.is_empty() {
+                    items.push((FlowElement::Shape, bounds));
+                }
+            }
+        }
+    }
+    items
 }
 
 fn text_layer_from_page(page: &TextPage, ctm: &Matrix, width: u32, height: u32) -> TextLayer {
@@ -3173,6 +3510,208 @@ mod tests {
     }
 
     #[test]
+    fn roll_restores_image_margins_at_page_seams() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-image-margins");
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="600"><rect width="300" height="600" fill="#336699"/></svg>"##;
+        std::fs::write(dir.join("plate.svg"), svg).unwrap();
+        let path = dir.join("plates.html");
+        let mut html = String::from(
+            "<!doctype html><html><head><style>\
+             html, body { margin: 0; }\
+             img { display: block; margin: 30px 0; }\
+             </style></head><body>",
+        );
+        for _ in 0..8 {
+            html.push_str(r#"<img src="plate.svg">"#);
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        let scale = strip.scale;
+        let margin = 30.0 * scale;
+
+        let mut checked = 0;
+        for index in 0..strip.page_offsets.len().saturating_sub(1) {
+            let gap = strip.page_offsets[index + 1]
+                - strip.page_offsets[index]
+                - strip.page_heights[index];
+            checked += 1;
+            assert!(
+                gap as f32 >= margin * 0.5,
+                "image margin lost at seam {index}: gap {gap}px, margin {margin:.1}px"
+            );
+            assert!(
+                gap as f32 <= margin * 2.0 + 2.0,
+                "image seam {index} gained an unexpected band: {gap}px, margin {margin:.1}px"
+            );
+        }
+        assert!(checked > 0, "the plate strip has at least one seam");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_restores_margins_between_text_and_images() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-mixed-margins");
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="240"><rect width="300" height="240" fill="#336699"/></svg>"##;
+        std::fs::write(dir.join("plate.svg"), svg).unwrap();
+        let path = dir.join("mixed.html");
+        let mut html = String::from(
+            "<!doctype html><html><head><style>\
+             html, body { margin: 0; }\
+             body { font-size: 16px; line-height: 24px; }\
+             p { margin: 0 0 16px 0; }\
+             img { display: block; margin: 20px 0; }\
+             </style></head><body>",
+        );
+        for i in 0..30 {
+            html.push_str(&format!(
+                "<p>Mixed paragraph {i}. Lorem ipsum dolor sit amet, consectetur \
+                 adipiscing elit, sed do eiusmod tempor incididunt.</p>"
+            ));
+            if i % 3 == 0 {
+                html.push_str(r#"<img src="plate.svg">"#);
+            }
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        let scale = strip.scale;
+        let baseline = engine.roll_top_baseline;
+        let count = engine.page_count.unwrap();
+        let image_margin = 20.0 * scale;
+
+        let mut mixed = 0;
+        for page_no in 1..count {
+            let (Some(previous), Some(next)) =
+                (engine.map_page(page_no - 1), engine.map_page(page_no))
+            else {
+                continue;
+            };
+            let Some(tall) = engine.tall_flow.as_ref() else {
+                break;
+            };
+            let last = &tall.elements[previous.last_tall].kind;
+            let first = &tall.elements[next.first_tall].kind;
+            let is_mixed = matches!(
+                (last, first),
+                (FlowElement::Text(_), FlowElement::Image)
+                    | (FlowElement::Image, FlowElement::Text(_))
+            );
+            if !is_mixed {
+                continue;
+            }
+            mixed += 1;
+            let gap = engine.seam_gap(page_no - 1, page_no, baseline, scale);
+            assert!(
+                gap as f32 >= image_margin * 0.5,
+                "text/image seam {page_no} lost its margin: {gap}px, \
+                 image margin {image_margin:.1}px"
+            );
+            assert!(
+                gap as f32 <= image_margin * 2.0 + 4.0,
+                "text/image seam {page_no} gained an unexpected band: \
+                 {gap}px, image margin {image_margin:.1}px"
+            );
+        }
+        assert!(mixed > 0, "no page seam fell between text and an image");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roll_restores_paragraph_margins_at_page_seams() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("roll-paragraph-margins");
+        let path = dir.join("paragraphs.html");
+        let mut html = String::from(
+            "<!doctype html><html><head><style>\
+             html, body { margin: 0; }\
+             body { font-size: 16px; line-height: 24px; }\
+             p { margin: 0 0 24px 0; text-indent: 2em; }\
+             </style></head><body>",
+        );
+        for i in 0..120 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing \
+                 elit, sed do eiusmod tempor incididunt ut labore.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(900, 1200);
+        engine.set_layout(false);
+        let strip = engine.render().unwrap();
+        let scale = strip.scale;
+        let line = strip.line_height.expect("line rhythm") * scale;
+        let margin = 24.0 * scale;
+
+        // Ink-to-ink spacing between two lines of the same paragraph.
+        let lines = &strip.text.lines;
+        let mut line_gaps: Vec<f32> = lines
+            .windows(2)
+            .map(|pair| pair[1].rect.y0 as f32 - pair[0].rect.y1 as f32)
+            .filter(|gap| *gap > 0.0 && *gap < line * 0.9)
+            .collect();
+        line_gaps.sort_by(f32::total_cmp);
+        let line_gap = line_gaps[line_gaps.len() / 2];
+        let left = lines
+            .iter()
+            .map(|line| line.rect.x0 as f32)
+            .fold(f32::INFINITY, f32::min);
+        // A paragraph's first line is indented by 2em; continuation lines are
+        // not, so the indent says which kind of break a page seam landed on.
+        let indented = |line: &TextLine| line.rect.x0 as f32 >= left + 16.0 * scale;
+
+        let mut checked_paragraphs = 0;
+        for &offset in &strip.page_offsets[1..] {
+            let seam = offset as f32;
+            let Some(above) = lines.iter().rev().find(|line| line.rect.y1 as f32 <= seam) else {
+                continue;
+            };
+            let Some(below) = lines.iter().find(|line| line.rect.y0 as f32 >= seam) else {
+                continue;
+            };
+            let gap = below.rect.y0 as f32 - above.rect.y1 as f32;
+            if indented(below) {
+                checked_paragraphs += 1;
+                assert!(
+                    gap >= line_gap + margin * 0.5,
+                    "paragraph margin lost at seam {seam}: gap {gap:.1}px, \
+                     line gap {line_gap:.1}px, margin {margin:.1}px"
+                );
+            } else {
+                assert!(
+                    gap <= line_gap + margin * 0.5,
+                    "mid-paragraph seam {seam} gained a paragraph gap: \
+                     {gap:.1}px vs line gap {line_gap:.1}px"
+                );
+            }
+        }
+        assert!(
+            checked_paragraphs > 0,
+            "no seam landed on a paragraph boundary"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn roll_keeps_a_chapter_margin_above_the_heading() {
         let _guard = doc_test_guard();
         let dir = test_dir("roll-chapter-margin");
@@ -3299,11 +3838,16 @@ mod tests {
         assert_eq!(strip.pages, vec![1, 2, 3, 4]);
         let book_background = strip.book_background;
         let first_height = strip.page_heights[0];
-        // The roll packs content blocks with no simulated page chrome:
-        // pages touch and a fully blank reflow page never shows up.
+        // The roll packs content blocks with no simulated page chrome and
+        // restores the document's real spacing at each seam, so a page may
+        // start a little below the previous page's bitmap. A fully blank
+        // reflow page never shows up.
         assert_eq!(strip.gap, 0);
         assert_eq!(strip.page_offsets[0], 0);
-        assert_eq!(strip.page_offsets[1], first_height);
+        assert!(
+            strip.page_offsets[1] >= first_height,
+            "the second page cannot overlap the first"
+        );
         assert!(
             strip.page_heights.iter().all(|&height| height > 0),
             "every page in the roll reports a content height"
