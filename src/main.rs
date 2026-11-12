@@ -93,13 +93,23 @@ const OUTLINE_PREVIEW_MAX_PIXELS: u64 = 4_000_000;
 /// line spacing the document's CSS asks for.
 const SCROLL_LINE_PIXELS: f32 = 60.0;
 /// CSSOM View leaves the smooth-scroll curve to the user agent (`scroll-behavior:
-/// smooth`). Use an exponential ease-out with a short time constant: key
-/// repeat stays fluid, but the first pixels of a press appear immediately.
-const SCROLL_GLIDE_TAU: f32 = 0.07;
+/// smooth`). The tail is a deformed Torricelli trumpet rather than an
+/// exponential: the remaining distance is the horn's finite "volume", so it
+/// falls as `1 / (1 + t/tau)^2`. The first pixels appear immediately, but the
+/// long, thin tail keeps the moving text inside the eye's tracking range and
+/// avoids the abrupt stop that would pull attention away from the page. The
+/// time constant is shorter than the old exponential one because the horn's
+/// tail is longer, keeping the felt duration similar.
+const SCROLL_GLIDE_TAU: f32 = 0.02;
 /// Cap the glide speed so a full-screen step glides instead of teleporting.
-const SCROLL_GLIDE_MAX_SPEED: f32 = 3200.0;
+/// Keeping this below a fast flick also keeps moving glyphs legible.
+const SCROLL_GLIDE_MAX_SPEED: f32 = 2400.0;
 /// Finish a glide once less than this many bitmap pixels remain.
 const SCROLL_GLIDE_SNAP: f32 = 0.5;
+/// A trackpad gesture in paged mode must travel this many line steps before
+/// it turns a page. Paged mode has no pixel scrolling, so the gesture is
+/// quantized instead of moving the bitmap.
+const PAGED_WHEEL_PAGE_STEPS: f32 = 2.0;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -432,8 +442,12 @@ struct SpreadAnimation {
 /// Only the distance left to travel is stored, not absolute coordinates: a
 /// recenter may slide the rendered window and rebase its offsets mid-glide,
 /// while each frame still applies a relative delta to the current position.
+/// `total` is the starting distance of the current horn curve; the next
+/// remainder is derived from `remaining / total`, so the curve stays
+/// incremental and needs no elapsed-time clock.
 struct ScrollGlide {
     remaining: f32,
+    total: f32,
     last: Instant,
 }
 
@@ -513,6 +527,9 @@ struct App {
     /// Scroll distance requested past the current strip. It is replayed when a
     /// strip with more pages arrives, so fast scrolling is never discarded.
     scroll_pending: f32,
+    /// Wheel travel accumulated in paged mode. Paged mode has no pixel
+    /// scrolling, so a trackpad gesture is quantized into page turns.
+    paged_wheel: f32,
     /// Last scroll direction: 1 down, -1 up. It decides how much lookahead the
     /// next strip keeps above the anchor.
     scroll_direction: i32,
@@ -645,6 +662,7 @@ impl App {
             scroll_keep_anchor: false,
             scroll_recenter_pending: None,
             scroll_pending: 0.0,
+            paged_wheel: 0.0,
             scroll_direction: 1,
             modifiers: ModifiersState::empty(),
             prompt: Prompt::None,
@@ -736,14 +754,6 @@ impl App {
         let scale = self.display_scale();
         let page_h = self.bitmap.as_ref().map(|b| b.height as f32).unwrap_or(0.0) * scale;
         (page_h + MARGIN as f32 * 2.0 - viewport_h as f32).max(0.0) / scale
-    }
-
-    fn page_fits_height(&self) -> bool {
-        let (_, viewport_h) = self.viewport();
-        let scale = self.display_scale();
-        self.bitmap.as_ref().is_some_and(|page| {
-            (page.height as f32 * scale).round() as u32 <= viewport_h.saturating_add(1)
-        })
     }
 
     fn content_left(&self) -> i32 {
@@ -893,6 +903,7 @@ impl App {
     fn toggle_spread(&mut self) {
         self.finish_animation();
         self.scroll_glide = None;
+        self.paged_wheel = 0.0;
         let reading = self.reading_page();
         let was_scroll = !self.spread_active;
         self.spread_enabled = !self.spread_enabled;
@@ -1172,16 +1183,17 @@ impl App {
     }
 
     fn scroll_vertical(&mut self, delta: f32) {
+        // Paged mode has no pixel scrolling. Its callers turn pages instead;
+        // reaching here means there is no continuous column to move.
         if self.scroll_mode() {
             self.scroll_document(delta);
-            return;
         }
-        self.scroll_y += delta / self.display_scale();
-        self.clamp_scroll();
-        self.request_redraw();
     }
 
     fn scroll_horizontal(&mut self, delta: f32) {
+        if !self.scroll_mode() {
+            return;
+        }
         self.scroll_x += delta / self.display_scale();
         self.clamp_scroll();
         self.request_redraw();
@@ -1192,7 +1204,7 @@ impl App {
         if self.scroll_mode() {
             self.scroll_smoothly(viewport_h as f32 * 0.9);
         } else {
-            self.scroll_vertical(viewport_h as f32 * 0.9);
+            self.scroll_page_step(viewport_h as f32 * 0.9);
         }
     }
 
@@ -1201,7 +1213,7 @@ impl App {
         if self.scroll_mode() {
             self.scroll_smoothly(-(viewport_h as f32 * 0.9));
         } else {
-            self.scroll_vertical(-(viewport_h as f32 * 0.9));
+            self.scroll_page_step(-(viewport_h as f32 * 0.9));
         }
     }
 
@@ -1250,23 +1262,36 @@ impl App {
             .unwrap_or(SCROLL_LINE_PIXELS)
     }
 
-    /// Scroll inside a page that is taller than the viewport, then turn the
-    /// page once its end is reached. Used by paged mode, which keeps its
-    /// immediate page-shaped scrolling rather than the continuous glide.
+    /// Move the paged model by whole pages. Paged mode fits the page, so
+    /// pixel scrolling is disabled there: wheel, key, and screen steps all
+    /// become page turns instead of sliding the bitmap.
     fn scroll_page_step(&mut self, delta: f32) {
-        if !self.page_fits_height()
-            && if delta > 0.0 {
-                self.scroll_y + 0.5 < self.max_scroll_y()
-            } else {
-                self.scroll_y > self.min_scroll_y() + 0.5
-            }
-        {
-            self.scroll_vertical(delta);
-        } else if delta > 0.0 {
+        if delta > 0.0 {
             self.send(Command::NextPage);
-        } else {
+        } else if delta < 0.0 {
             self.send(Command::PrevPage);
         }
+    }
+
+    /// Distance the preloaded strip can still scroll in `direction`, in device
+    /// pixels. Inertia is only allowed to spend what is already rendered, so
+    /// it never runs into a blank edge while waiting for a recenter.
+    fn scroll_buffer_remaining(&self, direction: f32) -> f32 {
+        if !self.strip_scroll || self.pages.is_empty() || direction == 0.0 {
+            return 0.0;
+        }
+        let scale = self.display_scale().max(0.001);
+        let (_, viewport_h) = self.viewport();
+        let view_h = viewport_h as f32 / scale;
+        let strip_bottom = self.page_offsets.last().copied().unwrap_or(0) as f32
+            + self.page_heights.last().copied().unwrap_or(0) as f32;
+        let position = self.scroll_position() + self.scroll_pending;
+        let available = if direction > 0.0 {
+            (strip_bottom - view_h - position).max(0.0)
+        } else {
+            position.max(0.0)
+        };
+        available * scale
     }
 
     /// Add a step to the continuous scroll glide. Repeated key events extend
@@ -1281,10 +1306,14 @@ impl App {
         // added now is consumed by the next frame over that frame's real
         // elapsed time, so key auto-repeat keeps a steady rate.
         match self.scroll_glide.as_mut() {
-            Some(glide) => glide.remaining += delta,
+            Some(glide) => {
+                glide.remaining += delta;
+                glide.total = glide.total.max(glide.remaining.abs());
+            }
             None => {
                 self.scroll_glide = Some(ScrollGlide {
                     remaining: delta,
+                    total: delta.abs(),
                     last: Instant::now(),
                 });
             }
@@ -1295,11 +1324,32 @@ impl App {
     /// Advance the smooth scroll by one frame. The bitmap position is applied
     /// as a relative delta, so a prefetched window can recenter underneath the
     /// glide without losing the visual position.
+    ///
+    /// The curve is spent against the existing preload buffer: each frame
+    /// reads how far the rendered strip can still move, and inertia is capped
+    /// to that distance and to one viewport height. A recenter therefore never
+    /// carries a stale overshoot into the new window.
     fn tick_scroll_glide(&mut self) {
+        let Some(glide) = self.scroll_glide.as_ref() else {
+            return;
+        };
+        let direction = glide.remaining.signum();
+        if direction == 0.0 {
+            self.scroll_glide = None;
+            return;
+        }
+        let (_, viewport_h) = self.viewport();
+        let available = self.scroll_buffer_remaining(direction);
+        if available <= 0.0 {
+            // The rendered window ends here. Stop instead of banking motion
+            // for a strip that has not arrived yet.
+            self.scroll_glide = None;
+            return;
+        }
+        let now = Instant::now();
         let Some(glide) = self.scroll_glide.as_mut() else {
             return;
         };
-        let now = Instant::now();
         let dt = now
             .saturating_duration_since(glide.last)
             .as_secs_f32()
@@ -1308,7 +1358,15 @@ impl App {
         if dt <= 0.0 {
             return;
         }
-        let (step, remaining) = glide_frame(glide.remaining, dt);
+        let (remaining, total) =
+            clamp_glide_to_window(glide.remaining, glide.total, available, viewport_h as f32);
+        if remaining == 0.0 {
+            self.scroll_glide = None;
+            return;
+        }
+        glide.remaining = remaining;
+        glide.total = total;
+        let (step, remaining) = glide_frame(glide.remaining, glide.total, dt);
         glide.remaining = remaining;
         if remaining == 0.0 {
             self.scroll_glide = None;
@@ -3071,6 +3129,9 @@ impl App {
             || self.pages != page.pages
             || self.rotation != page.rotation
             || (self.font_scale - page.font_scale).abs() > 1.0e-4;
+        if page_changed {
+            self.paged_wheel = 0.0;
+        }
         // A re-layout rescales the bitmap, so the glide's remaining distance,
         // stored in bitmap pixels, no longer describes the same motion. A
         // strip re-center keeps the scale locked and must not cancel it.
@@ -3482,8 +3543,12 @@ impl App {
         }
         if self.panning {
             if let Some(previous) = previous {
-                self.scroll_horizontal(-(position.x - previous.x) as f32);
-                self.scroll_vertical(-(position.y - previous.y) as f32);
+                // Paged mode has no pixel scrolling; only the continuous
+                // model follows a drag.
+                if self.scroll_mode() {
+                    self.scroll_horizontal(-(position.x - previous.x) as f32);
+                    self.scroll_vertical(-(position.y - previous.y) as f32);
+                }
             }
             return;
         }
@@ -3609,19 +3674,45 @@ impl App {
                 self.zoom_out();
             }
         } else if self.modifiers.shift_key() {
-            let amount = if dx.abs() > 0.0 { dx } else { dy };
-            self.scroll_horizontal(amount);
-        } else if smooth && self.scroll_mode() {
-            // Discrete wheel notches glide like the key steps. High-resolution
-            // trackpad deltas stay direct so pointer input is never filtered.
-            self.scroll_smoothly(-dy);
-        } else {
-            // Direct pixel input takes over from an in-flight glide instead of
-            // adding to it, matching how a browser interrupts smooth scrolling.
-            if !smooth {
-                self.scroll_glide = None;
+            if self.scroll_mode() {
+                let amount = if dx.abs() > 0.0 { dx } else { dy };
+                self.scroll_horizontal(amount);
             }
-            self.scroll_vertical(-dy);
+        } else if self.scroll_mode() {
+            if smooth && self.strip_scroll {
+                // Discrete wheel notches glide like the key steps.
+                self.scroll_smoothly(-dy);
+            } else {
+                // Direct pixel input takes over from an in-flight glide
+                // instead of adding to it, matching how a browser interrupts
+                // smooth scrolling.
+                if !smooth {
+                    self.scroll_glide = None;
+                }
+                self.scroll_vertical(-dy);
+            }
+        } else {
+            // Paged mode has no pixel scrolling. A wheel notch turns a page
+            // immediately; a trackpad gesture is quantized so a stream of
+            // small deltas cannot flip several pages at once.
+            if self.paged_wheel.signum() != dy.signum() {
+                self.paged_wheel = 0.0;
+            }
+            self.paged_wheel += dy;
+            let threshold = if smooth {
+                0.0
+            } else {
+                self.scroll_line_step() * PAGED_WHEEL_PAGE_STEPS
+            };
+            if self.paged_wheel != 0.0 && self.paged_wheel.abs() >= threshold {
+                let forward = self.paged_wheel < 0.0;
+                self.paged_wheel = 0.0;
+                if forward {
+                    self.send(Command::NextPage);
+                } else {
+                    self.send(Command::PrevPage);
+                }
+            }
         }
     }
 
@@ -4263,22 +4354,51 @@ fn page_offsets_end(offsets: &[u32], heights: &[u32], index: usize) -> u32 {
     offset.saturating_add(height)
 }
 
-/// One frame of the exponential ease-out scroll glide.
+/// Keep an in-flight glide inside the rendered window.
+///
+/// `available` is the distance the preloaded strip can still move and
+/// `viewport` is one screen; the smaller of the two is the inertial budget.
+/// A glide that asks for more is restarted from the budget so its first frame
+/// still responds immediately instead of arriving pre-aged.
+fn clamp_glide_to_window(remaining: f32, total: f32, available: f32, viewport: f32) -> (f32, f32) {
+    let limit = available.max(0.0).min(viewport.max(0.0));
+    if limit <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if remaining.abs() > limit {
+        (remaining.signum() * limit, limit)
+    } else {
+        (remaining, total.abs().max(remaining.abs()))
+    }
+}
+
+/// One frame of the Torricelli-like scroll glide.
+///
+/// The remaining distance is the finite "volume" of a deformed Gabriel's horn:
+/// `remaining(t) = total / (1 + t / tau)^2`, whose cross-section (the velocity)
+/// falls as `1 / (1 + t / tau)^2`. This keeps the old ease-out's immediate
+/// first pixels and adds a longer, thinner tail, so the eye can follow the
+/// moving text instead of being caught by a hard stop. `total` is the
+/// starting distance of the current curve; deriving the next remainder from
+/// `remaining / total` keeps the frame computation incremental.
 ///
 /// Returns the distance to apply this frame and the distance left afterwards.
-/// The curve follows CSSOM View's user-agent-defined smooth scrolling: most of
-/// the distance moves early and the tail eases to a stop. A speed cap keeps a
-/// large step (a screen or a page) from looking like a teleport on a slow
-/// frame, and the remainder snaps to zero so the glide always terminates.
-fn glide_frame(remaining: f32, dt: f32) -> (f32, f32) {
+/// A speed cap keeps a large step (a screen or a page) from looking like a
+/// teleport on a slow frame, and the remainder snaps to zero so the glide
+/// always terminates.
+fn glide_frame(remaining: f32, total: f32, dt: f32) -> (f32, f32) {
     if remaining == 0.0 || dt <= 0.0 {
         return (0.0, remaining);
     }
-    let factor = 1.0 - (-dt / SCROLL_GLIDE_TAU).exp();
+    let direction = remaining.signum();
+    let distance = remaining.abs();
+    let total = total.abs().max(distance);
+    let elapsed = (total / distance).sqrt();
+    let next = total / (elapsed + dt / SCROLL_GLIDE_TAU).powi(2);
     let max_step = SCROLL_GLIDE_MAX_SPEED * dt;
-    let mut step = (remaining * factor).clamp(-max_step, max_step);
+    let mut step = (direction * (distance - next)).clamp(-max_step, max_step);
     let mut rest = remaining - step;
-    if rest.abs() <= SCROLL_GLIDE_SNAP {
+    if rest.abs() <= SCROLL_GLIDE_SNAP || rest.signum() != direction {
         step += rest;
         rest = 0.0;
     }
@@ -4813,31 +4933,60 @@ mod tests {
     #[test]
     fn scroll_glide_moves_toward_the_target_and_snaps_to_rest() {
         // A frame never overshoots and never reverses direction.
-        let (step, rest) = glide_frame(120.0, 1.0 / 120.0);
+        let (step, rest) = glide_frame(120.0, 120.0, 1.0 / 120.0);
         assert!(step > 0.0 && step < 120.0);
         assert!(rest > 0.0 && rest < 120.0);
         assert!(close(step + rest, 120.0));
 
-        let (up, _) = glide_frame(-120.0, 1.0 / 120.0);
+        let (up, _) = glide_frame(-120.0, 120.0, 1.0 / 120.0);
         assert!(close(up, -step));
 
-        // Time constant: after one tau the remaining distance is about 1/e.
-        let (_, rest) = glide_frame(100.0, SCROLL_GLIDE_TAU);
-        assert!(close(rest, 100.0 / std::f32::consts::E));
+        // Torricelli tail: after one tau the horn's volume is 1/4, after two
+        // tau it is 1/9, and the thin tail outlives an exponential's. Keep the
+        // step below the speed cap so this measures the curve itself.
+        let (_, rest) = glide_frame(20.0, 20.0, SCROLL_GLIDE_TAU);
+        assert!(close(rest, 5.0));
+        let (_, rest) = glide_frame(20.0, 20.0, 2.0 * SCROLL_GLIDE_TAU);
+        assert!(close(rest, 20.0 / 9.0));
+        let (_, rest) = glide_frame(20.0, 20.0, 4.0 * SCROLL_GLIDE_TAU);
+        assert!(rest > 20.0 * (-4.0f32).exp());
         // The speed cap keeps a big step from teleporting on a slow frame.
-        let (step, rest) = glide_frame(10_000.0, 0.05);
+        let (step, rest) = glide_frame(10_000.0, 10_000.0, 0.05);
         assert!(step <= SCROLL_GLIDE_MAX_SPEED * 0.05 + 1.0e-3);
         assert!(rest > 0.0);
         // Repeated frames always terminate at exactly zero.
         let mut remaining = 60.0;
         for _ in 0..600 {
-            let (_, rest) = glide_frame(remaining, 1.0 / 60.0);
+            let (_, rest) = glide_frame(remaining, 60.0, 1.0 / 60.0);
             remaining = rest;
             if remaining == 0.0 {
                 break;
             }
         }
         assert_eq!(remaining, 0.0);
+    }
+
+    #[test]
+    fn scroll_glide_is_spent_inside_the_preloaded_window() {
+        // A flick cannot leave the rendered strip or travel more than one
+        // screen, whichever is smaller.
+        let (remaining, total) = clamp_glide_to_window(3_000.0, 3_000.0, 5_000.0, 900.0);
+        assert!(close(remaining, 900.0));
+        assert!(close(total, 900.0));
+
+        let (remaining, total) = clamp_glide_to_window(3_000.0, 3_000.0, 400.0, 900.0);
+        assert!(close(remaining, 400.0));
+        assert!(close(total, 400.0));
+
+        // A glide already inside the budget keeps its curve and direction.
+        let (remaining, total) = clamp_glide_to_window(-300.0, 300.0, 400.0, 900.0);
+        assert!(close(remaining, -300.0));
+        assert!(close(total, 300.0));
+
+        // No rendered lookahead means no inertia.
+        let (remaining, total) = clamp_glide_to_window(300.0, 300.0, 0.0, 900.0);
+        assert_eq!(remaining, 0.0);
+        assert_eq!(total, 0.0);
     }
 
     #[test]

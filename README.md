@@ -168,10 +168,17 @@ illustrations; a new chapter keeps its breathing room instead of butting
 against the previous text.
 Arrow keys move one line at a time, matching a mouse-wheel notch, and the step
 follows the line spacing the document's CSS asks for, while `Space`/`PageDown`
-and `PageUp` move most of a screen. Key steps and wheel notches glide smoothly over a few frames,
-following the same idea as CSSOM View's `scroll-behavior: smooth` and EPUB's
-scrolled-continuous flow, so holding an arrow key carries the column forward
-instead of stepping it page by page. Trackpad pixel deltas stay direct.
+and `PageUp` move most of a screen. Key steps and wheel notches glide smoothly
+over a few frames, following the same idea as CSSOM View's
+`scroll-behavior: smooth` and EPUB's scrolled-continuous flow, so holding an
+arrow key carries the column forward instead of stepping it page by page.
+Trackpad pixel deltas stay direct. The glide uses a Torricelli-like decay:
+the remaining distance is the finite volume of a deformed Gabriel's horn, so
+the movement starts at once and then thins into a long, gentle tail instead of
+stopping abruptly. Inertia is spent only against the preloaded strip and never
+travels more than one viewport height, so it cannot outrun the render buffer or
+throw the eye past the text it was following. Paged spreads disable pixel
+scrolling entirely; there, wheel, key, and screen steps turn whole pages.
 Continuous scroll works for fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
@@ -270,12 +277,18 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 - Continuous scroll now glides between positions at pixel granularity instead
   of teleporting on each key press. Wheel notches and `Down`/`Up`, `Space`,
-  `PageUp`/`PageDown`, and `C-n`/`C-p` feed one exponential ease-out curve, in
+  `PageUp`/`PageDown`, and `C-n`/`C-p` feed one incremental decay curve, in
   the spirit of CSSOM View's `scroll-behavior: smooth` and EPUB's
-  `rendition:flow: scrolled-continuous`. Repeated input extends the same glide,
-  high-resolution trackpad deltas remain direct, and a prefetched window can
-  re-center underneath the glide without a visual jump. Paged and explicit-zoom
-  modes keep their page-shaped scrolling.
+  `rendition:flow: scrolled-continuous`. The curve is a deformed Torricelli
+  trumpet: remaining distance falls as `1 / (1 + t/tau)^2`, giving the old
+  ease-out's immediate first pixels a longer, thinner tail so the eye can
+  follow moving text instead of being caught by a hard stop. Repeated input
+  extends the same glide, high-resolution trackpad deltas remain direct, and a
+  prefetched window can re-center underneath the glide without a visual jump.
+  Inertia is computed from the existing preload buffer and capped to the
+  rendered strip and one viewport height, so it cannot spend motion on pages
+  that have not arrived yet. Paged spreads disable pixel scrolling entirely:
+  wheel, key, and screen steps turn whole pages there.
 - Continuous scroll now renders reflowable pages as one unbroken roll instead
   of a stack of page-shaped blocks. The roll learns the simulated page margin
   shared by the document's pages and crops every page at that baseline, so
