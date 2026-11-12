@@ -178,7 +178,10 @@ the movement starts at once and then thins into a long, gentle tail instead of
 stopping abruptly. Inertia is spent only against the preloaded strip and never
 travels more than one viewport height, so it cannot outrun the render buffer or
 throw the eye past the text it was following. Paged spreads disable pixel
-scrolling entirely; there, wheel, key, and screen steps turn whole pages.
+scrolling entirely: vertical wheel and trackpad motion is ignored there,
+while a horizontal swipe turns exactly one page per gesture; holding Shift
+turns a vertical wheel into that sideways gesture. Key and screen steps turn
+whole pages.
 Continuous scroll works for fixed-layout documents such as PDFs as well
 as reflowable ones. In a reflowable document, a page that holds only an
 illustration is drawn as the illustration itself: MuPDF still lays it out on
@@ -276,6 +279,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Paged spreads no longer turn pages from vertical wheel or trackpad motion.
+  A paged spread has nothing to scroll, so vertical input is ignored and a
+  horizontal swipe turns exactly one page per gesture; key and screen steps
+  still turn whole pages. The previous scroll-distance quantizer could make
+  two short flicks flip one page, which read as scrolling rather than paging.
 - Continuous scroll now glides between positions at pixel granularity instead
   of teleporting on each key press. Wheel notches and `Down`/`Up`, `Space`,
   `PageUp`/`PageDown`, and `C-n`/`C-p` feed one incremental decay curve, in
@@ -289,7 +297,9 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   Inertia is computed from the existing preload buffer and capped to the
   rendered strip and one viewport height, so it cannot spend motion on pages
   that have not arrived yet. Paged spreads disable pixel scrolling entirely:
-  wheel, key, and screen steps turn whole pages there.
+  vertical wheel and trackpad motion is ignored there, while a horizontal
+  swipe turns one page per gesture and key/screen steps still turn whole
+  pages.
 - Continuous scroll now renders reflowable pages as one unbroken roll instead
   of a stack of page-shaped blocks. The roll learns the simulated page margin
   shared by the document's pages and crops every page at that baseline, so

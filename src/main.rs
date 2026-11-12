@@ -106,10 +106,18 @@ const SCROLL_GLIDE_TAU: f32 = 0.02;
 const SCROLL_GLIDE_MAX_SPEED: f32 = 2400.0;
 /// Finish a glide once less than this many bitmap pixels remain.
 const SCROLL_GLIDE_SNAP: f32 = 0.5;
-/// A trackpad gesture in paged mode must travel this many line steps before
-/// it turns a page. Paged mode has no pixel scrolling, so the gesture is
-/// quantized instead of moving the bitmap.
-const PAGED_WHEEL_PAGE_STEPS: f32 = 2.0;
+/// A horizontal trackpad swipe in paged mode must travel this many pixels
+/// before it turns a page. Vertical wheel and trackpad motion is ignored
+/// there: a paged spread has nothing to scroll, so only a deliberate sideways
+/// gesture flips a page.
+const PAGED_SWIPE_PIXELS: f32 = 24.0;
+/// Pause between wheel events that starts a new paged swipe. It keeps the
+/// momentum tail of one gesture, or two quick flicks, from turning more than
+/// one page.
+const PAGED_SWIPE_GAP: Duration = Duration::from_millis(180);
+/// How much one axis must dominate the other before wheel motion counts as a
+/// horizontal swipe. Diagonal jitter during a vertical gesture stays ignored.
+const PAGED_SWIPE_AXIS_RATIO: f32 = 1.5;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -451,6 +459,89 @@ struct ScrollGlide {
     last: Instant,
 }
 
+/// Page turn requested by a horizontal paged-mode swipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagedSwipeStep {
+    Next,
+    Prev,
+}
+
+/// Horizontal page-turn gesture for paged spreads.
+///
+/// A paged spread has no vertical scroll, so vertical wheel and trackpad
+/// motion is ignored. A sideways swipe is a page flip: it must be clearly
+/// horizontal, and one gesture turns exactly one page. `spent` marks the
+/// gesture after its turn, so the rest of its momentum cannot flip another
+/// page; a pause longer than [`PAGED_SWIPE_GAP`] starts a fresh gesture.
+#[derive(Default)]
+struct PagedSwipe {
+    distance: f32,
+    last: Option<Instant>,
+    spent: bool,
+}
+
+impl PagedSwipe {
+    fn reset(&mut self) {
+        self.distance = 0.0;
+        self.last = None;
+        self.spent = false;
+    }
+
+    /// Feed one wheel/trackpad delta and return the page turn it completes.
+    /// `smooth` marks a discrete wheel notch, which is already deliberate and
+    /// therefore turns immediately.
+    fn push(&mut self, dx: f32, dy: f32, smooth: bool, now: Instant) -> Option<PagedSwipeStep> {
+        let (ax, ay) = (dx.abs(), dy.abs());
+        if ay > ax * PAGED_SWIPE_AXIS_RATIO {
+            // Clearly vertical: paged mode has nothing to scroll.
+            self.reset();
+            return None;
+        }
+        if ax <= ay * PAGED_SWIPE_AXIS_RATIO {
+            // Diagonal: wait for a clearer horizontal event instead of
+            // spending a page turn on scroll jitter.
+            return None;
+        }
+        if smooth {
+            // A wheel notch is a discrete input; do not require a second one
+            // or make fast wheel paging wait for a gesture gap.
+            self.reset();
+            return Some(if dx < 0.0 {
+                PagedSwipeStep::Next
+            } else {
+                PagedSwipeStep::Prev
+            });
+        }
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) > PAGED_SWIPE_GAP)
+        {
+            // The previous gesture is over; its leftover distance and spent
+            // state must not leak into this one.
+            self.reset();
+        }
+        self.last = Some(now);
+        if self.spent {
+            return None;
+        }
+        self.distance += dx;
+        if self.distance.abs() < PAGED_SWIPE_PIXELS {
+            return None;
+        }
+        // winit reports content movement: swiping left gives a negative
+        // delta and reveals the next page, matching a natural-scrolling
+        // trackpad and a page dragged from right to left.
+        let step = if self.distance < 0.0 {
+            PagedSwipeStep::Next
+        } else {
+            PagedSwipeStep::Prev
+        };
+        self.distance = 0.0;
+        self.spent = true;
+        Some(step)
+    }
+}
+
 struct App {
     path: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
@@ -527,9 +618,9 @@ struct App {
     /// Scroll distance requested past the current strip. It is replayed when a
     /// strip with more pages arrives, so fast scrolling is never discarded.
     scroll_pending: f32,
-    /// Wheel travel accumulated in paged mode. Paged mode has no pixel
-    /// scrolling, so a trackpad gesture is quantized into page turns.
-    paged_wheel: f32,
+    /// Horizontal swipe state for paged spreads. Vertical wheel and trackpad
+    /// motion is ignored there; one sideways gesture turns one page.
+    paged_swipe: PagedSwipe,
     /// Last scroll direction: 1 down, -1 up. It decides how much lookahead the
     /// next strip keeps above the anchor.
     scroll_direction: i32,
@@ -662,7 +753,7 @@ impl App {
             scroll_keep_anchor: false,
             scroll_recenter_pending: None,
             scroll_pending: 0.0,
-            paged_wheel: 0.0,
+            paged_swipe: PagedSwipe::default(),
             scroll_direction: 1,
             modifiers: ModifiersState::empty(),
             prompt: Prompt::None,
@@ -903,7 +994,7 @@ impl App {
     fn toggle_spread(&mut self) {
         self.finish_animation();
         self.scroll_glide = None;
-        self.paged_wheel = 0.0;
+        self.paged_swipe.reset();
         let reading = self.reading_page();
         let was_scroll = !self.spread_active;
         self.spread_enabled = !self.spread_enabled;
@@ -3129,9 +3220,10 @@ impl App {
             || self.pages != page.pages
             || self.rotation != page.rotation
             || (self.font_scale - page.font_scale).abs() > 1.0e-4;
-        if page_changed {
-            self.paged_wheel = 0.0;
-        }
+        // A page arriving must not clear the swipe state: a long flick can
+        // still be emitting momentum after the turn, and clearing `spent`
+        // here would let that same gesture flip a second page. The gesture
+        // gap in `PagedSwipe` ends it instead.
         // A re-layout rescales the bitmap, so the glide's remaining distance,
         // stored in bitmap pixels, no longer describes the same motion. A
         // strip re-center keeps the scale locked and must not cancel it.
@@ -3655,19 +3747,20 @@ impl App {
         if self.command_menu.is_some() || self.resize_preview {
             return;
         }
-        self.finish_animation();
         let line_step = self.scroll_line_step();
         let (dx, dy, smooth) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (x * line_step, y * line_step, true),
             MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32, false),
         };
         if self.outline_open {
+            self.finish_animation();
             self.outline_scroll = (self.outline_scroll - dy).clamp(0.0, self.outline_max_scroll());
             self.ensure_outline_window();
             self.request_redraw();
             return;
         }
         if self.modifiers.control_key() {
+            self.finish_animation();
             if dy > 0.0 {
                 self.zoom_in();
             } else if dy < 0.0 {
@@ -3675,10 +3768,17 @@ impl App {
             }
         } else if self.modifiers.shift_key() {
             if self.scroll_mode() {
+                self.finish_animation();
                 let amount = if dx.abs() > 0.0 { dx } else { dy };
                 self.scroll_horizontal(amount);
+            } else {
+                // Shift turns a vertical wheel into a sideways gesture. Paged
+                // mode reads only that horizontal component.
+                let horizontal = if dx.abs() > 0.0 { dx } else { dy };
+                self.turn_page_from_swipe(horizontal, 0.0, smooth);
             }
         } else if self.scroll_mode() {
+            self.finish_animation();
             if smooth && self.strip_scroll {
                 // Discrete wheel notches glide like the key steps.
                 self.scroll_smoothly(-dy);
@@ -3692,27 +3792,19 @@ impl App {
                 self.scroll_vertical(-dy);
             }
         } else {
-            // Paged mode has no pixel scrolling. A wheel notch turns a page
-            // immediately; a trackpad gesture is quantized so a stream of
-            // small deltas cannot flip several pages at once.
-            if self.paged_wheel.signum() != dy.signum() {
-                self.paged_wheel = 0.0;
-            }
-            self.paged_wheel += dy;
-            let threshold = if smooth {
-                0.0
-            } else {
-                self.scroll_line_step() * PAGED_WHEEL_PAGE_STEPS
-            };
-            if self.paged_wheel != 0.0 && self.paged_wheel.abs() >= threshold {
-                let forward = self.paged_wheel < 0.0;
-                self.paged_wheel = 0.0;
-                if forward {
-                    self.send(Command::NextPage);
-                } else {
-                    self.send(Command::PrevPage);
-                }
-            }
+            // A paged spread has nothing to scroll. Vertical wheel and
+            // trackpad motion is ignored; a horizontal swipe flips a page.
+            self.turn_page_from_swipe(dx, dy, smooth);
+        }
+    }
+
+    /// Apply a paged-mode wheel or trackpad delta. Vertical motion does
+    /// nothing; a sideways gesture turns exactly one page.
+    fn turn_page_from_swipe(&mut self, dx: f32, dy: f32, smooth: bool) {
+        match self.paged_swipe.push(dx, dy, smooth, Instant::now()) {
+            Some(PagedSwipeStep::Next) => self.next_page(),
+            Some(PagedSwipeStep::Prev) => self.prev_page(),
+            None => {}
         }
     }
 
@@ -4571,6 +4663,63 @@ mod tests {
         assert_eq!(history.go_back(20), Some(12));
         history.record(30);
         assert_eq!(history.go_forward(30), None);
+    }
+
+    #[test]
+    fn paged_swipe_turns_one_page_per_horizontal_gesture() {
+        let ms = Duration::from_millis;
+        let t = Instant::now();
+
+        // Vertical wheel and trackpad motion does nothing in a paged spread.
+        let mut swipe = PagedSwipe::default();
+        assert_eq!(swipe.push(0.0, 40.0, false, t), None);
+        assert_eq!(swipe.push(4.0, 40.0, false, t), None);
+        assert_eq!(swipe.push(0.0, -40.0, true, t), None);
+
+        // A sideways trackpad swipe accumulates a little, then turns a page.
+        // Swiping left (negative content movement) reveals the next page.
+        assert_eq!(swipe.push(-10.0, 0.0, false, t), None);
+        assert_eq!(swipe.push(-10.0, 0.0, false, t + ms(16)), None);
+        assert_eq!(
+            swipe.push(-10.0, 0.0, false, t + ms(32)),
+            Some(PagedSwipeStep::Next)
+        );
+        // The rest of the same gesture, including its momentum tail, is spent.
+        assert_eq!(swipe.push(-80.0, 0.0, false, t + ms(48)), None);
+        assert_eq!(swipe.push(-40.0, 0.0, false, t + ms(64)), None);
+
+        // A pause starts a new gesture, which can turn again.
+        assert_eq!(
+            swipe.push(30.0, 0.0, false, t + ms(300)),
+            Some(PagedSwipeStep::Prev)
+        );
+
+        // Two separate short flicks do not add up into one turn: each gesture
+        // must reach the threshold on its own.
+        let mut swipe = PagedSwipe::default();
+        assert_eq!(swipe.push(-10.0, 0.0, false, t), None);
+        assert_eq!(swipe.push(-10.0, 0.0, false, t + ms(300)), None);
+        assert_eq!(swipe.push(-10.0, 0.0, false, t + ms(316)), None);
+        assert_eq!(
+            swipe.push(-10.0, 0.0, false, t + ms(332)),
+            Some(PagedSwipeStep::Next)
+        );
+
+        // A discrete wheel notch is already deliberate and turns at once.
+        assert_eq!(
+            swipe.push(-60.0, 0.0, true, t + ms(340)),
+            Some(PagedSwipeStep::Next)
+        );
+
+        // Diagonal jitter is neither a vertical scroll nor a page turn.
+        let mut swipe = PagedSwipe::default();
+        assert_eq!(swipe.push(10.0, 10.0, false, t), None);
+
+        // A clearly vertical event discards horizontal distance gathered so
+        // far, so the two axes cannot combine into a turn.
+        assert_eq!(swipe.push(20.0, 0.0, false, t + ms(16)), None);
+        assert_eq!(swipe.push(0.0, 40.0, false, t + ms(32)), None);
+        assert_eq!(swipe.push(10.0, 0.0, false, t + ms(48)), None);
     }
 
     #[test]
