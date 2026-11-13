@@ -14,8 +14,8 @@ use std::thread;
 use winit::event_loop::EventLoopProxy;
 
 use crate::document::{
-    Fit, OutlineEntry, PageBitmap, RenderEngine, RenderedPage, SearchScope, ZOOM_IN_FACTOR,
-    ZOOM_OUT_FACTOR,
+    Fit, LayoutIntent, OutlineEntry, PageBitmap, RenderEngine, RenderedPage, SearchScope,
+    ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
 };
 use crate::fonts::FontCatalog;
 use crate::theme::OutlineStyle;
@@ -23,10 +23,13 @@ use crate::UserEvent;
 
 pub enum Command {
     Viewport(u32, u32),
-    /// Select the reading model: a two-page spread (paged) or the
-    /// single-column continuous scroll.
-    SetLayout {
-        spread: bool,
+    /// Set the user's reading-model preference. The engine resolves the
+    /// effective layout from it and the current window geometry. `reset_fit`
+    /// returns to fit-page first, so `Auto` can choose a spread even when the
+    /// view was zoomed.
+    SetLayoutIntent {
+        intent: LayoutIntent,
+        reset_fit: bool,
     },
     SetBackground(u32),
     Open {
@@ -36,7 +39,7 @@ pub enum Command {
         pretty: bool,
         page: Option<usize>,
         background: u32,
-        spread: bool,
+        layout: LayoutIntent,
     },
     NextPage,
     PrevPage,
@@ -139,9 +142,12 @@ fn run(
                     }
                 }
             }
-            Command::SetLayout { spread } => {
+            Command::SetLayoutIntent { intent, reset_fit } => {
                 if let Some(engine) = engine.as_mut() {
-                    engine.set_layout(spread);
+                    if reset_fit {
+                        engine.fit_page();
+                    }
+                    engine.set_layout_intent(intent);
                     render_and_send(engine, &proxy);
                 }
             }
@@ -158,7 +164,7 @@ fn run(
                 pretty,
                 page,
                 background,
-                spread,
+                layout,
             } => {
                 let mut opened = match RenderEngine::open(&path, fonts, css, pretty) {
                     Ok(engine) => engine,
@@ -169,7 +175,7 @@ fn run(
                 };
                 opened.set_background(background);
                 opened.set_viewport(viewport.0, viewport.1);
-                opened.set_layout(spread);
+                opened.set_layout_intent(layout);
                 if let Some(page) = page {
                     opened.goto_page(page);
                 }

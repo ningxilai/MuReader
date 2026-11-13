@@ -73,6 +73,9 @@ const PAGE_CACHE_SINGLE_CAPACITY: usize = 2;
 /// when space is tight. Its width follows the rendered page width linearly, so
 /// it scales with every fit change and is always at least one pixel.
 pub const SPREAD_GAP_RATIO: f32 = 0.004;
+/// Below this fraction of a height-fitted single page, a spread page is too
+/// narrow to read and the engine uses continuous scroll instead.
+const MIN_SPREAD_PAGE_FRACTION: f32 = 0.7;
 
 pub fn spread_gap(page_width: u32) -> u32 {
     ((page_width as f32 * SPREAD_GAP_RATIO).floor() as u32).max(1)
@@ -125,6 +128,31 @@ pub enum Fit {
     /// more constrained. This keeps normal pages height-fitted while making
     /// wide media pages fully visible.
     Page,
+}
+
+/// Reading model used for one rendered page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Single-column continuous scroll.
+    Scroll,
+    /// Paged two-page spread.
+    Spread,
+}
+
+/// User preference for the reading model. The engine resolves the effective
+/// layout from this and the current window geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutIntent {
+    /// Use a spread when the window fits a comfortable pair, otherwise use
+    /// continuous scroll.
+    Auto,
+    /// Always use continuous scroll.
+    Scroll,
+    /// Force a spread even when the window is narrow. The reader UI never
+    /// sends this; it lets layout tests exercise the paged renderer at any
+    /// viewport.
+    #[allow(dead_code)] // Constructed by layout tests only.
+    Spread,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,9 +472,8 @@ pub struct RenderedPage {
     /// One canvas color sampled across the whole book. It stays constant for
     /// every page so the UI palette never flips mid-book.
     pub book_background: u32,
-    /// True when the strip is a vertical continuous-scroll layout rather than a
-    /// horizontal page or spread.
-    pub scroll: bool,
+    /// Reading model used for this strip.
+    pub layout: Layout,
     /// Geometry of each page inside the strip bitmap. Only meaningful for a
     /// scroll strip; paged layouts also fill them for completeness.
     pub page_offsets: Vec<u32>,
@@ -499,6 +526,9 @@ pub struct RenderEngine {
     fit: Fit,
     reflowable: bool,
     rotation: u16,
+    /// User preference for the reading model. `spread` and `scroll` below are
+    /// the effective layout resolved from this intent and the window geometry.
+    layout_intent: LayoutIntent,
     spread: bool,
     /// Single-column continuous scroll. Mutually exclusive with `spread`.
     scroll: bool,
@@ -612,6 +642,10 @@ impl RenderEngine {
             fit: Fit::Page,
             reflowable,
             rotation: 0,
+            // A fresh engine has no window preference yet, so it starts on the
+            // safe single-column layout. The reader sends `Auto` when it opens
+            // a book.
+            layout_intent: LayoutIntent::Scroll,
             spread: false,
             scroll: false,
             scroll_before: 1,
@@ -774,9 +808,23 @@ impl RenderEngine {
         self.fit
     }
 
-    /// Switch the reading model. A spread is paged; everything else is the
-    /// single-column scroll layout.
-    pub fn set_layout(&mut self, spread: bool) {
+    /// Set the user's reading-model preference. The effective layout is
+    /// resolved immediately and again before every render, so a preference
+    /// change and a later window resize both take effect.
+    pub fn set_layout_intent(&mut self, intent: LayoutIntent) {
+        self.layout_intent = intent;
+        self.resolve_layout();
+    }
+
+    /// Resolve the effective layout before planning a strip. Auto keeps a
+    /// spread only while the window can fit a comfortable pair; Scroll always
+    /// uses the continuous column; Spread is the explicit test override.
+    fn resolve_layout(&mut self) {
+        let spread = match self.layout_intent {
+            LayoutIntent::Auto => self.spread_fits(),
+            LayoutIntent::Scroll => false,
+            LayoutIntent::Spread => true,
+        };
         let scroll = !spread;
         if self.spread != spread || self.scroll != scroll {
             self.spread = spread;
@@ -784,6 +832,30 @@ impl RenderEngine {
             self.scroll_scale = None;
             self.page_cache.clear();
         }
+    }
+
+    /// Whether the current page and window can show a comfortable spread.
+    /// The pair may shrink to fit, so this rejects only a pair whose pages
+    /// would become too narrow to read.
+    fn spread_fits(&mut self) -> bool {
+        if self.page_count.unwrap_or(0) < 2 || self.fit != Fit::Page {
+            return false;
+        }
+        let Ok(bounds) = self
+            .doc
+            .load_page(self.page as i32)
+            .and_then(|page| page.bounds())
+        else {
+            return false;
+        };
+        let (rotated_w, rotated_h) = rotated_size(&bounds, self.rotation);
+        if rotated_w <= 0.0 || rotated_h <= 0.0 {
+            return false;
+        }
+        let (viewport_w, viewport_h) = self.viewport;
+        let single_width = (viewport_h as f32 * (rotated_w / rotated_h)).min(viewport_w as f32);
+        let prospective = viewport_w as f32 / (2.0 + SPREAD_GAP_RATIO);
+        prospective >= single_width * MIN_SPREAD_PAGE_FRACTION
     }
 
     /// Move the scroll strip without skipping blank pages. Page jumps still use
@@ -1949,6 +2021,7 @@ impl RenderEngine {
     }
 
     fn render_with_quads(&mut self, quads: &[Quad]) -> Result<RenderedPage, String> {
+        self.resolve_layout();
         let page_numbers = self.page_numbers_for();
         let cacheable = quads.is_empty() && self.search_query.is_none();
         // Continuous scroll treats the chapter as one flow, so blank pages
@@ -2176,7 +2249,11 @@ impl RenderEngine {
             links: bitmap.links,
             text: bitmap.text,
             book_background: self.book_background,
-            scroll: self.scroll,
+            layout: if self.scroll {
+                Layout::Scroll
+            } else {
+                Layout::Spread
+            },
             page_offsets,
             page_heights,
             font_scale: self.font_scale(),
@@ -3313,11 +3390,13 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, true).unwrap();
         engine.set_viewport(1100, 900);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let first = engine.render().unwrap();
         let total = first.page_count.unwrap_or(0);
         assert!(total > 1);
         assert!(!first.text.is_empty());
-        assert_eq!(first.pages, vec![1]);
+        assert_eq!(first.layout, Layout::Scroll);
+        assert_eq!(first.pages.first(), Some(&1));
         assert!(first.text.chars.iter().any(|ch| ch.ch == '你'));
 
         let search = engine
@@ -3327,7 +3406,8 @@ mod tests {
 
         assert!(engine.goto_page(2));
         let second = engine.render().unwrap();
-        assert_eq!(second.pages, vec![2]);
+        assert_eq!(second.page, 2);
+        assert!(second.pages.contains(&2));
         assert!(!second.text.is_empty());
 
         assert!(engine.goto_page(total));
@@ -3364,7 +3444,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(2400, 900);
-        engine.set_layout(true);
+        engine.set_layout_intent(LayoutIntent::Spread);
 
         let images = engine.render().unwrap();
         assert_eq!(images.page, 1);
@@ -3404,13 +3484,17 @@ mod tests {
         let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        // Render a wide spread first; its page geometry is the height-fitted
+        // single page that the narrower viewports are compared against.
+        engine.set_layout_intent(LayoutIntent::Spread);
         engine.set_viewport(2400, 900);
-        let single = engine.render().unwrap();
-        assert_eq!(single.pages, vec![1]);
-        let single_width = single.bitmap.width;
-        let single_height = single.bitmap.height;
+        let spread = engine.render().unwrap();
+        assert_eq!(spread.pages, vec![1, 2, 3, 4]);
+        let single_width = spread.page_widths[0];
+        let single_height = spread.bitmap.height;
+        assert_eq!(spread.gap, spread_gap(single_width));
+        assert!(spread.gap > 0);
 
-        engine.set_layout(true);
         engine.set_viewport(single_width * 2, 900);
         let tight = engine.render().unwrap();
         assert_eq!(tight.pages, vec![1, 2, 3, 4]);
@@ -3426,11 +3510,6 @@ mod tests {
             "the pair and its gutter must fit the viewport"
         );
 
-        engine.set_viewport(2400, 900);
-        let spread = engine.render().unwrap();
-        assert_eq!(spread.pages, vec![1, 2, 3, 4]);
-        assert_eq!(spread.gap, spread_gap(spread.page_widths[0]));
-        assert!(spread.gap > 0);
         assert!(spread.bitmap.width > single_width);
         assert_eq!(spread.bitmap.height, single_height);
         assert!(!spread.text.is_empty());
@@ -3483,6 +3562,46 @@ mod tests {
     }
 
     #[test]
+    fn auto_layout_falls_back_to_scroll_in_a_narrow_window() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("auto-layout");
+        let path = dir.join("sample.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        for i in 0..160 {
+            html.push_str(&format!(
+                "<p>Paragraph {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_layout_intent(LayoutIntent::Auto);
+
+        // A window too narrow for a comfortable pair uses the scroll model,
+        // not a paged single column.
+        engine.set_viewport(700, 900);
+        let narrow = engine.render().unwrap();
+        assert_eq!(narrow.layout, Layout::Scroll);
+        assert_eq!(narrow.page, 1);
+
+        // Widening resolves the same intent to a spread.
+        engine.set_viewport(2400, 900);
+        let wide = engine.render().unwrap();
+        assert_eq!(wide.layout, Layout::Spread);
+        assert_eq!(wide.pages, vec![1, 2, 3, 4]);
+
+        // The intent never changed, so shrinking returns to scroll.
+        engine.set_viewport(700, 900);
+        let narrow_again = engine.render().unwrap();
+        assert_eq!(narrow_again.layout, Layout::Scroll);
+        assert_eq!(narrow_again.page, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn roll_measures_the_css_line_height() {
         let _guard = doc_test_guard();
         let dir = test_dir("roll-line-height");
@@ -3506,7 +3625,7 @@ mod tests {
             mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
             let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
             engine.set_viewport(900, 1200);
-            engine.set_layout(false);
+            engine.set_layout_intent(LayoutIntent::Scroll);
             let strip = engine.render().unwrap();
             strip
                 .line_height
@@ -3540,7 +3659,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         let line = strip.line_height.expect("line rhythm") * strip.scale;
         let width = strip.bitmap.width as usize;
@@ -3609,7 +3728,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         let scale = strip.scale;
         let margin = 30.0 * scale;
@@ -3664,7 +3783,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         let scale = strip.scale;
         let baseline = engine.roll_top_baseline;
@@ -3733,7 +3852,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         let scale = strip.scale;
         let line = strip.line_height.expect("line rhythm") * scale;
@@ -3813,7 +3932,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         let line = strip.line_height.expect("line rhythm") * strip.scale;
         let width = strip.bitmap.width as usize;
@@ -3876,7 +3995,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let strip = engine.render().unwrap();
         assert!(
             strip.pages.contains(&1),
@@ -3908,10 +4027,10 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
 
         let strip = engine.render().unwrap();
-        assert!(strip.scroll);
+        assert_eq!(strip.layout, Layout::Scroll);
         assert_eq!(strip.pages, vec![1, 2, 3, 4]);
         let book_background = strip.book_background;
         let first_height = strip.page_heights[0];
@@ -3954,7 +4073,7 @@ mod tests {
         // move in both directions without exceeding the texture budget.
         engine.set_scale(2.0);
         let zoomed = engine.render().unwrap();
-        assert!(zoomed.scroll);
+        assert_eq!(zoomed.layout, Layout::Scroll);
         assert_eq!(zoomed.pages, vec![1, 2, 3]);
         assert_eq!(zoomed.book_background, book_background);
 
@@ -3998,7 +4117,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
 
         let strip = engine.render().unwrap();
         let width = strip.page_widths[0];
@@ -4047,7 +4166,7 @@ mod tests {
 
         // Paged mode keeps whole synthetic pages: the image stays inside the
         // page box rather than being cropped out of it.
-        engine.set_layout(true);
+        engine.set_layout_intent(LayoutIntent::Spread);
         let paged = engine.render().unwrap();
         let paged_ratio = paged.page_heights[0] as f32 / paged.page_widths[0] as f32;
         assert!(
@@ -4058,7 +4177,7 @@ mod tests {
         // A page with a caption flows with the roll as well: it is cropped to
         // its content instead of keeping the synthetic page chrome, and the
         // caption text is part of the flowing story.
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         let mixed = dir.join("mixed.html");
         std::fs::write(
             &mixed,
@@ -4069,7 +4188,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut mixed_engine = RenderEngine::open(&mixed, catalog, None, false).unwrap();
         mixed_engine.set_viewport(900, 1200);
-        mixed_engine.set_layout(false);
+        mixed_engine.set_layout_intent(LayoutIntent::Scroll);
         let mixed_strip = mixed_engine.render().unwrap();
         let mixed_ratio = mixed_strip.page_heights[0] as f32 / mixed_strip.page_widths[0] as f32;
         let column = mixed_engine.scroll_available_width().round() as u32;
@@ -4111,7 +4230,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
 
         let strip = engine.render().unwrap();
         let base = strip.scale;
@@ -4171,7 +4290,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(900, 1200);
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
 
         // A mixed-size page in the same window must reuse the first fit, so the
         // column does not re-zoom when the scroll window slides.
@@ -4186,9 +4305,9 @@ mod tests {
         assert!(refit > locked * 1.5, "a wider window refits the column");
 
         // Switching layout also starts a fresh scroll session.
-        engine.set_layout(true);
+        engine.set_layout_intent(LayoutIntent::Spread);
         assert!(engine.scroll_scale.is_none());
-        engine.set_layout(false);
+        engine.set_layout_intent(LayoutIntent::Scroll);
         assert!(engine.scroll_scale.is_none());
 
         // Rotation invalidates the lock as well.
@@ -4216,7 +4335,7 @@ mod tests {
         mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
         let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
         engine.set_viewport(2400, 900);
-        engine.set_layout(true);
+        engine.set_layout_intent(LayoutIntent::Spread);
 
         let first = engine.render().unwrap();
         assert_eq!(first.pages, vec![1, 2, 3, 4]);
@@ -4371,6 +4490,10 @@ mod tests {
             let path = dir.join(name);
             let mut engine = RenderEngine::open(&path, catalog.clone(), None, false).unwrap();
             engine.set_viewport(800, 600);
+            // Compare absolute scales at the same fit state: an explicit zoom
+            // and a restored scale are both `Fit::None`, so the strip shape is
+            // stable and only the scale differs.
+            engine.set_scale(1.0);
             let page = engine.render().unwrap();
             assert!(page.page_count.is_some(), "{name} has no page count");
             assert!(!page.bitmap.pixels.is_empty(), "{name} rendered empty");

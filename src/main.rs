@@ -11,13 +11,12 @@
 //! finished page bitmaps and plain text-layer data cross the thread boundary.
 //!
 //! The UI drives two reading models over one shared page-number coordinate:
-//! a paged two-page spread and a single-column continuous scroll. `ModeState`
-//! owns the user's preference and the model currently being driven; the
-//! worker owns the rendered layout and reports it in `RenderedPage::scroll`.
-//! Scroll mode is a continuous roll and never turns pages from a scroll
-//! gesture; spread mode is paged and ignores pixel scrolling. Keeping the two
-//! models explicit stops a scroll distance from leaking into a page turn and
-//! vice versa.
+//! a paged two-page spread and a single-column continuous scroll. The UI sends
+//! only the user's `LayoutIntent`; the worker resolves it against the window
+//! and reports the effective `Layout` with every rendered strip. Input and
+//! geometry follow that reported layout, so they always agree with the bitmap
+//! on screen. Scroll mode is a continuous roll and never turns pages from a
+//! scroll gesture; spread mode is paged and ignores pixel scrolling.
 
 // Keep the document, renderer, input, and progress paths free of unsafe code.
 // The platform modules below opt out individually because they wrap FFI.
@@ -50,9 +49,9 @@ use activation::Activation;
 use clipboard::{ClipboardHandle, ClipboardNotice};
 use config::Config;
 use document::{
-    scroll_side_margin, Fit, HighlightRect, LinkTarget, OutlineEntry, PageBitmap, RenderedLink,
-    RenderedPage, SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP, MARGIN, MAX_SCALE,
-    MIN_SCALE, SPREAD_GAP_RATIO, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
+    scroll_side_margin, Fit, HighlightRect, Layout, LayoutIntent, LinkTarget, OutlineEntry,
+    PageBitmap, RenderedLink, RenderedPage, SearchScope, TextLayer, TextSelection, FONT_SIZE_STEP,
+    MARGIN, MAX_SCALE, MIN_SCALE, ZOOM_IN_FACTOR, ZOOM_OUT_FACTOR,
 };
 use fontdb::Weight;
 use fonts::{EpubFontLoader, FontCatalog};
@@ -78,9 +77,6 @@ const OUTLINE_MIN_WIDTH: u32 = 232;
 const OUTLINE_MAX_WIDTH: u32 = 360;
 const OUTLINE_MIN_CONTENT: u32 = 240;
 const OUTLINE_ROW_HEIGHT: u32 = 28;
-/// Below this fraction of a height-fitted single page, a spread page is too
-/// narrow to read and the reader falls back to continuous scroll.
-const MIN_SPREAD_PAGE_FRACTION: f32 = 0.7;
 /// Rows requested at once when the outline needs a new bitmap window. A tall
 /// window also gets enough margin to cover the viewport in a single request.
 const OUTLINE_WINDOW_MIN_ROWS: usize = 256;
@@ -551,58 +547,6 @@ impl PagedSwipe {
     }
 }
 
-/// The reading model the UI drives. The worker reports the model it actually
-/// rendered separately (`strip_scroll`), so the one-frame gap between sending
-/// `SetLayout` and receiving the replacement bitmap stays explicit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadingMode {
-    Scroll,
-    Spread,
-}
-
-/// Reading-model preference and current model.
-///
-/// Preference and environment are separate: a narrow window or an explicit
-/// zoom can keep the reader on scroll without forgetting that the user asked
-/// for a spread, so widening the window or resetting the view restores it.
-#[derive(Clone, Copy, Debug)]
-struct ModeState {
-    prefer_spread: bool,
-    mode: ReadingMode,
-}
-
-impl ModeState {
-    fn new() -> Self {
-        Self {
-            prefer_spread: true,
-            mode: ReadingMode::Scroll,
-        }
-    }
-
-    fn scroll(&self) -> bool {
-        self.mode == ReadingMode::Scroll
-    }
-
-    fn spread(&self) -> bool {
-        self.mode == ReadingMode::Spread
-    }
-
-    /// Apply the environment's verdict. Returns the new model when it changed,
-    /// so the caller can tell the worker exactly once.
-    fn settle(&mut self, spread_ok: bool) -> Option<ReadingMode> {
-        let next = if self.prefer_spread && spread_ok {
-            ReadingMode::Spread
-        } else {
-            ReadingMode::Scroll
-        };
-        if next == self.mode {
-            return None;
-        }
-        self.mode = next;
-        Some(next)
-    }
-}
-
 struct App {
     path: PathBuf,
     proxy: EventLoopProxy<UserEvent>,
@@ -670,8 +614,15 @@ struct App {
     /// Geometry of the installed vertical strip.
     page_offsets: Vec<u32>,
     page_heights: Vec<u32>,
-    /// True when the installed strip uses the continuous-scroll layout.
-    strip_scroll: bool,
+    /// Reading model reported by the last render. This is the model on screen,
+    /// so input and geometry always agree with the bitmap.
+    layout: Layout,
+    /// User preference sent to the worker. The worker resolves it against the
+    /// window and reports the effective model in `layout`.
+    layout_intent: LayoutIntent,
+    /// Set by a manual toggle so the status line reports the model once the
+    /// worker has resolved it.
+    pending_layout_status: bool,
     /// Set while a strip re-center is in flight so the arriving strip keeps
     /// the visual position instead of jumping to the page start.
     scroll_keep_anchor: bool,
@@ -709,9 +660,6 @@ struct App {
     pending_viewport: Option<Instant>,
     resize_preview: bool,
     last_viewport_sent: Option<(u32, u32)>,
-    /// Reading-model preference and the model the UI is driving. The worker's
-    /// rendered model lives in `strip_scroll`.
-    mode: ModeState,
     pending_turn: Option<TurnDirection>,
     animation: Option<SpreadAnimation>,
     scroll_glide: Option<ScrollGlide>,
@@ -804,7 +752,11 @@ impl App {
             scroll_in_page: 0.0,
             page_offsets: Vec::new(),
             page_heights: Vec::new(),
-            strip_scroll: false,
+            // Until the first render arrives, page coordinates are the only
+            // meaningful reading position, so start on the paged side.
+            layout: Layout::Spread,
+            layout_intent: LayoutIntent::Auto,
+            pending_layout_status: false,
             scroll_keep_anchor: false,
             scroll_recenter_pending: None,
             scroll_pending: 0.0,
@@ -832,7 +784,6 @@ impl App {
             pending_viewport: None,
             resize_preview: false,
             last_viewport_sent: None,
-            mode: ModeState::new(),
             pending_turn: None,
             animation: None,
             scroll_glide: None,
@@ -928,7 +879,7 @@ impl App {
         if !self.outline_open || self.page_fit != Fit::Page {
             return 1.0;
         }
-        let natural = if self.strip_scroll {
+        let natural = if self.scroll_mode() {
             self.bitmap.as_ref().map_or(0, |bitmap| bitmap.width) as f32
         } else {
             self.visible_width() as f32
@@ -940,7 +891,7 @@ impl App {
         let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
         // Keep the scroll column's side margins even when the outline borrows
         // part of the window; the paged layout may still use the full width.
-        let target_w = if self.strip_scroll {
+        let target_w = if self.scroll_mode() {
             let content = content_w.round().max(1.0) as u32;
             content
                 .saturating_sub(scroll_side_margin(content).saturating_mul(2))
@@ -993,7 +944,7 @@ impl App {
         let (viewport_w, _) = self.viewport();
         let content_w = (viewport_w as i32 - self.content_left()).max(1) as f32;
         let scale = self.display_scale();
-        let page_w = if self.strip_scroll {
+        let page_w = if self.scroll_mode() {
             self.bitmap.as_ref().map_or(0, |bitmap| bitmap.width) as f32
         } else {
             self.visible_width() as f32
@@ -1001,96 +952,44 @@ impl App {
         ((page_w - content_w) / 2.0 / scale).max(0.0)
     }
 
-    /// Whether the current document and window can support a comfortable
-    /// two-page spread. A spread may shrink both pages to fit, so this is not
-    /// "two full-size pages fit"; instead it rejects a spread whose pages
-    /// would be too narrow to read.
-    fn spread_can_fit(&self) -> bool {
-        if self.page_count.unwrap_or(0) < 2 || self.page_fit != Fit::Page {
-            return false;
-        }
-        spread_width_is_comfortable(self.viewport().0, self.single_page_width())
-    }
-
-    /// Apply the reading-model state machine after a render or a preference
-    /// change, and tell the worker only when the model actually changes.
-    fn update_spread_layout(&mut self) {
-        let spread_ok = if self.mode.spread() {
-            // Keep an already active pair while the outline overlay is open:
-            // the worker viewport is unchanged and the pair is display-scaled.
-            // Leave only when the page is no longer a fit-page spread or the
-            // window is too narrow for a comfortable pair.
-            spread_stays(self.page_fit, self.bitmap.is_some(), self.spread_can_fit())
-        } else {
-            // Do not start a spread while the outline is open: the overlay
-            // makes the visible content narrower, and a pair that looked
-            // comfortable in the full window can become cramped.
-            !self.outline_open && self.spread_can_fit()
-        };
-        let changed = self.mode.settle(spread_ok);
-        if let Some(mode) = changed {
-            self.send(Command::SetLayout {
-                spread: mode == ReadingMode::Spread,
-            });
-            self.update_title();
-        }
-    }
-
     /// Switch between the paged two-page spread and the single-column
-    /// continuous scroll. Page numbers stay the shared coordinate, so the
-    /// current page is preserved across the switch.
+    /// continuous scroll. The worker resolves the preference against the
+    /// window, so a narrow window stays on scroll even when the user asks for
+    /// a spread. Page numbers stay the shared coordinate, so the current page
+    /// is preserved across the switch.
     fn toggle_spread(&mut self) {
         self.finish_animation();
         self.scroll_glide = None;
         self.paged_swipe.reset();
         let reading = self.reading_page();
-        let was_scroll = self.mode.scroll();
-        self.mode.prefer_spread = !self.mode.prefer_spread;
-        // Leaving scroll for a paged mode must use the page at the top of the
-        // viewport, not a worker focus page that may not have caught up after
-        // scrolling.
-        if self.mode.prefer_spread && was_scroll && reading != self.page {
+        let was_scroll = self.scroll_mode();
+        self.layout_intent = match self.layout_intent {
+            LayoutIntent::Auto => LayoutIntent::Scroll,
+            LayoutIntent::Scroll | LayoutIntent::Spread => LayoutIntent::Auto,
+        };
+        // Leaving scroll for the paged model must use the page at the top of
+        // the viewport, not a worker focus page that may not have caught up
+        // after scrolling.
+        if self.layout_intent == LayoutIntent::Auto && was_scroll && reading != self.page {
             self.goto_page(reading);
         }
-        let spread_ok = self.page_fit == Fit::Page && self.spread_can_fit();
-        if let Some(mode) = self.mode.settle(spread_ok) {
-            self.send(Command::SetLayout {
-                spread: mode == ReadingMode::Spread,
-            });
+        // Auto can only choose a spread in fit-page mode. If the view is
+        // zoomed, reset the fit as part of the same command so the toggle is
+        // not a no-op and the status reports the final layout, not an
+        // intermediate render.
+        let reset_fit = self.layout_intent == LayoutIntent::Auto && self.page_fit != Fit::Page;
+        if reset_fit {
+            self.pending_zooms.clear();
+            self.clear_scroll_recenter();
+            self.scroll_x = 0.0;
+            self.scroll_y = 0.0;
         }
-        let status = if self.mode.spread() {
-            "two-page spread"
-        } else if self.mode.prefer_spread && self.page_fit != Fit::Page {
-            // A spread is a fit-to-page layout. Return to fit first; the next
-            // page event can then start the spread through the normal path.
-            self.reset_view();
-            "two-page spread"
-        } else {
-            "continuous scroll"
-        };
-        self.status = Some(status.to_string());
-        self.update_title();
+        self.pending_layout_status = true;
+        self.send(Command::SetLayoutIntent {
+            intent: self.layout_intent,
+            reset_fit,
+        });
         self.request_redraw();
-    }
-
-    /// Width of a height-fitted single page at the current window size. The
-    /// current page's aspect ratio is preserved, including rotation.
-    fn single_page_width(&self) -> Option<f32> {
-        let page = self.bitmap.as_ref()?;
-        let page_width = *self.page_widths.get(self.window_index)? as f32;
-        // In scroll mode the bitmap is the whole vertical strip, so its height
-        // is not the focus page's aspect. Use the per-page geometry instead.
-        let page_height = if self.strip_scroll {
-            *self.page_heights.get(self.window_index)? as f32
-        } else {
-            page.height as f32
-        };
-        if page_width <= 0.0 || page_height <= 0.0 {
-            return None;
-        }
-        let (viewport_w, viewport_h) = self.viewport();
-        let aspect = page_width / page_height;
-        Some((viewport_h as f32 * aspect).min(viewport_w as f32))
     }
 
     fn send_viewport(&mut self) {
@@ -1123,15 +1022,15 @@ impl App {
         self.resize_preview = true;
     }
 
-    /// True when the semantic reading model is the single-column scroll.
+    /// True when the installed layout is the single-column continuous scroll.
     fn scroll_mode(&self) -> bool {
-        self.mode.scroll()
+        self.layout == Layout::Scroll
     }
 
     /// Page that represents the reading position. Scroll uses the page at the
     /// top of the viewport; paged mode uses the worker's focus page.
     fn reading_page(&self) -> usize {
-        if self.scroll_mode() && self.strip_scroll {
+        if self.scroll_mode() {
             self.scroll_anchor.max(1)
         } else {
             self.page
@@ -1176,7 +1075,7 @@ impl App {
     /// the rendered strip the remainder is remembered and replayed as soon as
     /// a strip with more pages arrives, so fast scrolling is never discarded.
     fn scroll_document(&mut self, delta: f32) {
-        if !self.strip_scroll || self.pages.is_empty() {
+        if !self.scroll_mode() || self.pages.is_empty() {
             return;
         }
         if delta > 0.0 {
@@ -1243,7 +1142,7 @@ impl App {
     /// the guard against a non-moving window prevents a request loop when the
     /// strip is already as large as the texture budget allows.
     fn maybe_prefetch_scroll(&mut self) {
-        if !self.strip_scroll || self.pages.len() < 2 {
+        if !self.scroll_mode() || self.pages.len() < 2 {
             return;
         }
         if self.scroll_recenter_pending.is_some() {
@@ -1264,7 +1163,7 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
-        if self.strip_scroll {
+        if self.scroll_mode() {
             self.scroll_x = self
                 .scroll_x
                 .clamp(-self.max_scroll_x(), self.max_scroll_x());
@@ -1373,7 +1272,7 @@ impl App {
     /// pixels. Inertia is only allowed to spend what is already rendered, so
     /// it never runs into a blank edge while waiting for a recenter.
     fn scroll_buffer_remaining(&self, direction: f32) -> f32 {
-        if !self.strip_scroll || self.pages.is_empty() || direction == 0.0 {
+        if !self.scroll_mode() || self.pages.is_empty() || direction == 0.0 {
             return 0.0;
         }
         let scale = self.display_scale().max(0.001);
@@ -1395,7 +1294,7 @@ impl App {
     /// at a steady pixel rate. CSSOM View's `scroll-behavior: smooth` likewise
     /// lets consecutive scrolls interrupt and retarget the running animation.
     fn scroll_smoothly(&mut self, delta: f32) {
-        if !self.strip_scroll || !delta.is_finite() || delta == 0.0 {
+        if !self.scroll_mode() || !delta.is_finite() || delta == 0.0 {
             return;
         }
         // Extend the running curve without rebasing its clock: the distance
@@ -1807,7 +1706,7 @@ impl App {
     /// is already inside the strip the worker may not re-render, so reset the
     /// scroll anchor and repaint locally.
     fn scroll_to_page_start(&mut self, page: usize) {
-        if !self.strip_scroll || !self.pages.contains(&page) {
+        if !self.scroll_mode() || !self.pages.contains(&page) {
             return;
         }
         self.scroll_glide = None;
@@ -1971,7 +1870,7 @@ impl App {
     fn page_point_at_screen(&self, screen: (f32, f32)) -> Option<(f32, f32)> {
         let page = self.bitmap.as_ref()?;
         let scale = self.display_scale();
-        let width = if self.strip_scroll {
+        let width = if self.scroll_mode() {
             page.width
         } else {
             self.visible_width()
@@ -1986,7 +1885,7 @@ impl App {
         // the whole rendered strip. `page_origin()` points at the strip start
         // and therefore still includes the scroll position.
         let window_left = self.page_left_offset(width) as f32 - self.scroll_x * scale;
-        let window_top = if self.strip_scroll {
+        let window_top = if self.scroll_mode() {
             -(self.scroll_position() * scale)
         } else {
             self.page_vertical_offset(height) as f32 - self.scroll_y * scale
@@ -2004,7 +1903,7 @@ impl App {
             return;
         };
         let scale = self.display_scale();
-        let width = if self.strip_scroll {
+        let width = if self.scroll_mode() {
             page.width
         } else {
             self.visible_width()
@@ -2014,7 +1913,7 @@ impl App {
         let display_h = height as f32 * scale;
         let left = self.page_left_offset(width) as f32;
         self.scroll_x = (left + point.0 * display_w - screen.0) / scale;
-        if self.strip_scroll {
+        if self.scroll_mode() {
             self.set_scroll_position((point.1 * display_h - screen.1) / scale);
         } else {
             let top = self.page_vertical_offset(height) as f32;
@@ -2098,7 +1997,7 @@ impl App {
             return;
         }
 
-        let page = if self.strip_scroll {
+        let page = if self.scroll_mode() {
             match self.page_count {
                 Some(total) => format!("{}/{}", self.reading_page(), total),
                 None => self.reading_page().to_string(),
@@ -3253,8 +3152,8 @@ impl App {
         // represent the current position. Dropping it instead of snapping to
         // its focus page keeps fast scrolling stable; ask for a fresh window
         // that actually includes the anchor.
-        if self.strip_scroll
-            && page.scroll
+        if self.scroll_mode()
+            && page.layout == Layout::Scroll
             && self.bitmap.is_some()
             && self.scroll_keep_anchor
             && !page.pages.is_empty()
@@ -3269,7 +3168,7 @@ impl App {
         // window. Capture the old geometry so a resize can preserve the
         // fraction of the page that is scrolled past, not just the raw pixel
         // offset.
-        let old_strip_scroll = self.strip_scroll;
+        let old_scroll_layout = self.scroll_mode();
         let old_scroll_anchor = self.scroll_anchor;
         let old_scroll_in_page = self.scroll_in_page;
         let old_page_height = self
@@ -3285,7 +3184,7 @@ impl App {
         self.pages = page.pages;
         self.page_widths = page.page_widths;
         self.spread_gap = page.gap;
-        self.strip_scroll = page.scroll;
+        self.layout = page.layout;
         self.page_offsets = page.page_offsets;
         self.page_heights = page.page_heights;
         self.page_count = page.page_count;
@@ -3312,7 +3211,7 @@ impl App {
         self.page_revision = self.page_revision.wrapping_add(1);
         self.resize_preview = false;
         self.window_index = window_index_for(&self.pages, self.page);
-        self.spread_offset = if self.strip_scroll {
+        self.spread_offset = if self.scroll_mode() {
             0.0
         } else {
             self.normal_offset()
@@ -3324,7 +3223,7 @@ impl App {
         } else if let Some((anchor, screen)) = zoom_anchor {
             self.place_page_point(anchor, screen);
         }
-        if self.strip_scroll {
+        if self.scroll_mode() {
             // A re-center, zoom, or resize keeps the visual anchor. A real page
             // jump resets to the top of the target page, matching paged mode.
             let keep = (self.scroll_keep_anchor || !page_changed)
@@ -3339,7 +3238,7 @@ impl App {
             // resize or re-center does not visibly drift.
             if zoom_anchor.is_none()
                 && keep
-                && old_strip_scroll
+                && old_scroll_layout
                 && old_scroll_anchor == self.scroll_anchor
                 && old_page_height > 0.0
             {
@@ -3392,7 +3291,6 @@ impl App {
         if self.outline_open {
             self.ensure_outline_window();
         }
-        self.update_spread_layout();
         // Outline entries are previews until Enter keeps them, so only a
         // settled page belongs in the progress file.
         let reading_page = self.reading_page();
@@ -3407,6 +3305,16 @@ impl App {
     fn handle_page(&mut self, page: RenderedPage) {
         self.pending_turn = None;
         self.install_page(page);
+        if self.pending_layout_status {
+            self.pending_layout_status = false;
+            self.status = Some(
+                match self.layout {
+                    Layout::Scroll => "continuous scroll",
+                    Layout::Spread => "two-page spread",
+                }
+                .to_string(),
+            );
+        }
         if let Some(resume) = self.resume_page.take() {
             if self.page == resume {
                 self.status = Some(format!("resumed at page {resume}"));
@@ -3417,7 +3325,7 @@ impl App {
     }
 
     fn can_slide(&self, direction: TurnDirection) -> bool {
-        if !self.mode.spread() {
+        if self.layout != Layout::Spread {
             return false;
         }
         match direction {
@@ -3570,7 +3478,7 @@ impl App {
     fn page_origin(&self) -> Option<(i32, i32)> {
         let bitmap = self.bitmap.as_ref()?;
         let scale = self.display_scale();
-        if self.strip_scroll {
+        if self.scroll_mode() {
             return Some((
                 self.page_left_offset(bitmap.width) - (self.scroll_x * scale).round() as i32,
                 -((self.scroll_position() * scale).round() as i32),
@@ -3599,7 +3507,7 @@ impl App {
         let (x0, y0) = self.page_origin()?;
         let x = (position.x as f32 - x0 as f32) / scale;
         let y = (position.y as f32 - y0 as f32) / scale;
-        if self.strip_scroll {
+        if self.scroll_mode() {
             if x < 0.0 || x >= page.width as f32 || y < 0.0 || y >= page.height as f32 {
                 return None;
             }
@@ -3781,7 +3689,7 @@ impl App {
             }
         } else if self.scroll_mode() {
             self.finish_animation();
-            if smooth && self.strip_scroll {
+            if smooth && self.scroll_mode() {
                 // Discrete wheel notches glide like the key steps.
                 self.scroll_smoothly(-dy);
             } else {
@@ -3878,7 +3786,7 @@ impl App {
         let full = Rect::new(0, 0, vw, vh);
         let mut list = DrawList::new();
 
-        if self.resize_preview && !self.strip_scroll {
+        if self.resize_preview && !self.scroll_mode() {
             if let Some(page) = self.bitmap.as_ref() {
                 let visible = self.visible_width().max(1) as f32;
                 let content_w = (vw - content_left).max(1) as f32;
@@ -3897,7 +3805,7 @@ impl App {
                 );
             }
         } else if let Some(page) = self.bitmap.as_ref() {
-            if self.strip_scroll {
+            if self.scroll_mode() {
                 // The strip is already laid out top-to-bottom at the reading
                 // scale. A resize preview only needs a width fit; normal
                 // frames draw at the worker's scale and scroll through the
@@ -4106,7 +4014,7 @@ impl ApplicationHandler<UserEvent> for App {
             pretty: self.pretty_text,
             page: self.resume_page,
             background: self.theme.window,
-            spread: self.mode.spread(),
+            layout: self.layout_intent,
         });
         self.worker = Some(worker);
 
@@ -4408,32 +4316,6 @@ fn window_index_for(pages: &[usize], page: usize) -> usize {
         .iter()
         .position(|&candidate| candidate == page)
         .unwrap_or(0)
-}
-
-/// Whether a window can show a two-page spread without squeezing each page
-/// below a comfortable reading width. `single` is the width of one
-/// height-fitted page; `None` means the page geometry is not known yet.
-///
-/// This is a pure geometry test. It deliberately does not look at how many
-/// pages the rendered strip contains: blank reflow pages can shorten a strip,
-/// but that says nothing about whether the window is wide enough for a pair.
-fn spread_width_is_comfortable(viewport_width: u32, single: Option<f32>) -> bool {
-    let Some(single) = single else {
-        return false;
-    };
-    let prospective = viewport_width as f32 / (2.0 + SPREAD_GAP_RATIO);
-    prospective >= single * MIN_SPREAD_PAGE_FRACTION
-}
-
-/// Whether an active spread stays on screen.
-///
-/// The length of the rendered strip is deliberately not an input. Blank reflow
-/// pages can shorten a strip to the visible pair without changing the window's
-/// ability to fit a comfortable pair, so a short strip must not pin a cramped
-/// spread in place. With no bitmap yet, keep waiting for geometry instead of
-/// collapsing the layout on every resize frame.
-fn spread_stays(page_fit: Fit, has_bitmap: bool, can_fit: bool) -> bool {
-    page_fit == Fit::Page && (!has_bitmap || can_fit)
 }
 
 /// Decide whether the rendered scroll window should slide to keep lookahead in
@@ -5171,63 +5053,6 @@ mod tests {
         assert_eq!(window_index_for(&[1, 3, 4, 6], 3), 1);
         assert_eq!(window_index_for(&[2, 4], 2), 0);
         assert_eq!(window_index_for(&[], 7), 0);
-    }
-
-    #[test]
-    fn narrow_window_rejects_a_spread_pair() {
-        // A height-fitted single page 600 wide needs each spread half to stay
-        // at least 70% of that width. The pair plus gutter must fit the
-        // viewport, so the threshold is just above 2.004 * 420.
-        let single = Some(600.0);
-        assert!(spread_width_is_comfortable(1400, single));
-        assert!(!spread_width_is_comfortable(800, single));
-        assert!(!spread_width_is_comfortable(0, single));
-
-        // Unknown page geometry cannot justify a spread.
-        assert!(!spread_width_is_comfortable(2400, None));
-    }
-
-    #[test]
-    fn narrow_window_leaves_spread_even_with_a_short_strip() {
-        // Blank reflow pages can leave only the visible pair in the strip.
-        // Geometry, not strip length, decides whether the pair stays.
-        assert!(!spread_stays(Fit::Page, true, false));
-        assert!(spread_stays(Fit::Page, true, true));
-        // Before the first bitmap arrives there is no geometry to judge yet.
-        assert!(spread_stays(Fit::Page, false, false));
-        // An explicit zoom is not a fit-to-page spread.
-        assert!(!spread_stays(Fit::None, true, true));
-    }
-
-    #[test]
-    fn mode_state_keeps_spread_preference_across_a_narrow_window() {
-        let mut mode = ModeState::new();
-        assert!(mode.scroll());
-        assert!(mode.prefer_spread);
-
-        // The first wide render enables the spread.
-        assert_eq!(mode.settle(true), Some(ReadingMode::Spread));
-        assert!(mode.spread());
-
-        // A narrow window leaves the spread but remembers the preference, so
-        // widening restores it without another toggle.
-        assert_eq!(mode.settle(false), Some(ReadingMode::Scroll));
-        assert!(mode.scroll());
-        assert!(mode.prefer_spread);
-        assert_eq!(mode.settle(true), Some(ReadingMode::Spread));
-
-        // A manual toggle off overrides the geometry and survives widening.
-        mode.prefer_spread = false;
-        assert_eq!(mode.settle(true), Some(ReadingMode::Scroll));
-        assert_eq!(mode.settle(true), None);
-    }
-
-    #[test]
-    fn mode_state_does_not_resend_an_unchanged_model() {
-        let mut mode = ModeState::new();
-        assert_eq!(mode.settle(false), None);
-        assert_eq!(mode.settle(true), Some(ReadingMode::Spread));
-        assert_eq!(mode.settle(true), None);
     }
 
     #[test]

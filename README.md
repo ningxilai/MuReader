@@ -17,7 +17,7 @@ cargo install --git https://github.com/ningxilai/MuReader.git
 ```
 
 MuPDF is built from `ningxilai/mupdf-rs` at a pinned revision
-(`ccbeff0373aba5d83eddfc9c44190c1552c4fb22`), which carries the reflow layout
+(`501076c4015a98068db57c45591ee3a068e8818c`), which carries the reflow layout
 fixes used by MuReader. Pinning the revision and committing `Cargo.lock` keeps
 builds reproducible. This keeps the MuPDF C changes in the fork instead of
 vendoring the whole C source tree in this repository. Cargo fetches the fork
@@ -279,6 +279,11 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Reading-model ownership now lives in the renderer. The reader sends only the
+  user's `LayoutIntent` (`Auto` or `Scroll`); the worker resolves it against
+  the current window and reports the effective `Layout` with every rendered
+  strip. Input, geometry, and the status line follow that reported layout, so a
+  resize cannot leave the UI driving a model that no longer matches the bitmap.
 - A paged spread keeps its slide animation when both visible pages are
   illustrations. Blank reflow pages used to shorten the rendered strip to the
   two visible pages, leaving no lookahead for the turn; the spread now scans
