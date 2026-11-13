@@ -279,6 +279,13 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- A paged spread keeps its slide animation when both visible pages are
+  illustrations. Blank reflow pages used to shorten the rendered strip to the
+  two visible pages, leaving no lookahead for the turn; the spread now scans
+  past blank pages until it holds four non-blank pages. A window too narrow
+  for a comfortable pair now reliably falls back to continuous scroll instead
+  of keeping a cramped single paged column, and that decision no longer
+  depends on how many pages the strip happens to contain.
 - Paged spreads no longer turn pages from vertical wheel or trackpad motion.
   A paged spread has nothing to scroll, so vertical input is ignored and a
   horizontal swipe turns exactly one page per gesture; key and screen steps

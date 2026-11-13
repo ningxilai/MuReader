@@ -1893,10 +1893,49 @@ impl RenderEngine {
             (start..start + count).collect()
         } else if self.spread && self.fit != Fit::None {
             let start = self.page.saturating_sub(1);
-            vec![start, start + 1, start + 2, start + 3]
+            if self.reflowable {
+                self.spread_page_numbers(start)
+            } else {
+                vec![start, start + 1, start + 2, start + 3]
+            }
         } else {
             vec![self.page]
         }
+    }
+
+    /// Pages of a reflowable spread strip.
+    ///
+    /// Reflow can leave blank pages behind, and a spread skips them so a
+    /// blank band never appears between two real pages. Filtering alone would
+    /// shorten the strip, though, and the slide animation needs one page of
+    /// lookahead beyond the visible pair. Scan forward until four non-blank
+    /// pages are collected, so a blank page costs a slot in the document, not
+    /// a slot in the strip. The scan is bounded: a pathological run of blanks
+    /// must not turn one render into a whole-document walk.
+    fn spread_page_numbers(&self, start: usize) -> Vec<usize> {
+        const SPREAD_PAGES: usize = 4;
+        const SPREAD_SCAN_LIMIT: usize = 64;
+        let end = self
+            .page_count
+            .unwrap_or(usize::MAX)
+            .min(start.saturating_add(SPREAD_SCAN_LIMIT));
+        let mut numbers = Vec::with_capacity(SPREAD_PAGES);
+        for page_no in start..end {
+            if self.page_is_blank(page_no) {
+                continue;
+            }
+            numbers.push(page_no);
+            if numbers.len() == SPREAD_PAGES {
+                break;
+            }
+        }
+        if numbers.is_empty() {
+            // Every candidate was blank (or the window starts past the end).
+            // Render the requested pages anyway so the worker still reports a
+            // focus page and its geometry.
+            return (start..start + SPREAD_PAGES).collect();
+        }
+        numbers
     }
 
     /// Number of contiguous pages in the scroll strip. Auto-fit can afford the
@@ -1912,24 +1951,16 @@ impl RenderEngine {
     fn render_with_quads(&mut self, quads: &[Quad]) -> Result<RenderedPage, String> {
         let page_numbers = self.page_numbers_for();
         let cacheable = quads.is_empty() && self.search_query.is_none();
-        // Blank reflow pages are skipped in paged layouts, but a scroll strip
-        // used to keep them as contiguous viewport chunks. Continuous scroll
-        // instead treats the chapter as one flow, so blank pages disappear
-        // from the strip entirely and no blank band appears between blocks.
+        // Continuous scroll treats the chapter as one flow, so blank pages
+        // disappear from the strip entirely and no blank band appears between
+        // blocks. Paged reflowable spreads filter blanks while choosing their
+        // page numbers, where the scan can also keep enough lookahead for the
+        // slide animation.
         if self.roll() {
             let filtered: Vec<usize> = page_numbers
                 .iter()
                 .copied()
                 .filter(|&page_no| self.roll_metrics(page_no).is_some())
-                .collect();
-            if !filtered.is_empty() {
-                return self.render_pages(&filtered, quads, cacheable);
-            }
-        } else if self.reflowable && !self.scroll {
-            let filtered: Vec<usize> = page_numbers
-                .iter()
-                .copied()
-                .filter(|&page_no| !self.page_is_blank(page_no))
                 .collect();
             if !filtered.is_empty() {
                 return self.render_pages(&filtered, quads, cacheable);
@@ -3302,6 +3333,57 @@ mod tests {
         assert!(engine.goto_page(total));
         let last = engine.render().unwrap();
         assert!(!last.text.is_empty(), "pretty text ended with a blank page");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spread_keeps_slide_lookahead_across_blank_pages() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("spread-lookahead");
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="600" height="450"><rect width="600" height="450" fill="#336699"/></svg>"##;
+        std::fs::write(dir.join("plate.svg"), svg).unwrap();
+        let path = dir.join("images.html");
+        let mut html = String::from("<!doctype html><html><body>");
+        // Two image-only pages are followed by a spacer that reflow turns
+        // into blank pages, and then by text. Blank pages are skipped in a
+        // spread, but the strip must still hold four non-blank pages: the
+        // visible pair plus one page of lookahead for the slide animation.
+        for _ in 0..2 {
+            html.push_str("<div style=\"margin:0;padding:0\"><img src=\"plate.svg\" width=\"600\" height=\"450\"></div>");
+        }
+        html.push_str("<div style=\"height:4000pt;margin:0;padding:0\"></div>");
+        for i in 0..120 {
+            html.push_str(&format!(
+                "<p>Tail {i}. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>"
+            ));
+        }
+        html.push_str("</body></html>");
+        std::fs::write(&path, html).unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let mut engine = RenderEngine::open(&path, catalog, None, false).unwrap();
+        engine.set_viewport(2400, 900);
+        engine.set_layout(true);
+
+        let images = engine.render().unwrap();
+        assert_eq!(images.page, 1);
+        assert_eq!(images.pages.len(), 4, "image pair lost its lookahead");
+        assert_eq!(&images.pages[..2], &[1, 2]);
+        assert!(
+            images.pages[2] > 3,
+            "blank reflow pages must be skipped, not rendered: {:?}",
+            images.pages
+        );
+
+        // Moving to the text after the blank run keeps a full strip too.
+        assert!(engine.next_page());
+        assert!(engine.next_page());
+        let text = engine.render().unwrap();
+        assert_eq!(text.page, 8);
+        assert_eq!(text.pages.len(), 4);
+        assert!(text.pages.iter().all(|&page| page >= 8));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
