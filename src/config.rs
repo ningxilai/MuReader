@@ -145,7 +145,7 @@ impl Config {
     /// document text share this primary face; glyph fallback remains shared.
     pub fn font_family(&self) -> Option<String> {
         let css = self.reflowable_css()?;
-        first_css_font_family(&css)
+        crate::css::StyleSheet::parse(&css).font_family()
     }
 
     /// Combine inline CSS and an optional CSS file. A relative file path is
@@ -237,115 +237,6 @@ pub fn load() -> Config {
             Config::default()
         }
     }
-}
-
-pub(crate) fn strip_css_comments(css: &str) -> String {
-    let mut result = String::with_capacity(css.len());
-    let mut rest = css;
-    while let Some(start) = rest.find("/*") {
-        result.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        match after.find("*/") {
-            Some(end) => rest = &after[end + 2..],
-            None => return result,
-        }
-    }
-    result.push_str(rest);
-    result
-}
-
-fn is_css_ident_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') || !ch.is_ascii()
-}
-
-pub(crate) fn strip_font_face_blocks(css: &str) -> String {
-    let lower = css.to_ascii_lowercase();
-    let mut result = String::with_capacity(css.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while let Some(relative) = lower[search..].find("@font-face") {
-        let start = search + relative;
-        if css[..start]
-            .chars()
-            .next_back()
-            .is_some_and(is_css_ident_char)
-        {
-            search = start + 1;
-            continue;
-        }
-        let Some(open_relative) = css[start..].find('{') else {
-            break;
-        };
-        let open = start + open_relative;
-        let mut depth = 0usize;
-        let mut end = None;
-        for (offset, ch) in css[open..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        end = Some(open + offset + ch.len_utf8());
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match end {
-            Some(end) => {
-                result.push_str(&css[copied..start]);
-                copied = end;
-                search = end;
-            }
-            None => break,
-        }
-    }
-    result.push_str(&css[copied..]);
-    result
-}
-
-fn first_css_font_family(css: &str) -> Option<String> {
-    // `@font-face` names the source font, not necessarily the body face. The
-    // UI should follow the family the document actually asks for.
-    let css = strip_font_face_blocks(&strip_css_comments(css));
-    let lower = css.to_ascii_lowercase();
-    let mut search = 0usize;
-    while let Some(relative) = lower[search..].find("font-family") {
-        let index = search + relative;
-        if css[..index]
-            .chars()
-            .next_back()
-            .is_some_and(is_css_ident_char)
-        {
-            search = index + 1;
-            continue;
-        }
-        let after = &lower[index + "font-family".len()..];
-        let Some(colon) = after.find(':') else {
-            break;
-        };
-        // A colon after a declaration boundary belongs to a later property.
-        if after[..colon].contains([';', '{', '}']) {
-            search = index + 1;
-            continue;
-        }
-        let value_start = index + "font-family".len() + colon + 1;
-        let value_lower = &lower[value_start..];
-        let end = value_lower.find([';', '}']).unwrap_or(value_lower.len());
-        let important = value_lower[..end].find("!important").unwrap_or(end);
-        let value = css[value_start..value_start + end]
-            .get(..important)
-            .unwrap_or("")
-            .trim();
-        let first = value.split(',').next().unwrap_or(value).trim();
-        let first = first.trim_matches(|ch| matches!(ch, '\'' | '"')).trim();
-        if !first.is_empty() && !first.to_ascii_lowercase().starts_with("var(") {
-            return Some(first.to_string());
-        }
-        search = value_start + end;
-    }
-    None
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -529,23 +420,27 @@ hpluv = false
 
     #[test]
     fn finds_the_first_css_font_family() {
-        let family = first_css_font_family(
+        let mut config = Config::default();
+        config.reflowable.css = Some(
             r#"
 @font-face { font-family: "Embedded Face"; src: url(x); }
 body { color: red; font-family: "FangSongCode", serif !important; }
-"#,
+"#
+            .to_string(),
         );
-        assert_eq!(family.as_deref(), Some("FangSongCode"));
-        assert_eq!(
-            first_css_font_family("body { font-family: 'Noto Serif', serif; }").as_deref(),
-            Some("Noto Serif")
-        );
-        assert_eq!(first_css_font_family("body { color: red; }"), None);
+        assert_eq!(config.font_family().as_deref(), Some("FangSongCode"));
+
+        config.reflowable.css = Some("body { font-family: 'Noto Serif', serif; }".to_string());
+        assert_eq!(config.font_family().as_deref(), Some("Noto Serif"));
+
+        config.reflowable.css = Some("body { color: red; }".to_string());
+        assert_eq!(config.font_family(), None);
     }
 
     #[test]
     fn css_font_family_ignores_comments_face_blocks_and_case() {
-        let family = first_css_font_family(
+        let mut config = Config::default();
+        config.reflowable.css = Some(
             r#"
 /* font-family: "Commented Out"; */
 @FONT-FACE { font-family: "Embedded Face"; src: url(x); }
@@ -553,12 +448,13 @@ body {
     --font-family: "Custom Property";
     FONT-FAMILY: 'Real Face', serif !IMPORTANT;
 }
-"#,
+"#
+            .to_string(),
         );
-        assert_eq!(family.as_deref(), Some("Real Face"));
-        assert_eq!(
-            first_css_font_family("body { --font-family: 'No'; font-family: 'Yes'; }").as_deref(),
-            Some("Yes")
-        );
+        assert_eq!(config.font_family().as_deref(), Some("Real Face"));
+
+        config.reflowable.css =
+            Some("body { --font-family: 'No'; font-family: 'Yes'; }".to_string());
+        assert_eq!(config.font_family().as_deref(), Some("Yes"));
     }
 }

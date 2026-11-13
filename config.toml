@@ -58,6 +58,15 @@ css = ""
 # against this config file's directory.
 css_file = ""
 
+# A reflowable document can instead use a sidecar stylesheet discovered from
+# its SHA-256:
+#   $XDG_CACHE_HOME/mureader/css/<sha256>.css
+# MUREADER_CSS_CACHE overrides the directory. When present, the sidecar
+# replaces both this CSS and the document's own stylesheet, and
+# [perfect_palette] is not applied. It is sanitized to the CSS subset MuPDF
+# implements; unreadable, oversized, or empty sidecars fall back to this CSS.
+# Plain-text pretty layout keeps its generated document CSS.
+
 # Read plain-text files with Unicode line breaking and a total-fit pass.
 # MuPDF provides the handlers for txt and text files; formats without a MuPDF
 # handler are not opened.

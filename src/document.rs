@@ -580,11 +580,25 @@ pub struct RenderEngine {
 }
 
 impl RenderEngine {
+    #[cfg(test)]
     pub fn open(
         path: &Path,
         fonts: Arc<FontCatalog>,
         css: Option<String>,
         pretty: bool,
+    ) -> Result<Self, String> {
+        Self::open_with_document_css(path, fonts, css, pretty, true)
+    }
+
+    /// Open a document with explicit control over MuPDF's document stylesheet.
+    /// A sidecar replaces the document's CSS; pretty text always keeps it
+    /// because the generated HTML carries its required layout `<style>`.
+    pub fn open_with_document_css(
+        path: &Path,
+        fonts: Arc<FontCatalog>,
+        css: Option<String>,
+        pretty: bool,
+        document_css: bool,
     ) -> Result<Self, String> {
         // MuPDF's TXT handler also claims .log, but log output is machine
         // text, not a document. Reject it instead of showing it as a book.
@@ -602,6 +616,10 @@ impl RenderEngine {
             .map_err(|e| format!("reflowable CSS: {e}"))?;
 
         let mut pretty_text = pretty && crate::pretty_text::is_plain_text(path);
+        // The generated plain-text document needs its own `<style>`; a sidecar
+        // must not disable it. If pretty text falls back to MuPDF's handler,
+        // restore the requested setting before reopening the file.
+        context.set_use_document_css(document_css || pretty_text);
         let mut doc = if pretty_text {
             match crate::pretty_text::html_for_path(path, &fonts) {
                 Ok(html) => match Document::from_copied_bytes(html.as_bytes(), "text/html") {
@@ -609,12 +627,14 @@ impl RenderEngine {
                     Err(error) => {
                         eprintln!("MuReader: pretty text render failed: {error}; using MuPDF");
                         pretty_text = false;
+                        context.set_use_document_css(document_css);
                         Document::open(path).map_err(|e| format!("open {}: {e}", path.display()))?
                     }
                 },
                 Err(error) => {
                     eprintln!("MuReader: pretty text failed: {error}; using MuPDF");
                     pretty_text = false;
+                    context.set_use_document_css(document_css);
                     Document::open(path).map_err(|e| format!("open {}: {e}", path.display()))?
                 }
             }
@@ -4411,6 +4431,74 @@ mod tests {
         assert!(light > 1000, "CSS background not applied");
         assert!(yellow > 0, "CSS foreground not applied");
         assert_eq!(page.bitmap.pixels[0], 0x00112233);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_can_disable_the_document_stylesheet() {
+        let _guard = doc_test_guard();
+        let dir = test_dir("sidecar-css");
+        let path = dir.join("sample.html");
+        std::fs::write(
+            &path,
+            "<!doctype html><html><head><style>\
+             html body { background-color: #ff0000 !important; }\
+             </style></head><body><p>Sidecar</p></body></html>",
+        )
+        .unwrap();
+
+        let catalog = Arc::new(crate::fonts::FontCatalog::new(None).unwrap());
+        mupdf::set_font_loader(crate::fonts::EpubFontLoader::new(catalog.clone()));
+        let css = "body { background-color: #112233; color: #ffcc00; }";
+
+        let mut replaced = RenderEngine::open_with_document_css(
+            &path,
+            catalog.clone(),
+            Some(css.to_string()),
+            false,
+            false,
+        )
+        .unwrap();
+        replaced.set_viewport(800, 600);
+        let page = replaced.render().unwrap();
+        let sidecar = page
+            .bitmap
+            .pixels
+            .iter()
+            .filter(|&&pixel| pixel == 0x00112233)
+            .count();
+        let document = page
+            .bitmap
+            .pixels
+            .iter()
+            .filter(|&&pixel| pixel == 0x00ff0000)
+            .count();
+        assert!(sidecar > 1000, "sidecar background not applied");
+        assert_eq!(document, 0, "document CSS should be disabled");
+        drop(replaced);
+        Context::get().set_user_css("").unwrap();
+
+        let mut native = RenderEngine::open_with_document_css(
+            &path,
+            catalog,
+            Some(css.to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+        native.set_viewport(800, 600);
+        let page = native.render().unwrap();
+        let document = page
+            .bitmap
+            .pixels
+            .iter()
+            .filter(|&&pixel| pixel == 0x00ff0000)
+            .count();
+        assert!(
+            document > 1000,
+            "the document stylesheet should win when it is enabled"
+        );
+        Context::get().set_user_css("").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

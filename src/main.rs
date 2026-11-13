@@ -27,6 +27,7 @@ mod activation;
 mod book_color;
 mod clipboard;
 mod config;
+mod css;
 mod document;
 mod fonts;
 mod gpu;
@@ -35,6 +36,7 @@ mod outline_text;
 mod palette;
 mod pretty_text;
 mod progress;
+mod sidecar;
 mod startup;
 mod theme;
 mod worker;
@@ -654,6 +656,9 @@ struct App {
     pending_zooms: VecDeque<PendingZoom>,
     last_requested_scale: f32,
     css: Option<String>,
+    /// Whether MuPDF should apply the document's own stylesheet. A sidecar
+    /// replaces both the config CSS and the document CSS.
+    document_css: bool,
     pretty_text: bool,
     page_turn_duration: Duration,
     window_fit_duration: Duration,
@@ -684,8 +689,7 @@ impl App {
         proxy: EventLoopProxy<UserEvent>,
         fonts: Arc<FontCatalog>,
         keymap: Keymap,
-        css: Option<String>,
-        theme: Theme,
+        styles: Styles,
         pretty_text: bool,
         page_turn_duration: Duration,
         window_fit_duration: Duration,
@@ -699,7 +703,13 @@ impl App {
             .copied()
             .filter(|entry| menu_keys.has_binding(entry.action))
             .collect();
-        let follow_document_theme = !Theme::has_css_colors(css.as_deref());
+        let Styles {
+            css,
+            theme,
+            follow_document_theme,
+            document_css,
+            font_family: _,
+        } = styles;
         Self {
             path,
             proxy,
@@ -778,6 +788,7 @@ impl App {
             pending_zooms: VecDeque::new(),
             last_requested_scale: 1.0,
             css,
+            document_css,
             pretty_text,
             page_turn_duration,
             window_fit_duration,
@@ -4011,6 +4022,7 @@ impl ApplicationHandler<UserEvent> for App {
             path: self.path.clone(),
             fonts: self.fonts.clone(),
             css: self.css.clone(),
+            document_css: self.document_css,
             pretty: self.pretty_text,
             page: self.resume_page,
             background: self.theme.window,
@@ -4477,10 +4489,45 @@ fn scroll_for_page_point_at_screen(
     )
 }
 
-/// Compose the stylesheet the reader actually applies. The eye-comfort palette
-/// is a transformation of the theme implied by the user's CSS, so its rules
-/// come after that CSS. When disabled, both values stay exactly untouched.
-fn configured_styles(config: &Config) -> (Option<String>, Theme) {
+/// The effective reading styles and the UI theme derived from them.
+struct Styles {
+    /// The stylesheet passed to MuPDF as user CSS.
+    css: Option<String>,
+    theme: Theme,
+    /// True when the CSS names no colors, so the UI keeps following the
+    /// rendered page background instead of pinning a palette.
+    follow_document_theme: bool,
+    /// Whether MuPDF should apply the document's own stylesheet.
+    document_css: bool,
+    /// Primary face for UI text and glyph fallback.
+    font_family: Option<String>,
+}
+
+/// Compose the stylesheet the reader actually applies.
+///
+/// A sidecar replaces both the config CSS and the document CSS: it is
+/// sanitized, the eye-comfort palette is not appended (the sidecar is already
+/// a complete palette), and the theme is derived from the sanitized result.
+/// Without a sidecar, the eye-comfort palette is a transformation of the
+/// theme implied by the user's CSS, so its rules come after that CSS.
+fn configured_styles(config: &Config, sidecar: Option<&str>) -> Styles {
+    if let Some(sidecar) = sidecar {
+        let sheet = css::StyleSheet::parse(sidecar);
+        let safe = sheet.safe_css();
+        if !safe.trim().is_empty() {
+            let applied = css::StyleSheet::parse(&safe);
+            let (theme, has_colors) = Theme::from_sheet(&applied);
+            return Styles {
+                css: Some(safe),
+                theme,
+                follow_document_theme: !has_colors,
+                document_css: false,
+                font_family: applied.font_family(),
+            };
+        }
+        eprintln!("MuReader: sidecar CSS has no usable rules; using config CSS");
+    }
+
     let mut css = config.reflowable_css();
     let mut theme = Theme::from_css(css.as_deref());
     if config.perfect_palette.enable {
@@ -4492,7 +4539,13 @@ fn configured_styles(config: &Config) -> (Option<String>, Theme) {
         });
         theme = Theme::from_css(css.as_deref());
     }
-    (css, theme)
+    Styles {
+        follow_document_theme: !Theme::has_css_colors(css.as_deref()),
+        font_family: config.font_family(),
+        css,
+        theme,
+        document_css: true,
+    }
 }
 
 fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
@@ -4506,10 +4559,11 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
             path
         }
     };
-    let fonts = Arc::new(FontCatalog::new(config.font_family().as_deref())?);
+    let sidecar = sidecar::load(&path);
+    let styles = configured_styles(&config, sidecar.as_deref());
+    let fonts = Arc::new(FontCatalog::new(styles.font_family.as_deref())?);
     mupdf::set_font_loader(EpubFontLoader::new(fonts.clone()));
     let keymap = Keymap::new(&config.keys);
-    let (css, theme) = configured_styles(&config);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -4518,8 +4572,7 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         proxy,
         fonts,
         keymap,
-        css,
-        theme,
+        styles,
         config.reflowable.pretty,
         Duration::from_millis(config.animation.page_turn_ms),
         Duration::from_millis(config.animation.window_fit_ms),
@@ -4642,9 +4695,62 @@ mod tests {
     fn disabled_palette_leaves_css_and_theme_untouched() {
         let mut config = Config::default();
         config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
-        let (css, theme) = configured_styles(&config);
-        assert_eq!(css, config.reflowable_css());
-        assert_eq!(theme, Theme::from_css(css.as_deref()));
+        let styles = configured_styles(&config, None);
+        assert_eq!(styles.css, config.reflowable_css());
+        assert_eq!(styles.theme, Theme::from_css(styles.css.as_deref()));
+        assert!(!styles.follow_document_theme);
+        assert!(styles.document_css);
+        assert_eq!(styles.font_family, config.font_family());
+    }
+
+    #[test]
+    fn sidecar_replaces_config_css_and_document_css() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { color: #ff0000; }".to_string());
+        config.perfect_palette.enable = true;
+        let sidecar = r#"
+            body {
+                background: #101820;
+                color: #f0e6d2;
+                font-family: "Sidecar Face", serif;
+                transform: rotate(90deg);
+            }
+            @media print { body { color: red; } }
+        "#;
+        let styles = configured_styles(&config, Some(sidecar));
+        let css = styles.css.unwrap();
+        assert!(css.contains("background: #101820;"));
+        assert!(css.contains("font-family: \"Sidecar Face\", serif;"));
+        assert!(!css.contains("#ff0000"));
+        assert!(!css.contains("transform"));
+        assert!(!css.contains("@media"));
+        assert!(!css.contains("--mureader-palette-0"));
+        assert!(!styles.document_css, "a sidecar replaces the document CSS");
+        assert!(!styles.follow_document_theme);
+        assert_eq!(styles.font_family.as_deref(), Some("Sidecar Face"));
+        assert_eq!(styles.theme, Theme::from_css(Some(&css)));
+    }
+
+    #[test]
+    fn empty_sidecar_falls_back_to_config_css() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { color: #123456; }".to_string());
+        let styles = configured_styles(&config, Some("@media print { body { color: red; } }"));
+        assert_eq!(styles.css, config.reflowable_css());
+        assert!(styles.document_css);
+        assert_eq!(styles.theme, Theme::from_css(styles.css.as_deref()));
+    }
+
+    #[test]
+    fn sidecar_without_colors_follows_the_document() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { color: #123456; }".to_string());
+        let styles = configured_styles(&config, Some("body { line-height: 1.5; }"));
+        assert!(styles.follow_document_theme);
+        assert_eq!(
+            styles.css.as_deref(),
+            Some("body {\n    line-height: 1.5;\n}\n")
+        );
     }
 
     #[test]
@@ -4716,8 +4822,8 @@ mod tests {
         let mut config = Config::default();
         config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
         config.perfect_palette.enable = true;
-        let (css, theme) = configured_styles(&config);
-        let css = css.unwrap();
+        let styles = configured_styles(&config, None);
+        let css = styles.css.unwrap();
         let user = css.find("body { background").unwrap();
         let tuned = css.find("--mureader-palette-0").unwrap();
         assert!(user < tuned, "the tuned palette must follow the user CSS");
@@ -4729,7 +4835,7 @@ mod tests {
             "config CSS stays exactly the user's stylesheet"
         );
         assert_ne!(
-            theme,
+            styles.theme,
             Theme::from_css(config.reflowable_css().as_deref()),
             "the UI theme follows the tuned palette"
         );

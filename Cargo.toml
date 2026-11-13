@@ -11,6 +11,7 @@ description = "MuReader: standalone MuPDF document reader"
 [dependencies]
 ab_glyph = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
+cssparser = "0.37"
 fontdb = "0.24"
 harfbuzz_rs = "2"
 hypher = "0.1"
@@ -31,6 +32,7 @@ mupdf-fonts-noto = "0.8"
 pollster = "1"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.8"
 unicode-bidi = "0.3"
 unicode-bidi-mirroring = "0.4"

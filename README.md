@@ -198,6 +198,32 @@ declared there is also used by the outline, command menu, and other UI text;
 CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
 line-breaking pass for TXT and text files.
 
+### Sidecar stylesheets
+
+A reflowable document can use a replacement stylesheet discovered from its
+content instead of named in the config. MuReader hashes the document bytes
+with SHA-256 and looks for:
+
+```text
+$XDG_CACHE_HOME/mureader/css/<sha256>.css
+```
+
+`MUREADER_CSS_CACHE` overrides that directory. The lookup applies to EPUB,
+HTML/XHTML, FB2, MOBI, DOCX/XLSX/PPTX/HWPX, and TXT/text files. When a sidecar
+exists, it replaces both the `[reflowable]` CSS and the document's own
+stylesheet, and `[perfect_palette]` is not applied. A missing sidecar is
+silent; an unreadable or oversized file (over 4 MiB) is reported and the
+normal config-plus-document pipeline is used instead.
+
+The sidecar is parsed with a CSS syntax parser and sanitized before MuPDF sees
+it. It keeps `@font-face`, `@page`, the properties MuPDF implements, and
+`--mureader-*` custom properties; other at-rules, `var()`, `calc()`,
+unsupported properties, unbounded numbers, and absolute or parent-escaping
+URLs are dropped. Rule order is preserved. Font and image URLs must stay
+relative to the document archive. The plain-text pretty layout keeps document
+CSS enabled even with a sidecar because its generated HTML carries the required
+page layout.
+
 `[perfect_palette]` is an optional eye-comfort palette ported from the HPLuv
 `perfect-palette` helper in the author's Emacs configuration. Instead of
 imposing an unrelated theme, it reads the window, text, and accent hue from
@@ -279,6 +305,13 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
+- Reflowable documents can use an auto-discovered sidecar stylesheet at
+  `$XDG_CACHE_HOME/mureader/css/<sha256>.css`, keyed by the document's SHA-256.
+  The sidecar replaces both the config CSS and the document CSS, is parsed with
+  `cssparser` and sanitized to the at-rules, properties, and URL forms MuPDF
+  actually supports, and falls back to the normal pipeline when missing or
+  unusable. UI theme and font extraction now share the same parser instead of
+  hand-written CSS scanning.
 - Reading-model ownership now lives in the renderer. The reader sends only the
   user's `LayoutIntent` (`Auto` or `Scroll`); the worker resolves it against
   the current window and reports the effective `Layout` with every rendered

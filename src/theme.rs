@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::{strip_css_comments, strip_font_face_blocks};
+use crate::css::StyleSheet;
 
 /// The built-in dark window color, also used when a CSS theme only overrides
 /// individual tokens.
@@ -104,24 +104,28 @@ impl Theme {
     /// follows the rendered page background when it becomes available.
     pub fn from_css(css: Option<&str>) -> Self {
         match css {
-            Some(css) if !css.trim().is_empty() => {
-                let overrides = parse_overrides(css);
-                if overrides.any() {
-                    Self::from_overrides(overrides)
-                } else {
-                    Self::html_default()
-                }
-            }
+            Some(css) if !css.trim().is_empty() => Self::from_sheet(&StyleSheet::parse(css)).0,
             _ => Self::html_default(),
         }
     }
 
-    /// Whether the CSS chooses any UI color. When it does not, the app derives
-    /// one theme from an isolated `book_color` whole-book sample and keeps it
-    /// for the book; the optional palette may later consume the same color.
+    /// Parse a theme and report whether the stylesheet chose any UI color.
+    /// When it did not, the app derives one theme from an isolated
+    /// `book_color` whole-book sample and keeps it for the book; the optional
+    /// palette may later consume the same color.
+    pub(crate) fn from_sheet(sheet: &StyleSheet) -> (Self, bool) {
+        let overrides = parse_overrides(sheet);
+        if overrides.any() {
+            (Self::from_overrides(overrides), true)
+        } else {
+            (Self::html_default(), false)
+        }
+    }
+
+    /// Whether the CSS chooses any UI color.
     pub fn has_css_colors(css: Option<&str>) -> bool {
         match css {
-            Some(css) if !css.trim().is_empty() => parse_overrides(css).any(),
+            Some(css) if !css.trim().is_empty() => Self::from_sheet(&StyleSheet::parse(css)).1,
             _ => false,
         }
     }
@@ -399,30 +403,18 @@ impl Overrides {
     }
 }
 
-fn parse_overrides(css: &str) -> Overrides {
-    let declarations = declarations(css);
-    let mut variables = BTreeMap::new();
-    for declaration in &declarations {
-        if declaration.property.starts_with("--") {
-            variables.insert(declaration.property.clone(), declaration.value.clone());
-        }
-    }
+fn parse_overrides(sheet: &StyleSheet) -> Overrides {
+    let variables = sheet.custom_properties();
     let token = |name: &str| {
         variables
             .get(name)
             .and_then(|value| parse_color_value(value, &variables))
     };
     Overrides {
-        window: token("--mureader-background").or_else(|| {
-            find_base_color(
-                &declarations,
-                &variables,
-                &["background-color", "background"],
-            )
-        }),
+        window: token("--mureader-background")
+            .or_else(|| find_base_color(sheet, &variables, &["background-color", "background"])),
         surface: token("--mureader-surface"),
-        text: token("--mureader-text")
-            .or_else(|| find_base_color(&declarations, &variables, &["color"])),
+        text: token("--mureader-text").or_else(|| find_base_color(sheet, &variables, &["color"])),
         muted: token("--mureader-muted"),
         accent: token("--mureader-accent"),
         border: token("--mureader-border"),
@@ -432,192 +424,29 @@ fn parse_overrides(css: &str) -> Overrides {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Declaration {
-    selector: String,
-    property: String,
-    value: String,
-}
-
-fn declarations(css: &str) -> Vec<Declaration> {
-    let cleaned = strip_font_face_blocks(&strip_css_comments(css));
-    let mut result = Vec::new();
-    parse_declarations(&cleaned, "", &mut result);
-    result
-}
-
-fn parse_declarations(css: &str, selector: &str, out: &mut Vec<Declaration>) {
-    let bytes = css.as_bytes();
-    let mut start = 0usize;
-    let mut index = 0usize;
-    let mut parens = 0i32;
-    let mut quote = 0u8;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if quote != 0 {
-            if byte == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if byte == quote {
-                quote = 0;
-            }
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'"' | b'\'' => quote = byte,
-            b'(' => parens += 1,
-            b')' => parens = (parens - 1).max(0),
-            b'{' if parens == 0 => {
-                let prelude = css[start..index].trim();
-                let Some(end) = matching_brace(css, index) else {
-                    return;
-                };
-                let nested = if prelude.starts_with('@') {
-                    selector.to_string()
-                } else {
-                    prelude.to_string()
-                };
-                parse_declarations(&css[index + 1..end], &nested, out);
-                index = end + 1;
-                start = index;
-                continue;
-            }
-            b';' if parens == 0 => {
-                push_declaration(&css[start..index], selector, out);
-                index += 1;
-                start = index;
-                continue;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    push_declaration(&css[start..], selector, out);
-}
-
-fn matching_brace(css: &str, open: usize) -> Option<usize> {
-    let bytes = css.as_bytes();
-    if bytes.get(open) != Some(&b'{') {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut quote = 0u8;
-    let mut index = open;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if quote != 0 {
-            if byte == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if byte == quote {
-                quote = 0;
-            }
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'"' | b'\'' => quote = byte,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn push_declaration(raw: &str, selector: &str, out: &mut Vec<Declaration>) {
-    let text = raw.trim();
-    if text.is_empty() || text.starts_with('@') {
-        return;
-    }
-    let Some(colon) = top_level_colon(text) else {
-        return;
-    };
-    let property = text[..colon].trim();
-    let value = strip_important(text[colon + 1..].trim());
-    if property.is_empty() || value.is_empty() {
-        return;
-    }
-    let property = if property.starts_with("--") {
-        property.to_string()
-    } else {
-        property.to_ascii_lowercase()
-    };
-    out.push(Declaration {
-        selector: selector.trim().to_string(),
-        property,
-        value: value.to_string(),
-    });
-}
-
-fn top_level_colon(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut parens = 0i32;
-    let mut quote = 0u8;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if quote != 0 {
-            if byte == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
-            }
-            if byte == quote {
-                quote = 0;
-            }
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'"' | b'\'' => quote = byte,
-            b'(' => parens += 1,
-            b')' => parens = (parens - 1).max(0),
-            b':' if parens == 0 => return Some(index),
-            _ => {}
-        }
-        index += 1;
-    }
-    None
-}
-
-fn strip_important(value: &str) -> &str {
-    let lower = value.to_ascii_lowercase();
-    match lower.find("!important") {
-        Some(index) => value[..index].trim(),
-        None => value.trim(),
-    }
-}
-
 fn find_base_color(
-    declarations: &[Declaration],
+    sheet: &StyleSheet,
     variables: &BTreeMap<String, String>,
     properties: &[&str],
 ) -> Option<u32> {
     let mut best: Option<(u8, u32)> = None;
-    for declaration in declarations {
-        if !properties.contains(&declaration.property.as_str()) {
-            continue;
-        }
-        let Some(color) = parse_color_value(&declaration.value, variables) else {
-            continue;
-        };
-        let rank = selector_rank(&declaration.selector);
+    for rule in &sheet.rules {
         // Only the document canvas supplies the base. Colors on links,
         // headings, or selection pseudo-elements must not repaint the UI.
+        let rank = selector_rank(&rule.selectors);
         if rank == 0 {
             continue;
         }
-        if best.is_none_or(|(best_rank, _)| rank >= best_rank) {
-            best = Some((rank, color));
+        for declaration in &rule.declarations {
+            if !properties.contains(&declaration.name.as_str()) {
+                continue;
+            }
+            let Some(color) = parse_color_value(&declaration.value, variables) else {
+                continue;
+            };
+            if best.is_none_or(|(best_rank, _)| rank >= best_rank) {
+                best = Some((rank, color));
+            }
         }
     }
     best.map(|(_, color)| color)
@@ -669,6 +498,14 @@ fn parse_color_value(value: &str, variables: &BTreeMap<String, String>) -> Optio
         }
     }
     None
+}
+
+fn strip_important(value: &str) -> &str {
+    let lower = value.to_ascii_lowercase();
+    match lower.find("!important") {
+        Some(index) => value[..index].trim(),
+        None => value.trim(),
+    }
 }
 
 fn resolve_variables(value: &str, variables: &BTreeMap<String, String>) -> String {

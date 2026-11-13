@@ -36,6 +36,7 @@ pub enum Command {
         path: PathBuf,
         fonts: Arc<FontCatalog>,
         css: Option<String>,
+        document_css: bool,
         pretty: bool,
         page: Option<usize>,
         background: u32,
@@ -161,12 +162,19 @@ fn run(
                 path,
                 fonts,
                 css,
+                document_css,
                 pretty,
                 page,
                 background,
                 layout,
             } => {
-                let mut opened = match RenderEngine::open(&path, fonts, css, pretty) {
+                let mut opened = match RenderEngine::open_with_document_css(
+                    &path,
+                    fonts,
+                    css,
+                    pretty,
+                    document_css,
+                ) {
                     Ok(engine) => engine,
                     Err(e) => {
                         let _ = proxy.send_event(UserEvent::Worker(Event::Fatal(e)));
