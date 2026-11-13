@@ -79,7 +79,7 @@ const OUTLINE_MAX_WIDTH: u32 = 360;
 const OUTLINE_MIN_CONTENT: u32 = 240;
 const OUTLINE_ROW_HEIGHT: u32 = 28;
 /// Below this fraction of a height-fitted single page, a spread page is too
-/// narrow to read and the reader falls back to one page.
+/// narrow to read and the reader falls back to continuous scroll.
 const MIN_SPREAD_PAGE_FRACTION: f32 = 0.7;
 /// Rows requested at once when the outline needs a new bitmap window. A tall
 /// window also gets enough margin to cover the viewport in a single request.
