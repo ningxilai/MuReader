@@ -25,6 +25,7 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) params: vec4<f32>,
 };
 
 @vertex
@@ -32,11 +33,13 @@ fn vs_main(
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) params: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4<f32>(position, 0.0, 1.0);
     out.uv = uv;
     out.color = color;
+    out.params = params;
     return out;
 }
 
@@ -45,7 +48,24 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSampleLevel(tex, samp, in.uv, 0.0) * in.color;
+    // A 3x3 Gaussian with sigma = 1 texel: the smallest kernel that still
+    // looks isotropic. `params.xy` scales the sample offsets, so the weights
+    // stay fixed while the radius follows the cross-fade envelope.
+    let base = textureSampleLevel(tex, samp, in.uv, 0.0);
+    var c = base;
+    let r = in.params.xy;
+    if (r.x > 0.0 || r.y > 0.0) {
+        c = base * 0.20418;
+        c += textureSampleLevel(tex, samp, in.uv + vec2<f32>(r.x, 0.0), 0.0) * 0.12384;
+        c += textureSampleLevel(tex, samp, in.uv - vec2<f32>(r.x, 0.0), 0.0) * 0.12384;
+        c += textureSampleLevel(tex, samp, in.uv + vec2<f32>(0.0, r.y), 0.0) * 0.12384;
+        c += textureSampleLevel(tex, samp, in.uv - vec2<f32>(0.0, r.y), 0.0) * 0.12384;
+        c += textureSampleLevel(tex, samp, in.uv + r, 0.0) * 0.07511;
+        c += textureSampleLevel(tex, samp, in.uv - r, 0.0) * 0.07511;
+        c += textureSampleLevel(tex, samp, in.uv + vec2<f32>(r.x, -r.y), 0.0) * 0.07511;
+        c += textureSampleLevel(tex, samp, in.uv + vec2<f32>(-r.x, r.y), 0.0) * 0.07511;
+    }
+    return c * in.color;
 }
 "#;
 
@@ -80,7 +100,12 @@ enum Command {
     Texture {
         id: u64,
         dst: Rect,
+        /// Bitmap-pixel window to draw. `None` draws the whole texture.
+        src: Option<Rect>,
         clip: Rect,
+        color: [f32; 4],
+        /// Gaussian radius in bitmap pixels; zero disables the kernel.
+        blur: f32,
     },
     Solid {
         dst: Rect,
@@ -101,9 +126,31 @@ impl DrawList {
         Self::default()
     }
 
+    /// Draw the whole texture.
     pub fn texture(&mut self, id: u64, dst: Rect, clip: Rect) {
+        self.texture_region(id, dst, None, clip, [1.0; 4], 0.0);
+    }
+
+    /// Draw a bitmap-pixel window of a texture into `dst`. `blur` is a
+    /// Gaussian radius in bitmap pixels.
+    pub fn texture_region(
+        &mut self,
+        id: u64,
+        dst: Rect,
+        src: Option<Rect>,
+        clip: Rect,
+        color: [f32; 4],
+        blur: f32,
+    ) {
         if !dst.is_empty() && !clip.is_empty() {
-            self.commands.push(Command::Texture { id, dst, clip });
+            self.commands.push(Command::Texture {
+                id,
+                dst,
+                src,
+                clip,
+                color,
+                blur: blur.max(0.0),
+            });
         }
     }
 
@@ -120,6 +167,7 @@ struct Vertex {
     position: [f32; 2],
     uv: [f32; 2],
     color: [f32; 4],
+    params: [f32; 4],
 }
 
 struct TextureTile {
@@ -266,7 +314,8 @@ impl GpuRenderer {
                     attributes: &wgpu::vertex_attr_array![
                         0 => Float32x2,
                         1 => Float32x2,
-                        2 => Float32x4
+                        2 => Float32x4,
+                        3 => Float32x4
                     ],
                 })],
             },
@@ -328,6 +377,15 @@ impl GpuRenderer {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    /// Whether a bitmap of this size uploads as a single texture tile.
+    ///
+    /// The cross-fade shader samples across the whole texture, so it must not
+    /// run on a tiled bitmap: taps at a tile boundary would clamp and show a
+    /// seam. Callers fall back to the slide animation in that case.
+    pub fn can_crossfade(&self, width: u32, height: u32) -> bool {
+        width <= self.max_texture && height <= self.max_texture
     }
 
     /// Upload or replace a bitmap. `revision` is an opaque counter owned by
@@ -473,13 +531,22 @@ impl GpuRenderer {
         let mut batches: Vec<Batch<'_>> = Vec::new();
         for command in &list.commands {
             match *command {
-                Command::Texture { id, dst, clip } => {
+                Command::Texture {
+                    id,
+                    dst,
+                    src,
+                    clip,
+                    color,
+                    blur,
+                } => {
                     if let Some(texture) = self.textures.get(&id) {
                         self.append_texture(
                             texture,
                             dst,
+                            src,
                             clip,
-                            [1.0, 1.0, 1.0, 1.0],
+                            color,
+                            blur,
                             (width, height),
                             &mut vertices,
                             &mut batches,
@@ -492,8 +559,10 @@ impl GpuRenderer {
                         self.append_texture(
                             texture,
                             dst,
+                            None,
                             clip,
                             color,
+                            0.0,
                             (width, height),
                             &mut vertices,
                             &mut batches,
@@ -576,8 +645,10 @@ impl GpuRenderer {
         &'a self,
         texture: &'a GpuTexture,
         dst: Rect,
+        src: Option<Rect>,
         clip: Rect,
         color: [f32; 4],
+        blur: f32,
         (viewport_w, viewport_h): (u32, u32),
         vertices: &mut Vec<Vertex>,
         batches: &mut Vec<Batch<'a>>,
@@ -596,20 +667,46 @@ impl GpuRenderer {
             (clip_y1 - clip_y0) as u32,
         );
 
+        // The source window in bitmap pixels. `dst` maps this window onto the
+        // screen, so a cross-fade can draw two different windows of the same
+        // strip without uploading another texture. Keep the requested window
+        // even if it runs past the texture edge: only the visible intersection
+        // is drawn, and it stays at its proportional place in `dst`.
+        let (sx, sy, sw, sh) = match src {
+            Some(src) => (src.x, src.y, src.w, src.h),
+            None => (0, 0, texture.width as i32, texture.height as i32),
+        };
+        if sw <= 0 || sh <= 0 || dst.w <= 0 || dst.h <= 0 {
+            return;
+        }
+
         for tile in &texture.tiles {
-            let x0 = dst.x + (tile.x as i64 * dst.w as i64 / texture.width as i64) as i32;
-            let x1 =
-                dst.x + ((tile.x + tile.w) as i64 * dst.w as i64 / texture.width as i64) as i32;
-            let y0 = dst.y + (tile.y as i64 * dst.h as i64 / texture.height as i64) as i32;
-            let y1 =
-                dst.y + ((tile.y + tile.h) as i64 * dst.h as i64 / texture.height as i64) as i32;
-            if x0 >= x1 || y0 >= y1 {
+            // Intersect the tile with the source window, then map that
+            // intersection from bitmap space into the destination.
+            let Some((rect, [u0, v0, u1, v1])) = tile_quad(
+                dst,
+                (sx, sy, sw, sh),
+                (tile.x as i32, tile.y as i32, tile.w as i32, tile.h as i32),
+            ) else {
                 continue;
-            }
+            };
+            let x0 = rect.x;
+            let x1 = rect.right();
+            let y0 = rect.y;
+            let y1 = rect.bottom();
+
             let left = x0 as f32 / viewport_w as f32 * 2.0 - 1.0;
             let right = x1 as f32 / viewport_w as f32 * 2.0 - 1.0;
             let top = 1.0 - y0 as f32 / viewport_h as f32 * 2.0;
             let bottom = 1.0 - y1 as f32 / viewport_h as f32 * 2.0;
+
+            // `blur` is in bitmap pixels, so dividing by the tile size gives
+            // the same bitmap-pixel tap offset in every tile.
+            let params = if blur > 0.0 {
+                [blur / tile.w as f32, blur / tile.h as f32, 0.0, 0.0]
+            } else {
+                [0.0; 4]
+            };
 
             let start = vertices.len() as u32;
             let mut push = |position: [f32; 2], uv: [f32; 2]| {
@@ -617,14 +714,15 @@ impl GpuRenderer {
                     position,
                     uv,
                     color,
+                    params,
                 });
             };
-            push([left, top], [0.0, 0.0]);
-            push([right, top], [1.0, 0.0]);
-            push([left, bottom], [0.0, 1.0]);
-            push([right, top], [1.0, 0.0]);
-            push([right, bottom], [1.0, 1.0]);
-            push([left, bottom], [0.0, 1.0]);
+            push([left, top], [u0, v0]);
+            push([right, top], [u1, v0]);
+            push([left, bottom], [u0, v1]);
+            push([right, top], [u1, v0]);
+            push([right, bottom], [u1, v1]);
+            push([left, bottom], [u0, v1]);
 
             let can_merge = batches.last().is_some_and(|batch| {
                 std::ptr::eq(batch.bind_group, &tile.bind_group) && batch.scissor == scissor
@@ -643,6 +741,42 @@ impl GpuRenderer {
             }
         }
     }
+}
+
+/// Map the part of a texture tile that falls inside a source window into the
+/// destination rectangle. Returns the screen rect and `[u0, v0, u1, v1]`.
+///
+/// The source window is in bitmap pixels and `dst` is the screen rectangle it
+/// maps onto. Keeping the requested window, rather than clamping it to the
+/// texture, means an out-of-bounds window leaves the missing part blank
+/// instead of stretching the visible part across `dst`.
+fn tile_quad(
+    dst: Rect,
+    (sx, sy, sw, sh): (i32, i32, i32, i32),
+    (tx, ty, tw, th): (i32, i32, i32, i32),
+) -> Option<(Rect, [f32; 4])> {
+    if sw <= 0 || sh <= 0 || tw <= 0 || th <= 0 || dst.w <= 0 || dst.h <= 0 {
+        return None;
+    }
+    let ix0 = tx.max(sx);
+    let iy0 = ty.max(sy);
+    let ix1 = tx.saturating_add(tw).min(sx.saturating_add(sw));
+    let iy1 = ty.saturating_add(th).min(sy.saturating_add(sh));
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return None;
+    }
+    let x0 = dst.x + ((ix0 - sx) as i64 * dst.w as i64 / sw as i64) as i32;
+    let x1 = dst.x + ((ix1 - sx) as i64 * dst.w as i64 / sw as i64) as i32;
+    let y0 = dst.y + ((iy0 - sy) as i64 * dst.h as i64 / sh as i64) as i32;
+    let y1 = dst.y + ((iy1 - sy) as i64 * dst.h as i64 / sh as i64) as i32;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let u0 = (ix0 - tx) as f32 / tw as f32;
+    let u1 = (ix1 - tx) as f32 / tw as f32;
+    let v0 = (iy0 - ty) as f32 / th as f32;
+    let v1 = (iy1 - ty) as f32 / th as f32;
+    Some((Rect::new(x0, y0, x1 - x0, y1 - y0), [u0, v0, u1, v1]))
 }
 
 fn srgb_to_linear(value: f32) -> f32 {
@@ -679,5 +813,41 @@ mod tests {
             rgb(0x0012_3456, 0.5),
             [18.0 / 255.0, 52.0 / 255.0, 86.0 / 255.0, 0.5]
         );
+    }
+
+    #[test]
+    fn tile_quad_maps_a_full_tile() {
+        let dst = Rect::new(10, 20, 100, 200);
+        let (rect, uv) = tile_quad(dst, (0, 0, 100, 200), (0, 0, 100, 200)).unwrap();
+        assert_eq!(rect, dst);
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn tile_quad_maps_a_source_subrect() {
+        let dst = Rect::new(0, 0, 50, 50);
+        let (rect, uv) = tile_quad(dst, (25, 0, 50, 100), (0, 0, 100, 100)).unwrap();
+        assert_eq!(rect, dst);
+        assert_eq!(uv, [0.25, 0.0, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn tile_quad_splits_a_source_across_tiles_without_seams() {
+        let dst = Rect::new(0, 0, 80, 100);
+        let src = (50, 0, 40, 100);
+        let (left, left_uv) = tile_quad(dst, src, (0, 0, 60, 100)).unwrap();
+        let (right, right_uv) = tile_quad(dst, src, (60, 0, 40, 100)).unwrap();
+        assert_eq!(left, Rect::new(0, 0, 20, 100));
+        assert_eq!(right, Rect::new(20, 0, 60, 100));
+        assert_eq!(left_uv, [50.0 / 60.0, 0.0, 1.0, 1.0]);
+        assert_eq!(right_uv, [0.0, 0.0, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn tile_quad_leaves_out_of_bounds_source_blank() {
+        let dst = Rect::new(0, 0, 120, 100);
+        let (rect, uv) = tile_quad(dst, (-10, 0, 120, 100), (0, 0, 100, 100)).unwrap();
+        assert_eq!(rect, Rect::new(10, 0, 100, 100));
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
     }
 }

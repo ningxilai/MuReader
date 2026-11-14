@@ -125,6 +125,10 @@ const PAGED_SWIPE_GAP: Duration = Duration::from_millis(180);
 /// How much one axis must dominate the other before wheel motion counts as a
 /// horizontal swipe. Diagonal jitter during a vertical gesture stays ignored.
 const PAGED_SWIPE_AXIS_RATIO: f32 = 1.5;
+/// Peak Gaussian radius of the page-turn cross-fade, in device pixels. The
+/// blur follows a `4t(1-t)` envelope, so it is zero at both ends of the turn
+/// and reaches this value halfway through.
+const CROSSFADE_BLUR_PX: f32 = 1.5;
 
 const PAGE_TEXTURE: u64 = 1;
 const OUTLINE_TEXTURE: u64 = 2;
@@ -448,6 +452,11 @@ struct SpreadAnimation {
     started: Instant,
     from: f32,
     to: f32,
+    /// Width of the destination spread in bitmap pixels. The cross-fade only
+    /// runs when it matches the current spread's width.
+    to_width: u32,
+    /// Eased progress, 0 at the old spread and 1 at the new one.
+    progress: f32,
     duration: Duration,
     command: TurnDirection,
 }
@@ -937,6 +946,12 @@ impl App {
         } else {
             pages
         }
+    }
+
+    /// Width of the spread that starts at `index`, including the gutter when a
+    /// second page is present.
+    fn width_for_index(&self, index: usize) -> u32 {
+        spread_width_for_index(&self.page_widths, self.spread_gap, index)
     }
 
     fn offset_for_index(&self, index: usize) -> f32 {
@@ -3355,24 +3370,81 @@ impl App {
         };
         let from = self.spread_offset;
         let to = self.offset_for_index(target_index);
+        let to_width = self.width_for_index(target_index);
         self.animation = Some(SpreadAnimation {
             started: Instant::now(),
             from,
             to,
+            to_width,
+            progress: 0.0,
             duration: self.page_turn_duration,
             command: direction,
         });
         self.request_redraw();
     }
 
-    fn tick_animation(&mut self) {
+    /// Whether the in-flight turn can cross-fade instead of sliding.
+    ///
+    /// The fade draws the old and new spread windows from the same strip
+    /// texture, so both must have the same width and the bitmap must upload as
+    /// a single tile. Anything else keeps the existing slide.
+    fn crossfade_ready(&self) -> bool {
         let Some(animation) = self.animation.as_ref() else {
+            return false;
+        };
+        if self.scroll_mode() {
+            return false;
+        }
+        // A resize preview draws the old strip at a fitted scale; let the
+        // slide keep moving until the worker lands the new bitmap.
+        if self.resize_preview {
+            return false;
+        }
+        let Some(page) = self.bitmap.as_ref() else {
+            return false;
+        };
+        let width = self.visible_width();
+        if width == 0 || animation.to_width != width {
+            return false;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        if !gpu.can_crossfade(page.width, page.height) {
+            return false;
+        }
+        let from = animation.from.round() as i32;
+        let to = animation.to.round() as i32;
+        let width = width as i32;
+        from >= 0 && to >= 0 && from + width <= page.width as i32 && to + width <= page.width as i32
+    }
+
+    /// Cross-fade parameters for the current frame: old offset, new offset,
+    /// new spread width, and eased progress.
+    fn crossfade(&self) -> Option<(i32, i32, u32, f32)> {
+        if !self.crossfade_ready() {
+            return None;
+        }
+        let animation = self.animation.as_ref()?;
+        Some((
+            animation.from.round() as i32,
+            animation.to.round() as i32,
+            animation.to_width,
+            animation.progress,
+        ))
+    }
+
+    fn tick_animation(&mut self) {
+        if self.animation.is_none() {
+            return;
+        }
+        // Read this before taking the mutable borrow below.
+        let crossfade = self.crossfade_ready();
+        let Some(animation) = self.animation.as_mut() else {
             return;
         };
         let elapsed = animation.started.elapsed();
         let duration = animation.duration;
-        let from = animation.from;
-        let to = animation.to;
         if elapsed >= duration {
             self.finish_animation();
             return;
@@ -3385,7 +3457,14 @@ impl App {
         } else {
             1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
         };
-        self.spread_offset = from + (to - from) * eased;
+        animation.progress = eased;
+        if crossfade {
+            // Keep the old spread under the pointer and hit-testing until the
+            // fade lands; the shader mixes the new window on top.
+            self.spread_offset = animation.from;
+        } else {
+            self.spread_offset = animation.from + (animation.to - animation.from) * eased;
+        }
         self.request_redraw();
     }
 
@@ -3849,12 +3928,38 @@ impl App {
                 let display_width = (visible_width as f32 * scale).round().max(1.0) as i32;
                 let window_left = page_left_offset(viewport, content_left, display_width as u32)
                     - (self.scroll_x * scale).round() as i32;
-                let origin_x = window_left - (self.spread_offset * scale).round() as i32;
                 let y0 =
                     self.page_vertical_offset(page.height) - (self.scroll_y * scale).round() as i32;
                 let clip = Rect::new(window_left, 0, display_width, vh);
-                list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
-                self.draw_text_overlays(&mut list, origin_x, y0, scale, clip);
+                if let Some((from, to, to_width, progress)) = self.crossfade() {
+                    // Both windows are the same size, so they share one
+                    // destination rect. The old spread stays opaque and the
+                    // new one is blended on top: exactly `mix(old, new, t)`.
+                    let dst = Rect::new(window_left, y0, display_width, bh);
+                    let envelope = 4.0 * progress * (1.0 - progress);
+                    let blur = CROSSFADE_BLUR_PX / scale.max(0.01) * envelope;
+                    let src_h = page.height as i32;
+                    list.texture_region(
+                        PAGE_TEXTURE,
+                        dst,
+                        Some(Rect::new(from, 0, visible_width, src_h)),
+                        clip,
+                        [1.0, 1.0, 1.0, 1.0],
+                        blur,
+                    );
+                    list.texture_region(
+                        PAGE_TEXTURE,
+                        dst,
+                        Some(Rect::new(to, 0, to_width as i32, src_h)),
+                        clip,
+                        [1.0, 1.0, 1.0, progress],
+                        blur,
+                    );
+                } else {
+                    let origin_x = window_left - (self.spread_offset * scale).round() as i32;
+                    list.texture(PAGE_TEXTURE, Rect::new(origin_x, y0, bw, bh), clip);
+                    self.draw_text_overlays(&mut list, origin_x, y0, scale, clip);
+                }
             }
         }
 
@@ -4328,6 +4433,18 @@ fn window_index_for(pages: &[usize], page: usize) -> usize {
         .iter()
         .position(|&candidate| candidate == page)
         .unwrap_or(0)
+}
+
+/// Width of the spread starting at `index`: one page, or two pages plus the
+/// gutter when the strip has another page.
+fn spread_width_for_index(page_widths: &[u32], gap: u32, index: usize) -> u32 {
+    let Some(&first) = page_widths.get(index) else {
+        return 0;
+    };
+    match page_widths.get(index + 1) {
+        Some(&second) => first.saturating_add(second).saturating_add(gap),
+        None => first,
+    }
 }
 
 /// Decide whether the rendered scroll window should slide to keep lookahead in
@@ -5269,6 +5386,15 @@ mod tests {
         assert_eq!(window_index_for(&[1, 3, 4, 6], 3), 1);
         assert_eq!(window_index_for(&[2, 4], 2), 0);
         assert_eq!(window_index_for(&[], 7), 0);
+    }
+
+    #[test]
+    fn spread_width_adds_the_gutter_only_with_a_second_page() {
+        let widths = [100, 120, 80];
+        assert_eq!(spread_width_for_index(&widths, 4, 0), 224);
+        assert_eq!(spread_width_for_index(&widths, 4, 1), 204);
+        assert_eq!(spread_width_for_index(&widths, 4, 2), 80);
+        assert_eq!(spread_width_for_index(&widths, 4, 3), 0);
     }
 
     #[test]
