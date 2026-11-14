@@ -16,10 +16,11 @@ window_fit_ms = 120
 [reflowable]
 # Per-document styles are not configured here. On first open MuReader writes a
 # sidecar stylesheet at
-#   $XDG_DATA_HOME/mureader/css/<sha256>.css
-# and you edit that file from then on. MUREADER_CSS_DIR overrides the
-# directory. See README.md for the sidecar marker, theme tokens, and migration
-# from the old css, css_file, and [perfect_palette] options.
+#   $XDG_DATA_HOME/mureader/css/<name>-<sha256>.css
+# and you edit that file from then on. For EPUB, <name> is the title embedded
+# in the book, not the file name. MUREADER_CSS_DIR overrides the directory.
+# See README.md for the sidecar marker, theme tokens, and migration from the
+# old css, css_file, and [perfect_palette] options.
 
 # Read plain-text files with Unicode line breaking and a total-fit pass.
 # MuPDF provides the handlers for txt and text files; formats without a MuPDF

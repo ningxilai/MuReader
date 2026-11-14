@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Auto-generated sidecar stylesheets.
 //!
-//! A sidecar is a stylesheet named after the SHA-256 of the document bytes:
-//! `$XDG_DATA_HOME/mureader/css/<sha256>.css`. Nothing in the config names
-//! it, so a book and its stylesheet travel together by content rather than by
-//! path. `MUREADER_CSS_DIR` overrides the directory; the old
-//! `MUREADER_CSS_CACHE` name is still accepted for migration.
+//! A sidecar is a stylesheet named after the document's embedded name and the
+//! SHA-256 of its bytes:
+//! `$XDG_DATA_HOME/mureader/css/<name>-<sha256>.css`. For EPUB, `name` is the
+//! title stored in the book's own metadata, not the file name. Other formats
+//! use the file stem. Nothing in the config names the sidecar, so a book and
+//! its stylesheet travel together by content rather than by path.
+//! `MUREADER_CSS_DIR` overrides the directory.
 //!
 //! A missing sidecar is created on the first open of a reflowable document
 //! from the legacy config CSS and palette. After that the file belongs to the
@@ -26,6 +28,10 @@ use sha2::{Digest, Sha256};
 /// huge file would stall the worker before the first page is rendered.
 const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Keep the readable part of a sidecar name well inside the usual 255-byte
+/// filename limit, leaving room for the hyphen, 64-hex hash, and `.css`.
+const MAX_NAME_BYTES: usize = 120;
+
 /// The first line that makes a sidecar replace the document's own stylesheet
 /// instead of overlaying it.
 pub const REPLACE_DOCUMENT_CSS_MARKER: &str = "/* mureader: replace-document-css */";
@@ -41,8 +47,8 @@ const REFLOWABLE_EXTENSIONS: &[&str] = &[
 pub enum Loaded {
     /// The file exists and was read successfully.
     Present(String),
-    /// No sidecar exists yet; the caller may seed one.
-    Missing,
+    /// No sidecar exists yet; the caller may seed one at this path.
+    Missing(PathBuf),
     /// A sidecar exists but cannot be used. The document's own CSS is the
     /// fallback, never the legacy config CSS.
     Failed,
@@ -51,10 +57,6 @@ pub enum Loaded {
 /// The directory that holds sidecar stylesheets.
 pub fn css_dir() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("MUREADER_CSS_DIR").filter(|dir| !dir.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    // Legacy name from the cache-based sidecar model.
-    if let Some(dir) = env::var_os("MUREADER_CSS_CACHE").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     xdg_data_home(env::var_os("XDG_DATA_HOME"), env::var_os("HOME"))
@@ -103,7 +105,96 @@ pub fn file_for(document: &Path, dir: &Path) -> io::Result<Option<PathBuf>> {
     if !is_reflowable_path(document) {
         return Ok(None);
     }
-    Ok(Some(dir.join(format!("{}.css", document_hash(document)?))))
+    let hash = document_hash(document)?;
+    Ok(Some(
+        dir.join(format!("{}-{hash}.css", document_name(document))),
+    ))
+}
+
+/// The readable part of a sidecar name. EPUB uses the title from the book's
+/// own metadata; every other format falls back to the file stem.
+fn document_name(document: &Path) -> String {
+    let raw = embedded_title(document)
+        .or_else(|| {
+            document
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    sanitize_name(&raw)
+}
+
+/// Read the EPUB title through MuPDF. Opening the book is deferred to a short
+/// thread so the UI thread never touches MuPDF. A file that is not a ZIP EPUB
+/// is skipped before opening.
+fn embedded_title(document: &Path) -> Option<String> {
+    let is_epub = document
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"));
+    if !is_epub || !is_zip(document) {
+        return None;
+    }
+    let path = document.to_path_buf();
+    std::thread::spawn(move || {
+        let document = mupdf::Document::open(path.as_path()).ok()?;
+        document.metadata(mupdf::MetadataName::Title).ok()
+    })
+    .join()
+    .ok()
+    .flatten()
+    .map(|title| title.trim().to_string())
+    .filter(|title| !title.is_empty())
+}
+
+fn is_zip(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"PK\x03\x04"
+}
+
+/// Turn a title into one path component. Separators and control characters
+/// become dashes, empty names fall back to `document`, and long titles are cut
+/// on a UTF-8 boundary.
+fn sanitize_name(raw: &str) -> String {
+    let mut name = String::new();
+    let mut pending_dash = false;
+    for ch in raw.trim().chars() {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '\0') {
+            pending_dash = !name.is_empty();
+            continue;
+        }
+        if pending_dash && !name.ends_with('-') {
+            name.push('-');
+        }
+        pending_dash = false;
+        name.push(ch);
+    }
+    let name = truncate_name(name.trim_matches(is_name_edge));
+    if name.is_empty() || name == "." || name == ".." {
+        return "document".to_string();
+    }
+    if name.starts_with('.') {
+        return format!("_{name}");
+    }
+    name.to_string()
+}
+
+fn is_name_edge(ch: char) -> bool {
+    ch == '-' || ch == '.' || ch.is_whitespace()
+}
+
+fn truncate_name(name: &str) -> &str {
+    if name.len() <= MAX_NAME_BYTES {
+        return name;
+    }
+    let mut end = MAX_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].trim_end_matches(is_name_edge)
 }
 
 /// Whether the sidecar asks MuPDF to ignore the document's own stylesheet.
@@ -123,18 +214,29 @@ pub fn load(document: &Path) -> Option<Loaded> {
         return None;
     }
     Some(match css_dir() {
-        Some(dir) => load_from_dir(document, &dir),
-        None => Loaded::Missing,
+        Some(dir) => load_from_dir(document, &dir).unwrap_or(Loaded::Failed),
+        None => Loaded::Failed,
     })
 }
 
-/// Load the sidecar for a document from a specific directory. A missing
-/// sidecar is normal and silent; an unreadable or oversized one is reported
-/// and reported as [`Loaded::Failed`].
-pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
+/// Load the sidecar for a document from a specific directory. Returns `None`
+/// for formats that never use a sidecar. A missing sidecar is normal and
+/// silent; an unreadable or oversized one is reported as [`Loaded::Failed`].
+pub fn load_from_dir(document: &Path, dir: &Path) -> Option<Loaded> {
     if !is_reflowable_path(document) {
-        return Loaded::Missing;
+        return None;
     }
+    let path = match file_for(document, dir) {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!(
+                "MuReader: cannot hash {} for sidecar CSS: {error}",
+                document.display()
+            );
+            return Some(Loaded::Failed);
+        }
+    };
     match fs::metadata(dir) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
@@ -142,37 +244,26 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
                 "MuReader: cannot use sidecar directory {}: not a directory",
                 dir.display()
             );
-            return Loaded::Failed;
+            return Some(Loaded::Failed);
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => return Loaded::Missing,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Some(Loaded::Missing(path)),
         Err(error) => {
             eprintln!(
                 "MuReader: cannot inspect sidecar directory {}: {error}",
                 dir.display()
             );
-            return Loaded::Failed;
+            return Some(Loaded::Failed);
         }
     }
-    let path = match file_for(document, dir) {
-        Ok(Some(path)) => path,
-        Ok(None) => return Loaded::Missing,
-        Err(error) => {
-            eprintln!(
-                "MuReader: cannot hash {} for sidecar CSS: {error}",
-                document.display()
-            );
-            return Loaded::Failed;
-        }
-    };
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Loaded::Missing,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Some(Loaded::Missing(path)),
         Err(error) => {
             eprintln!(
                 "MuReader: cannot inspect sidecar CSS {}: {error}",
                 path.display()
             );
-            return Loaded::Failed;
+            return Some(Loaded::Failed);
         }
     };
     if !metadata.is_file() {
@@ -180,7 +271,7 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
             "MuReader: ignoring sidecar CSS {}: not a regular file",
             path.display()
         );
-        return Loaded::Failed;
+        return Some(Loaded::Failed);
     }
     if metadata.len() > MAX_SIDECAR_BYTES {
         eprintln!(
@@ -189,7 +280,7 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
             metadata.len(),
             MAX_SIDECAR_BYTES
         );
-        return Loaded::Failed;
+        return Some(Loaded::Failed);
     }
     let mut file = match File::open(&path) {
         Ok(file) => file,
@@ -198,7 +289,7 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
                 "MuReader: cannot read sidecar CSS {}: {error}",
                 path.display()
             );
-            return Loaded::Failed;
+            return Some(Loaded::Failed);
         }
     };
     let mut bytes = Vec::new();
@@ -211,7 +302,7 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
             "MuReader: cannot read sidecar CSS {}: {error}",
             path.display()
         );
-        return Loaded::Failed;
+        return Some(Loaded::Failed);
     }
     if bytes.len() as u64 > MAX_SIDECAR_BYTES {
         eprintln!(
@@ -219,9 +310,9 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
             path.display(),
             MAX_SIDECAR_BYTES
         );
-        return Loaded::Failed;
+        return Some(Loaded::Failed);
     }
-    match String::from_utf8(bytes) {
+    Some(match String::from_utf8(bytes) {
         Ok(css) => Loaded::Present(css),
         Err(error) => {
             eprintln!(
@@ -230,50 +321,38 @@ pub fn load_from_dir(document: &Path, dir: &Path) -> Loaded {
             );
             Loaded::Failed
         }
-    }
+    })
 }
 
-/// Write the first sidecar for a document. Returns `None` for formats that
-/// never use a sidecar. An existing file is never overwritten, so a sidecar
-/// created by another process (or by the user) stays authoritative.
-pub fn write(document: &Path, css: &str) -> io::Result<Option<PathBuf>> {
-    let Some(dir) = css_dir() else {
-        return Err(io::Error::new(
-            ErrorKind::NotFound,
-            "no data directory for sidecar CSS",
-        ));
-    };
-    write_to_dir(document, &dir, css)
-}
-
-/// Write a sidecar into a specific directory. The file is written to a
-/// temporary neighbour and linked into place, so a crash cannot leave a
-/// partial stylesheet under the real name.
-pub fn write_to_dir(document: &Path, dir: &Path, css: &str) -> io::Result<Option<PathBuf>> {
-    let Some(path) = file_for(document, dir)? else {
-        return Ok(None);
-    };
+/// Write a sidecar to a path returned by [`file_for`]. The file is written to
+/// a temporary neighbour and linked into place, so a crash cannot leave a
+/// partial stylesheet under the real name. An existing file is never
+/// overwritten, so a sidecar created by another process (or by the user) stays
+/// authoritative.
+pub fn write_path(path: &Path, css: &str) -> io::Result<()> {
     if css.len() as u64 > MAX_SIDECAR_BYTES {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("sidecar CSS exceeds the {MAX_SIDECAR_BYTES} byte limit"),
         ));
     }
-    fs::create_dir_all(dir)?;
-    let temp = temp_path(&path);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let temp = temp_path(path);
     let _ = fs::remove_file(&temp);
     fs::write(&temp, css)?;
-    let result = match fs::hard_link(&temp, &path) {
+    let result = match fs::hard_link(&temp, path) {
         Ok(()) => Ok(()),
         // Another process won the race. Its file is authoritative.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
         // Filesystems without hard links still get an atomic rename; the
         // missing-file check above already covered the ordinary case.
-        Err(error) if error.kind() == ErrorKind::Unsupported => fs::rename(&temp, &path),
+        Err(error) if error.kind() == ErrorKind::Unsupported => fs::rename(&temp, path),
         Err(error) => Err(error),
     };
     let _ = fs::remove_file(&temp);
-    result.map(|()| Some(path))
+    result
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -316,11 +395,17 @@ mod tests {
         let document = dir.join("book.epub");
         fs::write(&document, b"book bytes").unwrap();
         let hash = document_hash(&document).unwrap();
-        fs::write(dir.join(format!("{hash}.css")), "body { color: #123456; }").unwrap();
+        let path = file_for(&document, &dir).unwrap().unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("book-{hash}.css"),
+            "a non-ZIP EPUB falls back to the file stem"
+        );
+        fs::write(&path, "body { color: #123456; }").unwrap();
 
         assert_eq!(
             load_from_dir(&document, &dir),
-            Loaded::Present("body { color: #123456; }".to_string())
+            Some(Loaded::Present("body { color: #123456; }".to_string()))
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -330,16 +415,11 @@ mod tests {
         let dir = test_dir("sidecar-fixed");
         let document = dir.join("book.pdf");
         fs::write(&document, b"pdf bytes").unwrap();
-        let hash = document_hash(&document).unwrap();
-        fs::write(dir.join(format!("{hash}.css")), "body { color: red; }").unwrap();
 
         assert!(!is_reflowable_path(&document));
         assert_eq!(load(&document), None);
-        assert_eq!(load_from_dir(&document, &dir), Loaded::Missing);
-        assert_eq!(
-            write_to_dir(&document, &dir, "body { color: red; }").unwrap(),
-            None
-        );
+        assert_eq!(load_from_dir(&document, &dir), None);
+        assert_eq!(file_for(&document, &dir).unwrap(), None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -348,11 +428,14 @@ mod tests {
         let dir = test_dir("sidecar-missing");
         let document = dir.join("book.epub");
         fs::write(&document, b"book bytes").unwrap();
-        assert_eq!(load_from_dir(&document, &dir), Loaded::Missing);
-        assert_eq!(
+        assert!(matches!(
+            load_from_dir(&document, &dir),
+            Some(Loaded::Missing(_))
+        ));
+        assert!(matches!(
             load_from_dir(&document, &dir.join("absent")),
-            Loaded::Missing
-        );
+            Some(Loaded::Missing(_))
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -361,13 +444,12 @@ mod tests {
         let dir = test_dir("sidecar-large");
         let document = dir.join("book.epub");
         fs::write(&document, b"book bytes").unwrap();
-        let hash = document_hash(&document).unwrap();
-        let sidecar = dir.join(format!("{hash}.css"));
+        let sidecar = file_for(&document, &dir).unwrap().unwrap();
         let file = File::create(&sidecar).unwrap();
         file.set_len(MAX_SIDECAR_BYTES + 1).unwrap();
         drop(file);
 
-        assert_eq!(load_from_dir(&document, &dir), Loaded::Failed);
+        assert_eq!(load_from_dir(&document, &dir), Some(Loaded::Failed));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -376,10 +458,10 @@ mod tests {
         let dir = test_dir("sidecar-utf8");
         let document = dir.join("book.epub");
         fs::write(&document, b"book bytes").unwrap();
-        let hash = document_hash(&document).unwrap();
-        fs::write(dir.join(format!("{hash}.css")), [0xff, 0xfe, 0x00]).unwrap();
+        let sidecar = file_for(&document, &dir).unwrap().unwrap();
+        fs::write(&sidecar, [0xff, 0xfe, 0x00]).unwrap();
 
-        assert_eq!(load_from_dir(&document, &dir), Loaded::Failed);
+        assert_eq!(load_from_dir(&document, &dir), Some(Loaded::Failed));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -388,22 +470,40 @@ mod tests {
         let dir = test_dir("sidecar-write");
         let document = dir.join("book.epub");
         fs::write(&document, b"book bytes").unwrap();
+        let path = file_for(&document, &dir).unwrap().unwrap();
 
-        let path = write_to_dir(&document, &dir, "body { color: #123456; }")
-            .unwrap()
-            .unwrap();
+        write_path(&path, "body { color: #123456; }").unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "body { color: #123456; }"
         );
 
         // A second seed must not overwrite what the user now owns.
-        write_to_dir(&document, &dir, "body { color: #abcdef; }").unwrap();
+        write_path(&path, "body { color: #abcdef; }").unwrap();
         assert_eq!(
             load_from_dir(&document, &dir),
-            Loaded::Present("body { color: #123456; }".to_string())
+            Some(Loaded::Present("body { color: #123456; }".to_string()))
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_name_is_readable_and_safe() {
+        assert_eq!(sanitize_name("The Little Prince"), "The Little Prince");
+        assert_eq!(sanitize_name("  a/b\\c:d\n"), "a-b-c-d");
+        assert_eq!(sanitize_name("   "), "document");
+        assert_eq!(sanitize_name("."), "document");
+        assert_eq!(sanitize_name(".."), "document");
+        assert_eq!(sanitize_name(".hidden"), "hidden");
+        assert_eq!(sanitize_name("小王子"), "小王子");
+    }
+
+    #[test]
+    fn long_names_are_cut_on_a_utf8_boundary() {
+        let name = sanitize_name(&"小".repeat(100));
+        assert!(name.len() <= MAX_NAME_BYTES);
+        assert!(name.is_char_boundary(name.len()));
+        assert!(!name.is_empty());
     }
 
     #[test]
@@ -422,6 +522,140 @@ mod tests {
             "body {{ color: red; }}\n{REPLACE_DOCUMENT_CSS_MARKER}"
         )));
         assert!(!replaces_document_css("body { color: red; }"));
+    }
+
+    /// A minimal, valid EPUB, used to check that the embedded `dc:title` and
+    /// not the file name names the sidecar.
+    fn write_epub(path: &Path, title: &str) {
+        let container = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="id">urn:uuid:mureader-test</dc:identifier>
+<dc:title>{title}</dc:title>
+<dc:language>en</dc:language>
+</metadata>
+<manifest>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+</manifest>
+<spine toc="ncx"><itemref idref="chapter"/></spine>
+</package>"#
+        );
+        let ncx = r#"<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head/><docTitle><text>Test</text></docTitle>
+<navMap><navPoint id="n1" playOrder="1"><navLabel><text>Chapter</text></navLabel><content src="chapter.xhtml"/></navPoint></navMap>
+</ncx>"#;
+        let chapter = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><p>Hello.</p></body></html>"#;
+        let files: &[(&str, &[u8])] = &[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", container.as_bytes()),
+            ("OEBPS/content.opf", opf.as_bytes()),
+            ("OEBPS/toc.ncx", ncx.as_bytes()),
+            ("OEBPS/chapter.xhtml", chapter.as_bytes()),
+        ];
+        fs::write(path, zip_stored(files)).unwrap();
+    }
+
+    /// Build a ZIP archive with every entry stored uncompressed. EPUB requires
+    /// the `mimetype` entry first and uncompressed, which this ordering keeps.
+    fn zip_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut directory = Vec::new();
+        for (name, data) in files {
+            let offset = out.len() as u32;
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            push_u32(&mut out, 0x0403_4b50);
+            push_u16(&mut out, 20);
+            push_u16(&mut out, 0);
+            push_u16(&mut out, 0); // stored
+            push_u16(&mut out, 0);
+            push_u16(&mut out, 0);
+            push_u32(&mut out, crc);
+            push_u32(&mut out, size);
+            push_u32(&mut out, size);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, 0);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            push_u32(&mut directory, 0x0201_4b50);
+            push_u16(&mut directory, 20);
+            push_u16(&mut directory, 20);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u32(&mut directory, crc);
+            push_u32(&mut directory, size);
+            push_u32(&mut directory, size);
+            push_u16(&mut directory, name.len() as u16);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u16(&mut directory, 0);
+            push_u32(&mut directory, 0);
+            push_u32(&mut directory, offset);
+            directory.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = directory.len() as u32;
+        out.extend_from_slice(&directory);
+        push_u32(&mut out, 0x0605_4b50);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, files.len() as u16);
+        push_u16(&mut out, files.len() as u16);
+        push_u32(&mut out, cd_size);
+        push_u32(&mut out, cd_offset);
+        push_u16(&mut out, 0);
+        out
+    }
+
+    fn push_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn epub_sidecar_uses_the_embedded_title() {
+        let dir = test_dir("sidecar-epub-title");
+        let document = dir.join("book.epub");
+        write_epub(&document, "The Little Prince");
+
+        assert_eq!(
+            embedded_title(&document).as_deref(),
+            Some("The Little Prince")
+        );
+        let hash = document_hash(&document).unwrap();
+        let path = file_for(&document, &dir).unwrap().unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("The Little Prince-{hash}.css")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

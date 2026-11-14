@@ -4596,16 +4596,15 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
         None => None,
         Some(sidecar::Loaded::Present(css)) => Some(css),
         Some(sidecar::Loaded::Failed) => None,
-        Some(sidecar::Loaded::Missing) => {
+        Some(sidecar::Loaded::Missing(sidecar_path)) => {
             let seed = seed_sidecar_css(&config);
-            match sidecar::write(&path, &seed) {
-                Ok(Some(written)) => {
-                    eprintln!("MuReader: wrote sidecar CSS to {}", written.display());
+            match sidecar::write_path(&sidecar_path, &seed) {
+                Ok(()) => {
+                    eprintln!("MuReader: wrote sidecar CSS to {}", sidecar_path.display());
                 }
-                Ok(None) => {}
                 Err(error) => eprintln!(
-                    "MuReader: cannot write sidecar CSS for {}: {error}",
-                    path.display()
+                    "MuReader: cannot write sidecar CSS {}: {error}",
+                    sidecar_path.display()
                 ),
             }
             Some(seed)

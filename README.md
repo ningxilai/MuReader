@@ -188,11 +188,12 @@ Per-document styling is not configured in `config.toml`. MuReader hashes the
 document bytes with SHA-256 and uses:
 
 ```text
-$XDG_DATA_HOME/mureader/css/<sha256>.css
+$XDG_DATA_HOME/mureader/css/<name>-<sha256>.css
 ```
 
-`MUREADER_CSS_DIR` overrides that directory; the old `MUREADER_CSS_CACHE`
-name is still accepted. The lookup applies to EPUB, HTML/XHTML, FB2, MOBI,
+`MUREADER_CSS_DIR` overrides that directory. For EPUB, `<name>` is the title
+embedded in the book's own metadata, not the file name. Other reflowable
+formats use the file stem. The lookup applies to EPUB, HTML/XHTML, FB2, MOBI,
 DOCX/XLSX/PPTX/HWPX, and TXT/text files.
 
 On the first open of a reflowable document, MuReader creates the sidecar from
@@ -303,8 +304,10 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 ### Unreleased
 
 - Per-document styling now lives in an auto-generated sidecar at
-  `$XDG_DATA_HOME/mureader/css/<sha256>.css`, keyed by the document's SHA-256.
-  On first open it is seeded from the legacy `[reflowable]` CSS and
+  `$XDG_DATA_HOME/mureader/css/<name>-<sha256>.css`, keyed by the document's
+  SHA-256. EPUB uses its embedded title for the readable part of the name;
+  other formats use the file stem. On first open it is seeded from the legacy
+  `[reflowable]` CSS and
   `[perfect_palette]`, sanitized with `cssparser` to the at-rules, properties,
   and URL forms MuPDF actually supports, and then owned by the user. Generated
   sidecars overlay the document CSS by default; a first-line
