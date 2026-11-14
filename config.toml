@@ -7,7 +7,9 @@
 # Set MUREADER_CONFIG to use a different file.
 
 [animation]
-# Page-turn slide duration in milliseconds.
+# Page-turn duration in milliseconds. Paged spreads cross-fade the old and new
+# page with a small Gaussian blur; tiled bitmaps and mismatched spread widths
+# fall back to a clipped slide. Set to 0 to turn pages without animation.
 page_turn_ms = 320
 # Delay before re-rendering after window resize; the old page is scaled
 # immediately while dragging.
