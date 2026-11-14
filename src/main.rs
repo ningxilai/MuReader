@@ -3973,6 +3973,11 @@ impl App {
                         [1.0, 1.0, 1.0, 1.0],
                         blur,
                     );
+                    // The highlights and selection belong to the old page.
+                    // Draw them between the layers so the incoming page fades
+                    // over them, instead of dropping them for the whole turn.
+                    let old_origin = window_left - (from as f32 * scale).round() as i32;
+                    self.draw_text_overlays(&mut list, old_origin, y0, scale, clip);
                     list.texture_region(
                         PAGE_TEXTURE,
                         dst,
