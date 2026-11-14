@@ -591,8 +591,9 @@ impl RenderEngine {
     }
 
     /// Open a document with explicit control over MuPDF's document stylesheet.
-    /// A sidecar replaces the document's CSS; pretty text always keeps it
-    /// because the generated HTML carries its required layout `<style>`.
+    /// A sidecar only turns it off when its replacement marker is present;
+    /// pretty text always keeps it because the generated HTML carries its
+    /// required layout `<style>`.
     pub fn open_with_document_css(
         path: &Path,
         fonts: Arc<FontCatalog>,

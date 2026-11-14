@@ -49,7 +49,10 @@ impl Default for AnimationConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ReflowableConfig {
+    /// Legacy inline CSS. Only used to seed a document's sidecar on first
+    /// open; edit the sidecar afterwards.
     pub css: Option<String>,
+    /// Legacy CSS file. Like [`Self::css`], it only seeds a sidecar.
     pub css_file: Option<String>,
     /// Reflow plain text with the Unicode line-break pass before MuPDF
     /// renders it. This is a TXT-only subset, not an EPUB layout engine.
@@ -66,9 +69,10 @@ impl Default for ReflowableConfig {
     }
 }
 
-/// Optional eye-comfort palette ported from the `perfect-palette` helper in
-/// the user's Emacs configuration. It tunes the existing theme instead of
-/// replacing it, and only contributes CSS while `enable` is true.
+/// Legacy eye-comfort palette ported from the `perfect-palette` helper in the
+/// user's Emacs configuration. It is only used to seed a document's sidecar on
+/// first open, together with the legacy reflowable CSS; afterwards the
+/// generated sidecar is edited directly.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PerfectPaletteConfig {
@@ -141,16 +145,10 @@ impl ReflowableConfig {
 }
 
 impl Config {
-    /// The first `font-family` declared in the reflowable CSS. UI text and
-    /// document text share this primary face; glyph fallback remains shared.
-    pub fn font_family(&self) -> Option<String> {
-        let css = self.reflowable_css()?;
-        crate::css::StyleSheet::parse(&css).font_family()
-    }
-
-    /// Combine inline CSS and an optional CSS file. A relative file path is
-    /// resolved against the config file's directory. The returned stylesheet is
-    /// exactly the user's CSS; the optional palette is composed by the caller.
+    /// Combine the legacy inline CSS and an optional CSS file. A relative file
+    /// path is resolved against the config file's directory. The returned
+    /// stylesheet is exactly the legacy user CSS; the optional palette is
+    /// composed by the caller. This only seeds a sidecar on first open.
     pub fn reflowable_css(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(css) = self.reflowable.css() {
@@ -416,45 +414,5 @@ hpluv = false
         assert!(css.contains("background: black"));
         assert!(css.contains("color: red"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn finds_the_first_css_font_family() {
-        let mut config = Config::default();
-        config.reflowable.css = Some(
-            r#"
-@font-face { font-family: "Embedded Face"; src: url(x); }
-body { color: red; font-family: "FangSongCode", serif !important; }
-"#
-            .to_string(),
-        );
-        assert_eq!(config.font_family().as_deref(), Some("FangSongCode"));
-
-        config.reflowable.css = Some("body { font-family: 'Noto Serif', serif; }".to_string());
-        assert_eq!(config.font_family().as_deref(), Some("Noto Serif"));
-
-        config.reflowable.css = Some("body { color: red; }".to_string());
-        assert_eq!(config.font_family(), None);
-    }
-
-    #[test]
-    fn css_font_family_ignores_comments_face_blocks_and_case() {
-        let mut config = Config::default();
-        config.reflowable.css = Some(
-            r#"
-/* font-family: "Commented Out"; */
-@FONT-FACE { font-family: "Embedded Face"; src: url(x); }
-body {
-    --font-family: "Custom Property";
-    FONT-FAMILY: 'Real Face', serif !IMPORTANT;
-}
-"#
-            .to_string(),
-        );
-        assert_eq!(config.font_family().as_deref(), Some("Real Face"));
-
-        config.reflowable.css =
-            Some("body { --font-family: 'No'; font-family: 'Yes'; }".to_string());
-        assert_eq!(config.font_family().as_deref(), Some("Yes"));
     }
 }

@@ -14,81 +14,17 @@ page_turn_ms = 320
 window_fit_ms = 120
 
 [reflowable]
-# Custom CSS for reflowable documents (EPUB, HTML, TXT, FB2, MOBI, DOCX, ...).
-# Use !important where the document's own CSS should be overridden.
-#
-# The first font-family declared here is also used by the outline, prompts,
-# and other UI text. Missing glyphs (CJK, emoji, symbols) share the same
-# fallback chain, so there is no separate [fonts] section.
-#
-# The same CSS drives every non-reading color: the outline, command panel,
-# prompts, loading card, borders, and selection highlights. The effective
-# background/background-color and color on body, html, or :root set the base
-# surface and text, and all panel shades are derived from them. Optional
-# custom properties override individual parts:
-#
-#   --mureader-background     window behind the page
-#   --mureader-surface        outline, command panel, and prompt surface
-#   --mureader-text           primary UI text
-#   --mureader-muted          secondary UI text
-#   --mureader-accent         selection rails and accent text
-#   --mureader-border         panel borders
-#   --mureader-search         search-highlight color
-#   --mureader-selection      text-selection color
-#   --mureader-selected-text  selected outline/menu text
-#
-# Without CSS colors the UI follows the document: it starts from the HTML
-# default white canvas and dark text, then tracks the rendered page background
-# as pages arrive. CSS that only sets a font therefore changes nothing about
-# the palette.
-#
-# css = """
-# :root {
-#     --mureader-background: #1b1b1b;
-#     --mureader-surface: #242424;
-#     --mureader-text: #e8e2d8;
-#     --mureader-accent: #d7a45e;
-# }
-# body {
-#     font-family: "Noto Serif", "Droid Sans Fallback Full", sans-serif;
-# }
-# """
-css = ""
-# Optional CSS file, applied after the inline CSS. Relative paths are resolved
-# against this config file's directory.
-css_file = ""
-
-# A reflowable document can instead use a sidecar stylesheet discovered from
-# its SHA-256:
-#   $XDG_CACHE_HOME/mureader/css/<sha256>.css
-# MUREADER_CSS_CACHE overrides the directory. When present, the sidecar
-# replaces both this CSS and the document's own stylesheet, and
-# [perfect_palette] is not applied. It is sanitized to the CSS subset MuPDF
-# implements; unreadable, oversized, or empty sidecars fall back to this CSS.
-# Plain-text pretty layout keeps its generated document CSS.
+# Per-document styles are not configured here. On first open MuReader writes a
+# sidecar stylesheet at
+#   $XDG_DATA_HOME/mureader/css/<sha256>.css
+# and you edit that file from then on. MUREADER_CSS_DIR overrides the
+# directory. See README.md for the sidecar marker, theme tokens, and migration
+# from the old css, css_file, and [perfect_palette] options.
 
 # Read plain-text files with Unicode line breaking and a total-fit pass.
 # MuPDF provides the handlers for txt and text files; formats without a MuPDF
 # handler are not opened.
 pretty = true
-
-[perfect_palette]
-# Optional eye-comfort palette ported from the HPLuv helper in the Emacs
-# configuration. It softens the theme already implied by your [reflowable] CSS,
-# keeping its hue family, and recolors the page, UI accent, search, and
-# selection. When disabled, the CSS and colors are left exactly untouched.
-enable = false
-# Number of colors and hue step (p, q).
-colors = 9
-step = 4
-# Hue fraction used only when the existing theme is neutral (hue-start).
-# A tinted accent, window, or text color anchors the palette instead.
-hue_start = 0.58
-# Saturation and lightness in percent for the generated palette colors.
-saturation = 45
-lightness = 65
-# Use HPLuv (true) or ordinary HSL (false).
-hpluv = true
 
 [progress]
 # Number of documents whose last-read page is remembered. New entries

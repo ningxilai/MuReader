@@ -123,6 +123,7 @@ impl Theme {
     }
 
     /// Whether the CSS chooses any UI color.
+    #[cfg(test)]
     pub fn has_css_colors(css: Option<&str>) -> bool {
         match css {
             Some(css) if !css.trim().is_empty() => Self::from_sheet(&StyleSheet::parse(css)).1,

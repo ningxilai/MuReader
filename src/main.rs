@@ -657,7 +657,7 @@ struct App {
     last_requested_scale: f32,
     css: Option<String>,
     /// Whether MuPDF should apply the document's own stylesheet. A sidecar
-    /// replaces both the config CSS and the document CSS.
+    /// overlays it unless its first line carries the replacement marker.
     document_css: bool,
     pretty_text: bool,
     page_turn_duration: Duration,
@@ -4503,49 +4503,82 @@ struct Styles {
     font_family: Option<String>,
 }
 
-/// Compose the stylesheet the reader actually applies.
+/// Compose the stylesheet the reader actually applies from its sidecar.
 ///
-/// A sidecar replaces both the config CSS and the document CSS: it is
-/// sanitized, the eye-comfort palette is not appended (the sidecar is already
-/// a complete palette), and the theme is derived from the sanitized result.
-/// Without a sidecar, the eye-comfort palette is a transformation of the
-/// theme implied by the user's CSS, so its rules come after that CSS.
-fn configured_styles(config: &Config, sidecar: Option<&str>) -> Styles {
-    if let Some(sidecar) = sidecar {
-        let sheet = css::StyleSheet::parse(sidecar);
-        let safe = sheet.safe_css();
-        if !safe.trim().is_empty() {
-            let applied = css::StyleSheet::parse(&safe);
-            let (theme, has_colors) = Theme::from_sheet(&applied);
-            return Styles {
-                css: Some(safe),
-                theme,
-                follow_document_theme: !has_colors,
-                document_css: false,
-                font_family: applied.font_family(),
-            };
-        }
-        eprintln!("MuReader: sidecar CSS has no usable rules; using config CSS");
+/// The sidecar is sanitized before MuPDF sees it and the theme is derived from
+/// the sanitized result. By default its rules overlay the document's own CSS;
+/// the first-line replacement marker turns the document CSS off. A sidecar
+/// with no usable rules is a placeholder: no user CSS is applied and the
+/// document CSS stays enabled. Without a sidecar (missing or unusable), only
+/// the document CSS is used; the legacy config CSS is never a fallback.
+fn configured_styles(sidecar: Option<&str>) -> Styles {
+    let Some(sidecar) = sidecar else {
+        return document_only_styles();
+    };
+    let replaces_document_css = sidecar::replaces_document_css(sidecar);
+    let sheet = css::StyleSheet::parse(sidecar);
+    let safe = sheet.safe_css();
+    if safe.trim().is_empty() {
+        return document_only_styles();
     }
+    let applied = css::StyleSheet::parse(&safe);
+    let (theme, has_colors) = Theme::from_sheet(&applied);
+    Styles {
+        css: Some(safe),
+        theme,
+        follow_document_theme: !has_colors,
+        document_css: !replaces_document_css,
+        font_family: applied.font_family(),
+    }
+}
 
-    let mut css = config.reflowable_css();
-    let mut theme = Theme::from_css(css.as_deref());
+/// The effective styles when only the document's own CSS applies.
+fn document_only_styles() -> Styles {
+    Styles {
+        css: None,
+        theme: Theme::html_default(),
+        follow_document_theme: true,
+        document_css: true,
+        font_family: None,
+    }
+}
+
+/// The initial sidecar content for a document that has none.
+///
+/// The legacy config CSS and the optional eye-comfort palette are composed
+/// exactly as the old pipeline did, then sanitized so the generated file only
+/// contains rules MuPDF can apply. The header explains that the file is now
+/// user-owned. The replacement marker is deliberately absent, so the default
+/// is to overlay the document's own CSS.
+fn seed_sidecar_css(config: &Config) -> String {
+    let mut source = config.reflowable_css();
     if config.perfect_palette.enable {
+        let theme = Theme::from_css(source.as_deref());
         let palette = palette::tune(theme, config.perfect_palette.options());
         let tuned = palette::css(&palette);
-        css = Some(match css {
+        source = Some(match source {
             Some(user) => format!("{user}\n{tuned}"),
             None => tuned,
         });
-        theme = Theme::from_css(css.as_deref());
     }
-    Styles {
-        follow_document_theme: !Theme::has_css_colors(css.as_deref()),
-        font_family: config.font_family(),
-        css,
-        theme,
-        document_css: true,
+
+    let mut css = String::from(
+        "/* MuReader sidecar stylesheet.\n\
+         *\n\
+         * Generated on first open from the legacy config CSS and palette, then\n\
+         * owned by you. Edit this file directly; config.toml no longer styles\n\
+         * documents. These rules are applied on top of the document's own CSS.\n\
+         * The first-line marker documented in README.md replaces the document\n\
+         * CSS instead. Delete this file to regenerate it on the next open.\n\
+         */\n",
+    );
+    if let Some(source) = source {
+        let safe = css::StyleSheet::parse(&source).safe_css();
+        if !safe.trim().is_empty() {
+            css.push_str(&safe);
+        }
     }
+    css
 }
 
 fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
@@ -4559,8 +4592,26 @@ fn run(path: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
             path
         }
     };
-    let sidecar = sidecar::load(&path);
-    let styles = configured_styles(&config, sidecar.as_deref());
+    let sidecar = match sidecar::load(&path) {
+        None => None,
+        Some(sidecar::Loaded::Present(css)) => Some(css),
+        Some(sidecar::Loaded::Failed) => None,
+        Some(sidecar::Loaded::Missing) => {
+            let seed = seed_sidecar_css(&config);
+            match sidecar::write(&path, &seed) {
+                Ok(Some(written)) => {
+                    eprintln!("MuReader: wrote sidecar CSS to {}", written.display());
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "MuReader: cannot write sidecar CSS for {}: {error}",
+                    path.display()
+                ),
+            }
+            Some(seed)
+        }
+    };
+    let styles = configured_styles(sidecar.as_deref());
     let fonts = Arc::new(FontCatalog::new(styles.font_family.as_deref())?);
     mupdf::set_font_loader(EpubFontLoader::new(fonts.clone()));
     let keymap = Keymap::new(&config.keys);
@@ -4692,22 +4743,17 @@ mod tests {
     }
 
     #[test]
-    fn disabled_palette_leaves_css_and_theme_untouched() {
-        let mut config = Config::default();
-        config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
-        let styles = configured_styles(&config, None);
-        assert_eq!(styles.css, config.reflowable_css());
-        assert_eq!(styles.theme, Theme::from_css(styles.css.as_deref()));
-        assert!(!styles.follow_document_theme);
+    fn missing_sidecar_uses_only_document_css() {
+        let styles = configured_styles(None);
+        assert_eq!(styles.css, None);
         assert!(styles.document_css);
-        assert_eq!(styles.font_family, config.font_family());
+        assert!(styles.follow_document_theme);
+        assert_eq!(styles.theme, Theme::html_default());
+        assert_eq!(styles.font_family, None);
     }
 
     #[test]
-    fn sidecar_replaces_config_css_and_document_css() {
-        let mut config = Config::default();
-        config.reflowable.css = Some("body { color: #ff0000; }".to_string());
-        config.perfect_palette.enable = true;
+    fn sidecar_overlays_document_css_by_default() {
         let sidecar = r#"
             body {
                 background: #101820;
@@ -4717,40 +4763,105 @@ mod tests {
             }
             @media print { body { color: red; } }
         "#;
-        let styles = configured_styles(&config, Some(sidecar));
+        let styles = configured_styles(Some(sidecar));
         let css = styles.css.unwrap();
         assert!(css.contains("background: #101820;"));
         assert!(css.contains("font-family: \"Sidecar Face\", serif;"));
-        assert!(!css.contains("#ff0000"));
         assert!(!css.contains("transform"));
         assert!(!css.contains("@media"));
-        assert!(!css.contains("--mureader-palette-0"));
-        assert!(!styles.document_css, "a sidecar replaces the document CSS");
+        assert!(
+            styles.document_css,
+            "a sidecar overlays the document CSS by default"
+        );
         assert!(!styles.follow_document_theme);
         assert_eq!(styles.font_family.as_deref(), Some("Sidecar Face"));
         assert_eq!(styles.theme, Theme::from_css(Some(&css)));
     }
 
     #[test]
-    fn empty_sidecar_falls_back_to_config_css() {
-        let mut config = Config::default();
-        config.reflowable.css = Some("body { color: #123456; }".to_string());
-        let styles = configured_styles(&config, Some("@media print { body { color: red; } }"));
-        assert_eq!(styles.css, config.reflowable_css());
+    fn replace_marker_turns_off_document_css() {
+        let sidecar = format!(
+            "{}\nbody {{ background: #101820; color: #f0e6d2; }}\n",
+            sidecar::REPLACE_DOCUMENT_CSS_MARKER
+        );
+        let styles = configured_styles(Some(sidecar.as_str()));
+        assert!(styles.css.is_some());
+        assert!(!styles.document_css);
+    }
+
+    #[test]
+    fn marker_after_the_first_line_does_not_replace_document_css() {
+        let sidecar = format!(
+            "body {{ color: #f0e6d2; }}\n{}\n",
+            sidecar::REPLACE_DOCUMENT_CSS_MARKER
+        );
+        let styles = configured_styles(Some(sidecar.as_str()));
+        assert!(styles.css.is_some());
         assert!(styles.document_css);
-        assert_eq!(styles.theme, Theme::from_css(styles.css.as_deref()));
+    }
+
+    #[test]
+    fn placeholder_sidecar_keeps_document_css_and_follows_document() {
+        let styles = configured_styles(Some("/* nothing here yet */\n"));
+        assert_eq!(styles.css, None);
+        assert!(styles.document_css);
+        assert!(styles.follow_document_theme);
+        assert_eq!(styles.theme, Theme::html_default());
+        assert_eq!(styles.font_family, None);
     }
 
     #[test]
     fn sidecar_without_colors_follows_the_document() {
-        let mut config = Config::default();
-        config.reflowable.css = Some("body { color: #123456; }".to_string());
-        let styles = configured_styles(&config, Some("body { line-height: 1.5; }"));
+        let styles = configured_styles(Some("body { line-height: 1.5; }"));
         assert!(styles.follow_document_theme);
+        assert!(styles.document_css);
         assert_eq!(
             styles.css.as_deref(),
             Some("body {\n    line-height: 1.5;\n}\n")
         );
+    }
+
+    #[test]
+    fn seed_sidecar_migrates_legacy_css_and_palette() {
+        let mut config = Config::default();
+        config.reflowable.css = Some(
+            "body { background: #f2e8d5; color: #3a2e24; transform: rotate(1deg); }".to_string(),
+        );
+        config.perfect_palette.enable = true;
+        let seed = seed_sidecar_css(&config);
+        assert!(seed.starts_with("/* MuReader sidecar stylesheet."));
+        assert!(!sidecar::replaces_document_css(&seed));
+        assert!(seed.contains("background: #f2e8d5;"));
+        assert!(seed.contains("--mureader-palette-0"));
+        assert!(!seed.contains("transform"));
+        let user = seed.find("background: #f2e8d5;").unwrap();
+        let tuned = seed.find("--mureader-palette-0").unwrap();
+        assert!(user < tuned, "the tuned palette must follow the legacy CSS");
+
+        let styles = configured_styles(Some(seed.as_str()));
+        assert!(styles.document_css);
+        assert!(!styles.follow_document_theme);
+    }
+
+    #[test]
+    fn seed_sidecar_without_legacy_styles_is_a_placeholder() {
+        let config = Config::default();
+        let seed = seed_sidecar_css(&config);
+        assert!(seed.starts_with("/* MuReader sidecar stylesheet."));
+        let styles = configured_styles(Some(seed.as_str()));
+        assert_eq!(styles.css, None);
+        assert!(styles.document_css);
+        assert!(styles.follow_document_theme);
+    }
+
+    #[test]
+    fn seed_sidecar_keeps_font_family_for_ui_text() {
+        let mut config = Config::default();
+        config.reflowable.css = Some("body { font-family: 'Noto Serif', serif; }".to_string());
+        let seed = seed_sidecar_css(&config);
+        let styles = configured_styles(Some(seed.as_str()));
+        assert_eq!(styles.font_family.as_deref(), Some("Noto Serif"));
+        assert!(styles.follow_document_theme);
     }
 
     #[test]
@@ -4818,26 +4929,26 @@ mod tests {
     }
 
     #[test]
-    fn enabled_palette_appends_a_tuned_stylesheet() {
+    fn seed_sidecar_appends_the_tuned_palette_after_legacy_css() {
         let mut config = Config::default();
         config.reflowable.css = Some("body { background: #f2e8d5; color: #3a2e24; }".to_string());
         config.perfect_palette.enable = true;
-        let styles = configured_styles(&config, None);
-        let css = styles.css.unwrap();
-        let user = css.find("body { background").unwrap();
-        let tuned = css.find("--mureader-palette-0").unwrap();
+        let seed = seed_sidecar_css(&config);
+        let user = seed.find("background: #f2e8d5;").unwrap();
+        let tuned = seed.find("--mureader-palette-0").unwrap();
         assert!(user < tuned, "the tuned palette must follow the user CSS");
         assert!(
             !config
                 .reflowable_css()
                 .unwrap()
                 .contains("--mureader-palette"),
-            "config CSS stays exactly the user's stylesheet"
+            "the legacy config CSS stays exactly the user's stylesheet"
         );
+        let styles = configured_styles(Some(seed.as_str()));
         assert_ne!(
             styles.theme,
             Theme::from_css(config.reflowable_css().as_deref()),
-            "the UI theme follows the tuned palette"
+            "the UI theme follows the tuned palette in the sidecar"
         );
     }
 

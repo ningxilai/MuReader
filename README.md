@@ -104,18 +104,7 @@ page_turn_ms = 320
 window_fit_ms = 120
 
 [reflowable]
-css = ""
-css_file = ""
 pretty = true
-
-[perfect_palette]
-enable = false
-colors = 9
-step = 4
-hue_start = 0.58
-saturation = 45
-lightness = 65
-hpluv = true
 
 [progress]
 max_documents = 100
@@ -193,52 +182,60 @@ a blurry column-width plate. A page that carries an illustration together with
 text keeps that text in the same flow. Paged spreads, quarter-turned pages, and
 an explicit zoom keep the whole page.
 
-`[reflowable]` CSS is applied to reflowable documents. The first `font-family`
-declared there is also used by the outline, command menu, and other UI text;
-CJK, emoji, and symbol fallback are shared. `pretty` enables the Unicode
-line-breaking pass for TXT and text files.
-
 ### Sidecar stylesheets
 
-A reflowable document can use a replacement stylesheet discovered from its
-content instead of named in the config. MuReader hashes the document bytes
-with SHA-256 and looks for:
+Per-document styling is not configured in `config.toml`. MuReader hashes the
+document bytes with SHA-256 and uses:
 
 ```text
-$XDG_CACHE_HOME/mureader/css/<sha256>.css
+$XDG_DATA_HOME/mureader/css/<sha256>.css
 ```
 
-`MUREADER_CSS_CACHE` overrides that directory. The lookup applies to EPUB,
-HTML/XHTML, FB2, MOBI, DOCX/XLSX/PPTX/HWPX, and TXT/text files. When a sidecar
-exists, it replaces both the `[reflowable]` CSS and the document's own
-stylesheet, and `[perfect_palette]` is not applied. A missing sidecar is
-silent; an unreadable or oversized file (over 4 MiB) is reported and the
-normal config-plus-document pipeline is used instead.
+`MUREADER_CSS_DIR` overrides that directory; the old `MUREADER_CSS_CACHE`
+name is still accepted. The lookup applies to EPUB, HTML/XHTML, FB2, MOBI,
+DOCX/XLSX/PPTX/HWPX, and TXT/text files.
+
+On the first open of a reflowable document, MuReader creates the sidecar from
+the legacy `[reflowable] css`/`css_file` values and `[perfect_palette]`
+settings, sanitizes it, and writes it out. The file then belongs to you: it is
+authoritative on every later open, and changes to `config.toml` no longer
+affect that document. Edit the sidecar directly; delete it to regenerate it
+from the current config on the next open.
+
+By default the sidecar overlays the document's own CSS, so use `!important`
+where the book should be overridden. To replace the document CSS instead, make
+this the first line of the sidecar:
+
+```css
+/* mureader: replace-document-css */
+```
+
+A sidecar that contains only comments is a placeholder: no user CSS is applied
+and the document's own CSS stays enabled. An unreadable, non-UTF-8, or
+oversized (over 4 MiB) sidecar is reported and the document's own CSS is used;
+the legacy config CSS is never a fallback once the sidecar model is active.
+The plain-text pretty layout always keeps document CSS enabled because its
+generated HTML carries the required page layout.
 
 The sidecar is parsed with a CSS syntax parser and sanitized before MuPDF sees
 it. It keeps `@font-face`, `@page`, the properties MuPDF implements, and
 `--mureader-*` custom properties; other at-rules, `var()`, `calc()`,
 unsupported properties, unbounded numbers, and absolute or parent-escaping
 URLs are dropped. Rule order is preserved. Font and image URLs must stay
-relative to the document archive. The plain-text pretty layout keeps document
-CSS enabled even with a sidecar because its generated HTML carries the required
-page layout.
+relative to the document archive. The first `font-family` in the sidecar is
+also used by the outline, command menu, and other UI text; CJK, emoji, and
+symbol fallback are shared. `pretty` enables the Unicode line-breaking pass
+for TXT and text files.
 
-`[perfect_palette]` is an optional eye-comfort palette ported from the HPLuv
-`perfect-palette` helper in the author's Emacs configuration. Instead of
-imposing an unrelated theme, it reads the window, text, and accent hue from
-your `[reflowable]` CSS (or from the HTML default when no colors are named),
-then regenerates the page paper and ink plus the UI accent, search, and
-selection colors around that hue family. `hue_start` is only the fallback for
-a fully neutral theme. The palette walks `colors` hues with a
-`step / colors`-turn spacing at fixed `saturation` and `lightness`; every
-generated color is available as `--mureader-palette-0` through
-`--mureader-palette-(colors-1)`. The tuned stylesheet is appended after your
-CSS, so it transforms the resulting palette, and when `enable = false` the
-original CSS and colors are left exactly untouched. Light and dark themes keep
-their character; `lightness` only controls the generated palette colors.
+`[perfect_palette]` is an optional HPLuv eye-comfort palette ported from the
+`perfect-palette` helper in the author's Emacs configuration. It is a
+migration input: on first open it tunes the theme implied by the legacy CSS
+and its rules are written into the generated sidecar. Every generated color is
+available as `--mureader-palette-0` through `--mureader-palette-(colors-1)`.
+After migration, edit the concrete colors in the sidecar instead of tuning the
+palette.
 
-The same CSS supplies one theme for every non-reading surface: the outline,
+The sidecar supplies one theme for every non-reading surface: the outline,
 command panel, prompts, loading card, borders, and search/selection highlights.
 The effective `background`/`background-color` and `color` on `body`, `html`, or
 `:root` set the base surface and text, and panel shades, muted labels, chips,
@@ -259,9 +256,9 @@ properties override individual parts:
 }
 ```
 
-If the CSS contains no colors, the UI follows the document: it starts from the
-HTML default canvas (a white page with dark text) and derives one palette from
-the whole book. Pages spread evenly through the document are sampled at a
+If the sidecar contains no colors, the UI follows the document: it starts from
+the HTML default canvas (a white page with dark text) and derives one palette
+from the whole book. Pages spread evenly through the document are sampled at a
 small preview size and their canvas colors are joined with a Lagrange
 interpolation over page position. The color is read through a soft window
 around the middle of the book, and the target sample count grows continuously
@@ -271,9 +268,9 @@ kept for the whole book; a cover, an embedded image, or a PDF page with
 different colors therefore cannot flip the shell while reading. The
 interpolation itself lives in a small module that knows nothing about themes or
 the optional eye-comfort palette — consumers decide whether to derive the UI
-theme from the color, feed it to the palette, or only tint the outline. A CSS
-file that only sets `font-family` matches the book instead of forcing a dark
-shell. A light background automatically derives dark text and a darker
+theme from the color, feed it to the palette, or only tint the outline. A
+sidecar that only sets `font-family` matches the book instead of forcing a
+dark shell. A light background automatically derives dark text and a darker
 selected-text color, keeping outline and menu selections readable without
 adding a hue.
 
@@ -305,13 +302,15 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
 
 ### Unreleased
 
-- Reflowable documents can use an auto-discovered sidecar stylesheet at
-  `$XDG_CACHE_HOME/mureader/css/<sha256>.css`, keyed by the document's SHA-256.
-  The sidecar replaces both the config CSS and the document CSS, is parsed with
-  `cssparser` and sanitized to the at-rules, properties, and URL forms MuPDF
-  actually supports, and falls back to the normal pipeline when missing or
-  unusable. UI theme and font extraction now share the same parser instead of
-  hand-written CSS scanning.
+- Per-document styling now lives in an auto-generated sidecar at
+  `$XDG_DATA_HOME/mureader/css/<sha256>.css`, keyed by the document's SHA-256.
+  On first open it is seeded from the legacy `[reflowable]` CSS and
+  `[perfect_palette]`, sanitized with `cssparser` to the at-rules, properties,
+  and URL forms MuPDF actually supports, and then owned by the user. Generated
+  sidecars overlay the document CSS by default; a first-line
+  `/* mureader: replace-document-css */` marker replaces it. `config.toml` no
+  longer carries styling or palette options. UI theme and font extraction share
+  the same parser instead of hand-written CSS scanning.
 - Reading-model ownership now lives in the renderer. The reader sends only the
   user's `LayoutIntent` (`Auto` or `Scroll`); the worker resolves it against
   the current window and reports the effective `Layout` with every rendered
