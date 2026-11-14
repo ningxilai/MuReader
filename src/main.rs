@@ -455,6 +455,9 @@ struct SpreadAnimation {
     /// Width of the destination spread in bitmap pixels. The cross-fade only
     /// runs when it matches the current spread's width.
     to_width: u32,
+    /// Bitmap revision the offsets were computed against. A resize can install
+    /// a differently scaled strip while the turn is still running.
+    page_revision: u64,
     /// Eased progress, 0 at the old spread and 1 at the new one.
     progress: f32,
     duration: Duration,
@@ -3376,6 +3379,7 @@ impl App {
             from,
             to,
             to_width,
+            page_revision: self.page_revision,
             progress: 0.0,
             duration: self.page_turn_duration,
             command: direction,
@@ -3403,6 +3407,9 @@ impl App {
         let Some(page) = self.bitmap.as_ref() else {
             return false;
         };
+        if animation.page_revision != self.page_revision {
+            return false;
+        }
         let width = self.visible_width();
         if width == 0 || animation.to_width != width {
             return false;
@@ -3435,7 +3442,20 @@ impl App {
     }
 
     fn tick_animation(&mut self) {
-        if self.animation.is_none() {
+        let Some(revision) = self
+            .animation
+            .as_ref()
+            .map(|animation| animation.page_revision)
+        else {
+            return;
+        };
+        if revision != self.page_revision {
+            // A resize installed a differently scaled strip while the turn
+            // was running. Its pixel offsets no longer describe this bitmap,
+            // so land the turn now instead of interpolating stale values.
+            if let Some(animation) = self.animation.take() {
+                self.land_turn(animation.command);
+            }
             return;
         }
         // Read this before taking the mutable borrow below.
@@ -3473,8 +3493,14 @@ impl App {
             return;
         };
         self.spread_offset = animation.to;
-        self.pending_turn = Some(animation.command);
-        self.send(match animation.command {
+        self.land_turn(animation.command);
+    }
+
+    /// Send the page command for a finished turn without moving the current
+    /// bitmap; used when a resize has already rebased the strip.
+    fn land_turn(&mut self, command: TurnDirection) {
+        self.pending_turn = Some(command);
+        self.send(match command {
             TurnDirection::Next => Command::NextPage,
             TurnDirection::Prev => Command::PrevPage,
         });

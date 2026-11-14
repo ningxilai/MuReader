@@ -175,13 +175,16 @@ The cross-fade is only used when all of these hold:
    can contain one page, and fixed-layout documents can have pages of different
    sizes; drawing two different widths into one destination would scale one
    layer incorrectly.
-4. **No resize preview.** A resize preview draws the old strip at a fitted
-   scale; the slide keeps moving until the worker lands the new bitmap.
+4. **No resize preview or bitmap swap.** A resize preview draws the old strip
+   at a fitted scale. If the worker installs a differently scaled strip while
+   the turn is still running, the turn lands immediately instead of
+   interpolating offsets from the old bitmap.
 5. **Both source windows fit inside the strip.** `from + width` and
    `to + width` are within `page.width`.
 
-Otherwise the existing slide runs unchanged. `page_turn_ms = 0` still means no
-animation at all.
+Otherwise the existing slide runs. A bitmap swap mid-turn lands the turn
+immediately rather than sliding against stale offsets. `page_turn_ms = 0`
+still means no animation at all.
 
 ## 7. About using a Bezier curve instead of `textureSample`
 
