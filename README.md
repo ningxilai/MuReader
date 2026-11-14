@@ -129,10 +129,12 @@ rotate_left = "l"
 copy = ["M-w", "C-w"]
 ```
 
-`page_turn_ms` controls the page-slide duration. `window_fit_ms` debounces
-re-layout after a window resize: the existing page is scaled to fit the new
-window immediately, then re-rendered after the delay. Set it to `0` for the
-fastest response (one frame).
+`page_turn_ms` controls the page-turn duration. Paged spreads cross-fade the
+old and new spread with a small Gaussian; a clipped slide remains as the
+fallback for tiled bitmaps or mismatched spread widths. `window_fit_ms`
+debounces re-layout after a window resize: the existing page is scaled to fit
+the new window immediately, then re-rendered after the delay. Set it to `0` for
+the fastest response (one frame).
 
 The reader starts in a two-page spread whenever the window fits a comfortable
 pair. `toggle_spread` switches between that paged spread and a single-column
@@ -319,7 +321,7 @@ and `M-h`, `Forward` to `M-Right` and `M-l`.
   the current window and reports the effective `Layout` with every rendered
   strip. Input, geometry, and the status line follow that reported layout, so a
   resize cannot leave the UI driving a model that no longer matches the bitmap.
-- A paged spread keeps its slide animation when both visible pages are
+- A paged spread keeps its page-turn animation when both visible pages are
   illustrations. Blank reflow pages used to shorten the rendered strip to the
   two visible pages, leaving no lookahead for the turn; the spread now scans
   past blank pages until it holds four non-blank pages. A window too narrow
